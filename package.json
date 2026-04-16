@@ -1,0 +1,16 @@
+{
+  "name": "bridge-snap",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "kaplay": "^3001.0.19",
+    "stem-assistant-bridge": "file:../../packages/stem-assistant-bridge"
+  },
+  "devDependencies": {
+    "vite": "^7.3.1"
+  }
+}

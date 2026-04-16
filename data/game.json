@@ -1,0 +1,14 @@
+{
+  "game-id": "bridge-snap",
+  "title": "Bridge Snap",
+  "subject": "Engineering",
+  "description": "Design and Test bridges through physics — learn about trusses, tension, compression, and material science.",
+  "longDescription": [
+    "Bridge Snap is an educational bridge construction game. Players place road segments,support beams, cables, and rope to build structures that must support vehicles crossing a gap.",
+    "The game teaches core structural engineering concepts: triangulation, load distribution, material properties, tension vs compression, and efficient design. Each level introduces new materials and heavier vehicles, progressively building the player's understanding.",
+    "Bridges that simulate and behave realistically — they hold rigid when properly supported, show stress colors under load, and break at the weakest point when overloaded."
+  ],
+  "embedHeight": "750px",
+  "featured": true,
+  "tags": ["engineering", "physics", "bridges", "construction", "ai"]
+}
