@@ -55,10 +55,15 @@ export function gameScene(k, { levelIdx }) {
         mouseWorld: { x: 0, y: 0 },
         // Modal
         modal: null,         // { title, desc, score, win }
-        // AI
-        aiResult: null,      // { explanation, concept } or { error }
+        // AI — Socratic tutor lesson
+        aiResult: null,      // { concept, steps:[], summary } | { error } | { explanation, concept } (fallback msg)
         aiLoading: false,
         aiPanelOpen: false,
+        aiStepIdx: 0,        // which step of the lesson we're on
+        aiPhase: "question", // "question" | "feedback" | "done"
+        aiChoiceIdx: -1,     // index of the option the player picked (for feedback coloring)
+        aiOptionRects: [],   // click-targets rebuilt every frame
+        aiNextRect: null,    // "Next" / "Build!" button rect
         // Hint
         hintOpen: true,
         // Lesson panel
@@ -248,69 +253,7 @@ export function gameScene(k, { levelIdx }) {
                     k.drawRect({ pos: k.vec2(ox + c * pxSize, oy + r * pxSize), width: pxSize + 0.5, height: pxSize + 0.5, color: k.Color.fromHex(color), anchor: "topleft" });
     }
 
-    // Vehicle pixel art grids
-    // 0=transparent, 1=body, 2=bodyDark, 3=window, 4=wheel, 5=hubcap, 6=headlight, 7=accent
-    const VEHICLE_ART = {
-        car: [
-            [0,0,0,0,1,1,1,1,0,0,0,0],
-            [0,0,1,1,3,3,1,1,1,1,0,0],
-            [0,2,1,1,3,3,1,1,1,1,2,0],
-            [2,1,1,1,1,1,1,1,1,1,1,2],
-            [1,1,1,1,1,1,1,1,1,1,1,6],
-            [0,0,4,4,0,0,0,0,0,4,4,0],
-            [0,0,4,5,0,0,0,0,0,4,5,0],
-        ],
-        truck: [
-            [0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0],
-            [0,0,0,0,0,0,0,0,0,0,1,3,3,1,1,0,0,0],
-            [0,0,0,0,0,0,0,0,0,2,1,3,3,1,1,2,0,0],
-            [2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,0],
-            [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,6],
-            [0,0,4,4,0,0,0,0,0,0,4,4,0,0,0,4,4,0],
-            [0,0,4,5,0,0,0,0,0,0,4,5,0,0,0,4,5,0],
-        ],
-        train: [
-            [7,7,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-            [7,7,1,1,3,3,1,1,3,3,1,1,3,3,1,1,3,3,1,1,1,1],
-            [2,2,1,1,3,3,1,1,3,3,1,1,3,3,1,1,3,3,1,1,1,2],
-            [2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2],
-            [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,6],
-            [0,4,4,0,0,4,4,0,0,4,4,0,0,4,4,0,0,4,4,0,0,0],
-            [0,4,5,0,0,4,5,0,0,4,5,0,0,4,5,0,0,4,5,0,0,0],
-        ],
-    };
 
-    function drawPixelVehicle(artKey, px, py, hw, hh, bodyColor) {
-        const grid = VEHICLE_ART[artKey];
-        if (!grid) return;
-        const rows = grid.length, cols = grid[0].length;
-        const pxW = (hw * 2) / cols;
-        const pxH = (hh * 2) / rows;
-        const ox = px - hw;
-        const oy = py - hh;
-
-        const bodyC = k.Color.fromHex(bodyColor);
-        const darkR = Math.max(0, bodyC.r - 45);
-        const darkG = Math.max(0, bodyC.g - 45);
-        const darkB = Math.max(0, bodyC.b - 45);
-        const darkHex = "#" + [darkR, darkG, darkB].map(v => v.toString(16).padStart(2, "0")).join("");
-
-        const palette = [null, bodyColor, darkHex, "#a8cce0", "#1a1a1a", "#707070", "#fffde0", "#444444"];
-        const outlineC = k.Color.fromHex("#010101");
-
-        // Outline pass
-        for (let r = 0; r < rows; r++)
-            for (let c = 0; c < cols; c++)
-                if (grid[r][c])
-                    k.drawRect({ pos: k.vec2(ox + c * pxW - 1, oy + r * pxH - 1), width: pxW + 2, height: pxH + 2, color: outlineC, anchor: "topleft" });
-
-        // Color pass
-        for (let r = 0; r < rows; r++)
-            for (let c = 0; c < cols; c++) {
-                const v = grid[r][c];
-                if (v) k.drawRect({ pos: k.vec2(ox + c * pxW, oy + r * pxH), width: pxW + 0.5, height: pxH + 0.5, color: k.Color.fromHex(palette[v]), anchor: "topleft" });
-            }
-    }
 
     // ─── Terrain collision rectangles (for physics) ──
     // Tables are solid — nodes bounce off them instead of clipping through
@@ -380,8 +323,8 @@ export function gameScene(k, { levelIdx }) {
         if (state.modal) {
             const W = k.width(), H = k.height();
             const mx = W / 2, my = H / 2;
-            // Primary button
-            if (Math.abs(pos.x - mx) < 90 && Math.abs(pos.y - (my + 30)) < 20) {
+            // Primary button — Next Level / Try Again (y+15)
+            if (Math.abs(pos.x - mx) < 90 && Math.abs(pos.y - (my + 15)) < 18) {
                 if (state.modal.win) {
                     const nx = levelIdx + 1;
                     if (nx < LEVELS.length) k.go("game", { levelIdx: nx });
@@ -391,14 +334,24 @@ export function gameScene(k, { levelIdx }) {
                 }
                 return;
             }
-            // Secondary button
-            if (Math.abs(pos.x - mx) < 90 && Math.abs(pos.y - (my + 65)) < 16) {
+            // Try With AI (y+50) — only if level has been beaten at least once
+            const beaten = getCompleted().includes(levelIdx);
+            if (beaten && Math.abs(pos.x - mx) < 90 && Math.abs(pos.y - (my + 50)) < 16) {
+                resetToBuild();
+                handleAiClick();
+                return;
+            }
+            // Secondary — Replay / Menu (y+85)
+            if (Math.abs(pos.x - mx) < 90 && Math.abs(pos.y - (my + 85)) < 16) {
                 if (state.modal.win) resetToBuild();
                 else k.go("menu", { view: "levelSelect" });
                 return;
             }
             return;
         }
+
+        // ─── AI tutor panel clicks (options / next button) ───
+        if (handleAiPanelClick(pos.x, pos.y)) return;
 
         // ─── Toolbar button clicks (screen-space) ───
         if (handleToolbarClick(pos)) return;
@@ -722,32 +675,26 @@ export function gameScene(k, { levelIdx }) {
         return y < tb.h + tb.pad * 2 + 40; // block clicks on toolbar area
     }
 
-    // ─── AI Helper ──────────────────────────────────
+    // ─── AI Tutor (Socratic lesson) ─────────────────
     async function handleAiClick() {
-        // Toggle panel off if already open
         if (state.aiPanelOpen && !state.aiLoading) {
             state.aiPanelOpen = false;
             return;
         }
 
-        // Blueprint mode: AI can only build if the level has been beaten
-        const completed = getCompleted();
-        const levelBeaten = completed.includes(levelIdx);
-
+        const levelBeaten = getCompleted().includes(levelIdx);
         if (!levelBeaten) {
-            // Level not yet beaten — just show a teaching tip, no auto-build
             state.aiPanelOpen = true;
             state.aiResult = {
-                explanation: `Beat this level first to unlock the AI blueprint!\n\nTip: ${lvlDef.hint}`,
+                explanation: "Beat this level first to unlock the AI tutor!",
                 concept: lvlDef.concept,
             };
             onRecapRequest();
             return;
         }
 
-        // Level is beaten — allow AI to build the optimal bridge
         if (!getApiKey()) {
-            const key = prompt("Enter your Anthropic API key:");
+            const key = prompt("Enter your OpenAI API key:");
             if (key) setApiKey(key.trim());
             else return;
         }
@@ -756,35 +703,80 @@ export function gameScene(k, { levelIdx }) {
         state.aiLoading = true;
         state.aiPanelOpen = true;
         state.aiResult = null;
+        state.aiStepIdx = 0;
+        state.aiPhase = "question";
+        state.aiChoiceIdx = -1;
         onRecapRequest();
 
-        const result = await solveBridge(lvl, lvlDef);
-        state.aiLoading = false;
-
-        if (result.error) {
-            state.aiResult = { error: result.error };
-            return;
-        }
-
-        // Auto-build the AI's solution
-        // First clear existing non-builtin members
+        // Clear player's bridge so the lesson builds its own from scratch
         state.members = state.members.filter(m => m.builtin);
         state.nodes = state.nodes.filter(n => n.fixed || n.builtin);
 
-        for (const mb of result.members) {
+        const result = await solveBridge(lvl, lvlDef);
+        state.aiLoading = false;
+        state.aiResult = result;
+    }
+
+    // Place the members for the current lesson step into the world.
+    function buildLessonStep(step) {
+        if (!step?.members) return;
+        for (const mb of step.members) {
             const x1 = Math.round(mb.x1 / GRID) * GRID;
             const y1 = Math.round(mb.y1 / GRID) * GRID;
             const x2 = Math.round(mb.x2 / GRID) * GRID;
             const y2 = Math.round(mb.y2 / GRID) * GRID;
             const type = mb.type in MATERIALS ? mb.type : "wood_beam";
-
             const n1 = findOrCreate(x1, y1);
             const n2 = findOrCreate(x2, y2);
-            const exists = state.members.some(m => (m.n1 === n1 && m.n2 === n2) || (m.n2 === n1 && m.n1 === n2));
+            const exists = state.members.some(m =>
+                (m.n1 === n1 && m.n2 === n2) || (m.n2 === n1 && m.n1 === n2));
             if (!exists) state.members.push(new Member(n1, n2, type));
         }
+    }
 
-        state.aiResult = { explanation: result.explanation, concept: result.concept };
+    // Handle a click on an option button or the Next button.
+    function handleAiPanelClick(mx, my) {
+        if (!state.aiPanelOpen || !state.aiResult?.steps) return false;
+        // Option click only when waiting for an answer
+        if (state.aiPhase === "question") {
+            for (let i = 0; i < state.aiOptionRects.length; i++) {
+                const r = state.aiOptionRects[i];
+                if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
+                    state.aiChoiceIdx = i;
+                    state.aiPhase = "feedback";
+                    return true;
+                }
+            }
+        }
+        // Next button (either "Build!" after feedback, or "Next question" / "Done")
+        if (state.aiNextRect) {
+            const r = state.aiNextRect;
+            if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
+                advanceLesson();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function advanceLesson() {
+        const lesson = state.aiResult;
+        if (!lesson?.steps) return;
+        const step = lesson.steps[state.aiStepIdx];
+
+        if (state.aiPhase === "feedback") {
+            // Build the pieces for this step, then move to the next question
+            buildLessonStep(step);
+            state.aiStepIdx += 1;
+            state.aiChoiceIdx = -1;
+            if (state.aiStepIdx >= lesson.steps.length) {
+                state.aiPhase = "done";
+            } else {
+                state.aiPhase = "question";
+            }
+        } else if (state.aiPhase === "done") {
+            state.aiPanelOpen = false;
+        }
     }
 
     // ═══════════════════════════════════════════════════
@@ -940,21 +932,21 @@ export function gameScene(k, { levelIdx }) {
         const originX = lX;
         const originY = lY;
 
-        // Vertical lines
-        const startX = originX - Math.ceil((originX - wLeft.x) / step) * step;
-        for (let wx = startX; wx < wRight.x; wx += step) {
+        // Vertical lines — pad one extra step past each screen edge
+        const startX = originX - Math.ceil((originX - wLeft.x) / step) * step - step;
+        for (let wx = startX; wx <= wRight.x + step; wx += step) {
             const p1 = toScreen(wx, wLeft.y - 200);
             const p2 = toScreen(wx, wRight.y + 200);
             const isMajor = Math.abs(Math.round(wx / major) * major - wx) < 1;
-            k.drawLine({ p1, p2, width: isMajor ? 1 : 0.5, color: k.Color.fromHex("#8a7350"), opacity: isMajor ? 0.35 : 0.15 });
+            k.drawLine({ p1, p2, width: isMajor ? 1 : 0.5, color: k.Color.fromHex("#8a7350"), opacity: isMajor ? 0.35 : 0.18 });
         }
-        // Horizontal lines
-        const startY = originY - Math.ceil((originY - wLeft.y) / step) * step;
-        for (let wy = startY; wy < wRight.y + GRID * 10; wy += step) {
+        // Horizontal lines — pad one extra step past each screen edge
+        const startY = originY - Math.ceil((originY - wLeft.y) / step) * step - step;
+        for (let wy = startY; wy <= wRight.y + step; wy += step) {
             const p1 = toScreen(wLeft.x - 200, wy);
             const p2 = toScreen(wRight.x + 200, wy);
             const isMajor = Math.abs(Math.round(wy / major) * major - wy) < 1;
-            k.drawLine({ p1, p2, width: isMajor ? 1 : 0.5, color: k.Color.fromHex("#8a7350"), opacity: isMajor ? 0.35 : 0.15 });
+            k.drawLine({ p1, p2, width: isMajor ? 1 : 0.5, color: k.Color.fromHex("#8a7350"), opacity: isMajor ? 0.35 : 0.18 });
         }
     }
 
@@ -1497,30 +1489,19 @@ export function gameScene(k, { levelIdx }) {
             const hw = v.cfg.w / 2 * sc;
             const hh = v.cfg.h / 2 * sc;
 
-            // Use sprite if available, fall back to pixel art grid
             const spriteKey = v.cfg.sprite;
-            let drewSprite = false;
             const vAngle = v.angle || 0;
             if (spriteKey) {
-                try {
-                    const sprW = hw * 4;
-                    const sprH = sprW;
-                    k.drawSprite({
-                        sprite: spriteKey,
-                        pos: k.vec2(px, py - hh * 0.3),
-                        width: sprW,
-                        height: sprH,
-                        anchor: "center",
-                        flipX: true,
-                        angle: k.rad2deg(vAngle),
-                    });
-                    drewSprite = true;
-                } catch(e) {}
-            }
-            if (!drewSprite) {
-                // TODO: pixel art doesn't support rotation easily
-                const artKey = v.cfg.w <= 40 ? "car" : v.cfg.w <= 80 ? "truck" : "train";
-                drawPixelVehicle(artKey, px, py, hw, hh, v.cfg.color);
+                const sprW = hw * 4;
+                k.drawSprite({
+                    sprite: spriteKey,
+                    pos: k.vec2(px, py - hh * 0.3),
+                    width: sprW,
+                    height: sprW,
+                    anchor: "center",
+                    flipX: true,
+                    angle: k.rad2deg(vAngle),
+                });
             }
 
             // Multi-vehicle label badge
@@ -1751,35 +1732,132 @@ export function gameScene(k, { levelIdx }) {
         k.drawText({ text: lvlDef.hint, pos: k.vec2(px + 10, py + 30), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - 20, lineSpacing: 4 });
     }
 
-    // ─── AI panel ───────────────────────────────────
+    // ─── AI panel (Socratic tutor — styled like the hint sticky note) ──
     function drawAiPanel() {
+        // Reset click targets every frame — rebuilt below if panel is open
+        state.aiOptionRects = [];
+        state.aiNextRect = null;
         if (!state.aiPanelOpen) return;
-        const panelW = Math.min(300, k.width() * 0.4);
+
+        const panelW = Math.min(460, k.width() * 0.5);
+        const padX = 18;
         const px = 10;
         const py = 110;
 
-        // Notebook page
-        k.drawRect({ pos: k.vec2(px + 2, py + 2), width: panelW, height: 160, color: k.Color.fromHex("#000000"), opacity: 0.1, anchor: "topleft", radius: 3 });
-        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: 160, color: k.Color.fromHex("#f8f5ee"), anchor: "topleft", radius: 2 });
-        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: 160, fill: false, outline: { width: 1, color: k.Color.fromHex("#c0b8a0") }, anchor: "topleft", radius: 2 });
+        // Compute panel height based on content
+        const lesson = state.aiResult;
+        const hasSteps = lesson && Array.isArray(lesson.steps);
+        let panelH = 170;
+        const optH = 52;
+        if (hasSteps) {
+            if (state.aiPhase === "question") {
+                const step = lesson.steps[state.aiStepIdx];
+                // header + question (~60) + options
+                panelH = 140 + (optH + 8) * (step?.options?.length || 0);
+            } else if (state.aiPhase === "feedback") {
+                panelH = 250;
+            } else if (state.aiPhase === "done") {
+                panelH = 170;
+            }
+        } else if (state.aiResult?.error || state.aiResult?.explanation) {
+            panelH = 170;
+        }
 
-        k.drawText({ text: "AI TUTOR", pos: k.vec2(px + 10, py + 10), size: 8, font: "PressStart2P", color: k.Color.fromHex(C.markerBlue) });
+        // Sticky-note background with tape strip (match the HINT panel)
+        k.drawRect({ pos: k.vec2(px + 2, py + 2), width: panelW, height: panelH, color: k.Color.fromHex("#000000"), opacity: 0.1, anchor: "topleft", radius: 2 });
+        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: k.Color.fromHex("#fff9c4"), anchor: "topleft", radius: 1 });
+        k.drawRect({ pos: k.vec2(px + panelW / 2 - 20, py - 5), width: 40, height: 12, color: k.Color.fromHex(C.tape), anchor: "topleft", opacity: 0.55 });
+
+        k.drawText({ text: "AI TUTOR", pos: k.vec2(px + padX, py + 12), size: 10, font: "PressStart2P", color: k.Color.fromHex(C.markerBlue) });
 
         if (state.aiLoading) {
-            k.drawText({ text: "Thinking...", pos: k.vec2(px + 10, py + 35), size: 14, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.6 });
-        } else if (state.aiResult?.error) {
-            k.drawText({ text: state.aiResult.error, pos: k.vec2(px + 10, py + 35), size: 12, font: "PatrickHand", color: k.Color.fromHex(C.danger), width: panelW - 20, lineSpacing: 2 });
-        } else if (state.aiResult) {
+            k.drawText({ text: "Thinking...", pos: k.vec2(px + padX, py + 44), size: 18, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.6 });
+            return;
+        }
+
+        if (state.aiResult?.error) {
+            k.drawText({ text: state.aiResult.error, pos: k.vec2(px + padX, py + 44), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.danger), width: panelW - padX * 2, lineSpacing: 3 });
+            return;
+        }
+
+        // Fallback: level-not-beaten tip
+        if (!hasSteps && state.aiResult?.explanation) {
             if (state.aiResult.concept) {
-                k.drawText({ text: `Concept: ${state.aiResult.concept}`, pos: k.vec2(px + 10, py + 32), size: 13, font: "PatrickHand", color: k.Color.fromHex(C.markerGreen) });
+                k.drawText({ text: `Concept: ${state.aiResult.concept}`, pos: k.vec2(px + padX, py + 38), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.markerGreen) });
             }
-            k.drawText({ text: state.aiResult.explanation || "", pos: k.vec2(px + 10, py + 50), size: 11, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - 20, lineSpacing: 3 });
-        } else {
+            k.drawText({ text: state.aiResult.explanation, pos: k.vec2(px + padX, py + 62), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            return;
+        }
+
+        if (!hasSteps) {
             const beaten = getCompleted().includes(levelIdx);
             const tip = beaten
-                ? "Click to auto-build an optimal bridge\nand learn why it works!"
-                : "Beat this level first to unlock\nthe AI blueprint builder!";
-            k.drawText({ text: tip, pos: k.vec2(px + 10, py + 35), size: 13, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - 20, lineSpacing: 3, opacity: 0.5 });
+                ? "Click the AI button to start an\ninteractive lesson!"
+                : "Beat this level first to unlock\nthe AI tutor!";
+            k.drawText({ text: tip, pos: k.vec2(px + padX, py + 44), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4, opacity: 0.5 });
+            return;
+        }
+
+        // ── Lesson UI ──
+        const step = lesson.steps[state.aiStepIdx];
+        const totalSteps = lesson.steps.length;
+
+        if (lesson.concept) {
+            k.drawText({ text: lesson.concept, pos: k.vec2(px + padX, py + 34), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.markerGreen) });
+        }
+        k.drawText({
+            text: `Step ${Math.min(state.aiStepIdx + 1, totalSteps)} / ${totalSteps}`,
+            pos: k.vec2(px + panelW - padX, py + 34),
+            size: 14, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.6, anchor: "topright",
+        });
+
+        if (state.aiPhase === "question" && step) {
+            k.drawText({ text: step.question, pos: k.vec2(px + padX, py + 58), size: 17, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+
+            const optsY = py + 110;
+            for (let i = 0; i < step.options.length; i++) {
+                const oy = optsY + i * (optH + 8);
+                const rect = { x: px + padX, y: oy, w: panelW - padX * 2, h: optH };
+                state.aiOptionRects.push(rect);
+                k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: k.Color.fromHex("#fffdea"), anchor: "topleft", radius: 2 });
+                k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1.5, color: k.Color.fromHex(C.markerBlue) }, anchor: "topleft", radius: 2, opacity: 0.7 });
+                k.drawText({ text: String.fromCharCode(65 + i), pos: k.vec2(rect.x + 12, rect.y + rect.h / 2), size: 14, font: "PressStart2P", color: k.Color.fromHex(C.markerBlue), anchor: "left" });
+                k.drawText({ text: step.options[i], pos: k.vec2(rect.x + 40, rect.y + rect.h / 2), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: rect.w - 50, anchor: "left", lineSpacing: 3 });
+            }
+            return;
+        }
+
+        if (state.aiPhase === "feedback" && step) {
+            const correct = state.aiChoiceIdx === step.correct;
+            const bannerColor = correct ? C.markerGreen : C.markerRed;
+            k.drawText({ text: correct ? "RIGHT!" : "NOT QUITE", pos: k.vec2(px + padX, py + 60), size: 12, font: "PressStart2P", color: k.Color.fromHex(bannerColor) });
+
+            const pickedLabel = `${String.fromCharCode(65 + state.aiChoiceIdx)}: ${step.options[state.aiChoiceIdx]}`;
+            k.drawText({ text: pickedLabel, pos: k.vec2(px + padX, py + 84), size: 15, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.7, width: panelW - padX * 2, lineSpacing: 3 });
+
+            const explanation = correct ? (step.explainCorrect || "") : (step.explainWrong || "");
+            k.drawText({ text: explanation, pos: k.vec2(px + padX, py + 118), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+
+            const btnW = 160, btnH = 32;
+            const btnX = px + panelW - btnW - padX;
+            const btnY = py + panelH - btnH - 12;
+            state.aiNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
+            const isLast = state.aiStepIdx === lesson.steps.length - 1;
+            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: k.Color.fromHex(C.markerBlue), anchor: "topleft", radius: 3 });
+            k.drawText({ text: isLast ? "Build & Finish!" : "Build & Next", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2), size: 11, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
+            return;
+        }
+
+        if (state.aiPhase === "done") {
+            k.drawText({ text: "LESSON COMPLETE!", pos: k.vec2(px + padX, py + 60), size: 12, font: "PressStart2P", color: k.Color.fromHex(C.markerGreen) });
+            k.drawText({ text: lesson.summary || "Great work — hit PLAY to see the bridge in action.", pos: k.vec2(px + padX, py + 88), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+
+            const btnW = 100, btnH = 30;
+            const btnX = px + panelW - btnW - padX;
+            const btnY = py + panelH - btnH - 12;
+            state.aiNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
+            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: k.Color.fromHex(C.markerGreen), anchor: "topleft", radius: 3 });
+            k.drawText({ text: "Close", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2), size: 11, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
         }
     }
 
@@ -1791,7 +1869,7 @@ export function gameScene(k, { levelIdx }) {
         k.drawRect({ pos: k.vec2(0, 0), width: W, height: H, color: k.Color.fromHex("#000000"), anchor: "topleft", opacity: 0.4 });
 
         const mw = Math.min(320, W * 0.7);
-        const mh = 200;
+        const mh = 240;
         const mx = W / 2, my = H / 2;
 
         // Index card style
@@ -1803,19 +1881,26 @@ export function gameScene(k, { levelIdx }) {
             k.drawLine({ p1: k.vec2(mx - mw / 2 + 20, ly), p2: k.vec2(mx + mw / 2 - 20, ly), width: 0.5, color: k.Color.fromHex("#c0d8e8"), opacity: 0.3 });
         }
 
-        k.drawText({ text: m.title, pos: k.vec2(mx, my - 60), size: 12, font: "PressStart2P", color: k.Color.fromHex(m.win ? C.markerGreen : C.markerRed), anchor: "center" });
-        k.drawText({ text: m.desc, pos: k.vec2(mx, my - 25), size: 12, font: "PatrickHand", color: k.Color.fromHex(C.pencil), anchor: "center", width: mw - 40 });
+        k.drawText({ text: m.title, pos: k.vec2(mx, my - 80), size: 12, font: "PressStart2P", color: k.Color.fromHex(m.win ? C.markerGreen : C.markerRed), anchor: "center" });
+        k.drawText({ text: m.desc, pos: k.vec2(mx, my - 45), size: 12, font: "PatrickHand", color: k.Color.fromHex(C.pencil), anchor: "center", width: mw - 40 });
 
         if (m.score) {
-            k.drawText({ text: m.score, pos: k.vec2(mx, my + 5), size: 10, font: "PressStart2P", color: k.Color.fromHex(C.gold), anchor: "center" });
+            k.drawText({ text: m.score, pos: k.vec2(mx, my - 15), size: 10, font: "PressStart2P", color: k.Color.fromHex(C.gold), anchor: "center" });
         }
 
-        // Primary button
-        k.drawRect({ pos: k.vec2(mx, my + 30), width: 180, height: 32, color: k.Color.fromHex(m.win ? C.markerGreen : C.accent), anchor: "center" });
-        k.drawText({ text: m.win ? "NEXT LEVEL" : "TRY AGAIN", pos: k.vec2(mx, my + 30), size: 8, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
+        // Primary button — Next Level / Try Again
+        k.drawRect({ pos: k.vec2(mx, my + 15), width: 180, height: 30, color: k.Color.fromHex(m.win ? C.markerGreen : C.accent), anchor: "center" });
+        k.drawText({ text: m.win ? "NEXT LEVEL" : "TRY AGAIN", pos: k.vec2(mx, my + 15), size: 8, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
 
-        // Secondary button
-        k.drawRect({ pos: k.vec2(mx, my + 65), width: 180, height: 28, fill: false, outline: { width: 1, color: k.Color.fromHex("#c0b8a0") }, anchor: "center" });
-        k.drawText({ text: m.win ? "REPLAY" : "MENU", pos: k.vec2(mx, my + 65), size: 8, font: "PressStart2P", color: k.Color.fromHex(C.pencil), anchor: "center" });
+        // New: Try with AI — only offered when the level has been beaten at least once
+        const beaten = getCompleted().includes(levelIdx);
+        if (beaten) {
+            k.drawRect({ pos: k.vec2(mx, my + 50), width: 180, height: 28, color: k.Color.fromHex("#8e4924"), anchor: "center" });
+            k.drawText({ text: "TRY WITH AI", pos: k.vec2(mx, my + 50), size: 8, font: "PressStart2P", color: k.Color.fromHex("#fff8e0"), anchor: "center" });
+        }
+
+        // Secondary — Replay / Menu (bottom)
+        k.drawRect({ pos: k.vec2(mx, my + 85), width: 180, height: 26, fill: false, outline: { width: 1, color: k.Color.fromHex("#c0b8a0") }, anchor: "center" });
+        k.drawText({ text: m.win ? "REPLAY" : "MENU", pos: k.vec2(mx, my + 85), size: 8, font: "PressStart2P", color: k.Color.fromHex(C.pencil), anchor: "center" });
     }
 }
