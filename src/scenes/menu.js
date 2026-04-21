@@ -3,7 +3,10 @@ import { LEVELS } from "../levels.js";
 import { isUnlocked, getGrade, resetProgress } from "../progression.js";
 // Settings persistence
 const SETTINGS_KEY_INIT = "bridgesnap_settings";
-const SETTINGS_DEFAULTS = { masterVol: 0.8, musicVol: 0.7, sfxVol: 0.9, showGrid: true, showStress: true };
+const SETTINGS_DEFAULTS = { masterVol: 0.8, musicVol: 0.7, sfxVol: 0.9, showGrid: true, showStress: true, fpsCap: 60 };
+// FPS cap options — 0 means uncapped (physics matches display refresh rate)
+const FPS_OPTIONS = [30, 60, 0];
+const FPS_LABELS = ["30", "60", "∞"];
 function loadSettings() {
     try { return { ...SETTINGS_DEFAULTS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY_INIT)) }; }
     catch { return { ...SETTINGS_DEFAULTS }; }
@@ -237,7 +240,6 @@ export function menuScene(k, params = {}) {
 
     // ─── Settings state ──────────────────────────────
     const SETTINGS_KEY = "bridgesnap_settings";
-    const SETTINGS_DEFAULTS = { masterVol: 0.8, musicVol: 0.7, sfxVol: 0.9, showGrid: true, showStress: true };
     let settingsData = loadSettings();
     let settingsDragging = null;
     let settingsMessage = null;
@@ -967,18 +969,19 @@ export function menuScene(k, params = {}) {
                 { key: "sfxVol", label: "Sound Effects" },
             ];
 
-            const sliderSpacing = 65;
+            const sliderSpacing = 62;
             for (let i = 0; i < stSliders.length; i++) {
                 const s = stSliders[i];
-                const slY = audioY + 44 + i * sliderSpacing;
+                const slY = audioY + 60 + i * sliderSpacing;
                 const val = settingsData[s.key];
                 const knobX = leftX + val * sliderW;
                 const ropeCol = "#8B6914";
                 const ropeDk = "#5a4010";
 
-                // Label + percentage
-                k.drawText({ text: s.label, pos: k.vec2(leftX, slY - 24), size: 22, font: "PatrickHand", color: col("#4a2808") });
-                k.drawText({ text: Math.round(val * 100) + "%", pos: k.vec2(leftX + sliderW, slY - 24), size: 20, font: "PatrickHand", color: col("#4a2808"), anchor: "topright", opacity: 0.6 });
+                // Label + percentage — drawn above the rope with enough clearance
+                // so descenders don't kiss the rope line
+                k.drawText({ text: s.label, pos: k.vec2(leftX, slY - 32), size: 22, font: "PatrickHand", color: col("#4a2808") });
+                k.drawText({ text: Math.round(val * 100) + "%", pos: k.vec2(leftX + sliderW, slY - 32), size: 20, font: "PatrickHand", color: col("#4a2808"), anchor: "topright", opacity: 0.6 });
 
                 // Rope — coiled section (left of knob)
                 if (knobX - 14 > leftX) {
@@ -1015,7 +1018,8 @@ export function menuScene(k, params = {}) {
             }
 
             // ── Gameplay section ──────────
-            const gameY = audioY + 44 + stSliders.length * sliderSpacing + 20;
+            // N-1 gaps between N sliders + a modest padding below the last slider
+            const gameY = audioY + 60 + (stSliders.length - 1) * sliderSpacing + 48;
             k.drawText({ text: "Gameplay", pos: k.vec2(leftX, gameY), size: 14, font: "PressStart2P", color: col("#5a3510"), opacity: 0.6 });
             k.drawLine({ p1: k.vec2(leftX, gameY + 20), p2: k.vec2(leftX + sliderW, gameY + 20), width: 1.5, color: col("#5a3510"), opacity: 0.2 });
 
@@ -1026,7 +1030,7 @@ export function menuScene(k, params = {}) {
 
             for (let i = 0; i < stToggles.length; i++) {
                 const t = stToggles[i];
-                const tY = gameY + 38 + i * 44;
+                const tY = gameY + 46 + i * 44;
                 const val = settingsData[t.key];
                 k.drawText({ text: t.label, pos: k.vec2(leftX, tY), size: 22, font: "PatrickHand", color: col("#4a2808") });
                 const tx = leftX + 240, tw = 50, th = 26;
@@ -1037,8 +1041,23 @@ export function menuScene(k, params = {}) {
                 k.drawCircle({ pos: k.vec2(pegX, tY + 10), radius: th / 2 - 2, fill: false, outline: { width: 2, color: col("#5a3510") } });
             }
 
+            // ── FPS Cap segmented control ──
+            const fpsRowY = gameY + 46 + stToggles.length * 44;
+            k.drawText({ text: "FPS Cap", pos: k.vec2(leftX, fpsRowY), size: 22, font: "PatrickHand", color: col("#4a2808") });
+            const segW = 56, segH = 28, segGap = 4;
+            const segTotalW = FPS_OPTIONS.length * segW + (FPS_OPTIONS.length - 1) * segGap;
+            const segStartX = leftX + sliderW - segTotalW;
+            for (let si = 0; si < FPS_OPTIONS.length; si++) {
+                const sx = segStartX + si * (segW + segGap) + segW / 2;
+                const sy2 = fpsRowY + 10;
+                const active = settingsData.fpsCap === FPS_OPTIONS[si];
+                k.drawRect({ pos: k.vec2(sx, sy2), width: segW, height: segH, color: col(active ? "#6a9a50" : "#8a7060"), anchor: "center", radius: 4 });
+                k.drawRect({ pos: k.vec2(sx, sy2), width: segW, height: segH, fill: false, outline: { width: 2, color: col("#3a2010") }, anchor: "center", radius: 4, opacity: 0.3 });
+                k.drawText({ text: FPS_LABELS[si], pos: k.vec2(sx, sy2), size: 18, font: "PatrickHand", color: col(active ? "#ffffff" : "#3a2010"), anchor: "center" });
+            }
+
             // ── Data section ─────────────
-            const dataY = gameY + 38 + stToggles.length * 44 + 24;
+            const dataY = gameY + 46 + stToggles.length * 44 + 44 + 24;
             k.drawText({ text: "Data", pos: k.vec2(leftX, dataY), size: 14, font: "PressStart2P", color: col("#5a3510"), opacity: 0.6 });
             k.drawLine({ p1: k.vec2(leftX, dataY + 20), p2: k.vec2(leftX + sliderW, dataY + 20), width: 1.5, color: col("#5a3510"), opacity: 0.2 });
             drawPlankButton(stCx, dataY + 56, 240, 40, "Reset Progress", false, 0);
@@ -1178,7 +1197,7 @@ export function menuScene(k, params = {}) {
             const stTitleSz = Math.min(28, W * 0.028);
             const stTitleY = FW + pad + 30 + stY;
             const audioY = stTitleY + stTitleSz + 20;
-            const sliderSpacing = 65;
+            const sliderSpacing = 62;
 
             const stSliders = [
                 { key: "masterVol" },
@@ -1189,7 +1208,7 @@ export function menuScene(k, params = {}) {
             // Sliders
             for (let i = 0; i < stSliders.length; i++) {
                 const s = stSliders[i];
-                const slY = audioY + 44 + i * sliderSpacing;
+                const slY = audioY + 60 + i * sliderSpacing;
                 if (pos.y > slY - 18 && pos.y < slY + 18 && pos.x > leftX - 16 && pos.x < leftX + sliderW + 16) {
                     settingsDragging = s.key;
                     settingsData[s.key] = Math.max(0, Math.min(1, (pos.x - leftX) / sliderW));
@@ -1198,11 +1217,11 @@ export function menuScene(k, params = {}) {
             }
 
             // Toggles
-            const gameY = audioY + 44 + stSliders.length * sliderSpacing + 20;
+            const gameY = audioY + 60 + (stSliders.length - 1) * sliderSpacing + 48;
             const stToggles = [{ key: "showGrid" }, { key: "showStress" }];
             for (let i = 0; i < stToggles.length; i++) {
                 const t = stToggles[i];
-                const tY = gameY + 38 + i * 44;
+                const tY = gameY + 46 + i * 44;
                 const tx = leftX + 240;
                 if (Math.abs(pos.x - tx) < 30 && Math.abs(pos.y - (tY + 10)) < 16) {
                     settingsData[t.key] = !settingsData[t.key];
@@ -1211,8 +1230,23 @@ export function menuScene(k, params = {}) {
                 }
             }
 
+            // FPS Cap segments
+            const fpsRowY = gameY + 46 + stToggles.length * 44;
+            const segW = 56, segH = 28, segGap = 4;
+            const segTotalW = FPS_OPTIONS.length * segW + (FPS_OPTIONS.length - 1) * segGap;
+            const segStartX = leftX + sliderW - segTotalW;
+            for (let si = 0; si < FPS_OPTIONS.length; si++) {
+                const sx = segStartX + si * (segW + segGap) + segW / 2;
+                const sy2 = fpsRowY + 10;
+                if (Math.abs(pos.x - sx) < segW / 2 && Math.abs(pos.y - sy2) < segH / 2) {
+                    settingsData.fpsCap = FPS_OPTIONS[si];
+                    saveSettingsData();
+                    return;
+                }
+            }
+
             // Reset Progress
-            const dataY = gameY + 38 + stToggles.length * 44 + 24;
+            const dataY = gameY + 46 + stToggles.length * 44 + 44 + 24;
             if (Math.abs(pos.x - stCx) < 120 && Math.abs(pos.y - (dataY + 56)) < 20) {
                 if (confirm("Reset all progress? This cannot be undone.")) {
                     resetProgress();
