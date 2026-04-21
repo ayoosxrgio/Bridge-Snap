@@ -50,8 +50,26 @@ export function gameScene(k, { levelIdx }) {
         dragStart: null,     // node we're dragging from
         dragging: false,
         lineMode: false,      // line fill: drag to auto-place segments along a straight line
-        curveMode: false,     // curve tool: click member, drag to bend
-        curveTarget: null,    // { memberIdx, n1, n2, type } — member being curved
+        archMode: false,      // arch tool: click A → click B → drag apex handle → click off to commit
+        archStart: null,      // { x, y } — first anchor (set after first click)
+        archEnd: null,        // { x, y } — second anchor (set after second click — enters edit mode)
+        archBulge: 0,         // signed perpendicular distance from chord midpoint to apex
+        archDragging: false,  // true while user is dragging the apex handle
+        // Phase-B bulge direction: -1 = up (default), +1 = down. Updated only
+        // when cursor moves CLEARLY past the chord midpoint (hysteresis zone),
+        // so the preview doesn't flicker as the cursor jitters near the anchor.
+        archBulgeDir: -1,
+        // Placed arches — each entry { id, start, end, bulge }. archId stamps on
+        // the Members placed by that arch so we can find them for edit/resize.
+        arches: [],
+        nextArchId: 0,
+        editingArchId: null,       // non-null while re-editing a placed arch
+        editingOldMembers: null,   // stashed members — restored on cancel
+        editingOldArchData: null,  // stashed arch record — restored on cancel
+        // Undo: each entry is one user action; an action may have placed many
+        // members at once (line-fill, arch). Undo pops the latest action and
+        // removes everything it added.
+        undoStack: [],
         mouseWorld: { x: 0, y: 0 },
         // Modal
         modal: null,         // { title, desc, score, win }
@@ -70,6 +88,12 @@ export function gameScene(k, { levelIdx }) {
         lessonOpen: false,
         // Splash effects
         splashes: [],
+        // SNAP! popup + confetti VFX on bridge break
+        snapEvents: [],
+        snapPopups: [],
+        snapConfetti: [],
+        // Hover progress [0..1] for modal text buttons — animates the underline
+        modalBtnHover: { primary: 0, ai: 0, secondary: 0 },
     };
 
     // ─── Initialize nodes & anchors ─────────────────
@@ -92,11 +116,11 @@ export function gameScene(k, { levelIdx }) {
             state.vehicles = lvlDef.multiVehicle.map(mv => {
                 const base = VEHICLES[mv.vType];
                 const cfg = { ...base, color: mv.color, name: mv.label };
-                return { cfg, x: lX + mv.startXOffset, y: lY - base.h * 0.8, active: true, finished: false, vy: 0, vx: base.speed, angle: 0, angVel: 0, wheelAngle: 0, label: mv.label };
+                return { cfg, x: lX + mv.startXOffset, y: lY - base.h * 1.4, active: true, finished: false, vy: 0, vx: base.speed, angle: 0, angVel: 0, wheelAngle: 0, label: mv.label };
             });
         } else {
             const vcfg = VEHICLES[lvl.vType];
-            state.vehicles = [{ cfg: vcfg, x: lX - 55, y: lY - vcfg.h * 0.8, active: true, finished: false, vy: 0, vx: vcfg.speed, angle: 0, angVel: 0, wheelAngle: 0, label: null }];
+            state.vehicles = [{ cfg: vcfg, x: lX - 55, y: lY - vcfg.h * 1.4, active: true, finished: false, vy: 0, vx: vcfg.speed, angle: 0, angVel: 0, wheelAngle: 0, label: null }];
         }
     }
 
@@ -112,6 +136,9 @@ export function gameScene(k, { levelIdx }) {
         state.members.forEach(m => { m.broken = false; m.sparkDone = false; m.stress = 0; m._breakStress = 0; m._fatigue = 0; });
         state.particles = [];
         state.splashes = [];
+        state.snapEvents = [];
+        state.snapPopups = [];
+        state.snapConfetti = [];
         initVehicles();
     }
 
@@ -161,8 +188,8 @@ export function gameScene(k, { levelIdx }) {
         [0,0,0,0,0,0,0],
         [0,0,0,0,0,0,0],
     ];
-    // Curve icon (arc bending upward)
-    const ICON_CURVE = [
+    // Arch icon (arc bending upward)
+    const ICON_ARCH = [
         [0,0,0,1,0,0,0],
         [0,0,1,0,1,0,0],
         [0,1,0,0,0,1,0],
@@ -265,9 +292,12 @@ export function gameScene(k, { levelIdx }) {
         { x1: rX, y1: rY, x2: rX + 600, y2: rY + TABLE_COL_H },
     ];
 
-    // Helper: get fixed anchor nodes for snap
+    // Helper: nodes that the cursor can snap to.
+    // Includes fixed anchors AND any existing non-builtin node — so dragging
+    // near an off-grid node (e.g. an arch joint) snaps to it exactly instead
+    // of rounding to the nearest grid intersection.
     function getAnchors() {
-        return state.nodes.filter(n => n.fixed);
+        return state.nodes.filter(n => !n.builtin);
     }
 
     // ─── Build mode: find or create node ────────────
@@ -297,7 +327,7 @@ export function gameScene(k, { levelIdx }) {
             onBridgeSuccess({ summary: `${vName} crossed. Cost: $${cost}, Grade: ${grade}, ${memberCount} members` });
             onLevelComplete({ summary: `Level ${lvlDef.name} complete — grade ${grade}` });
             setTimeout(() => {
-                state.modal = { win: true, title: "MISSION COMPLETE!", desc: `${vName} crossed safely!`, score: `Cost: $${cost.toLocaleString()} · Grade: ${grade}` };
+                state.modal = { win: true, title: "MISSION COMPLETE!", desc: `${vName} crossed safely!`, cost, grade, openTime: k.time() };
             }, 600);
         } else {
             const brokenCount = state.members.filter(m => m.broken).length;
@@ -309,7 +339,7 @@ export function gameScene(k, { levelIdx }) {
             });
             state.shakeMag = 5;
             setTimeout(() => {
-                state.modal = { win: false, title: "BRIDGE FAILED", desc: "Add triangular supports or reinforce stressed members.", score: null };
+                state.modal = { win: false, title: "BRIDGE FAILED", desc: "Add triangular supports or reinforce stressed members.", openTime: k.time() };
             }, 1000);
         }
     }
@@ -319,12 +349,14 @@ export function gameScene(k, { levelIdx }) {
     // ═══════════════════════════════════════════════════
     k.onMousePress(() => {
         const pos = k.mousePos();
-        // Modal button clicks
+        // Modal button clicks — mirrors the linkBtn positions in drawModal
         if (state.modal) {
-            const W = k.width(), H = k.height();
-            const mx = W / 2, my = H / 2;
-            // Primary button — Next Level / Try Again (y+15)
-            if (Math.abs(pos.x - mx) < 90 && Math.abs(pos.y - (my + 15)) < 18) {
+            const L = getModalLayout();
+            const halfW = MODAL_BTN_W / 2, halfH = MODAL_BTN_H / 2;
+            const inBtn = (cy) => Math.abs(pos.x - L.mx) < halfW && Math.abs(pos.y - (L.my + cy)) < halfH;
+
+            // Primary — Next Level / Try Again
+            if (inBtn(L.btnY.primary)) {
                 if (state.modal.win) {
                     const nx = levelIdx + 1;
                     if (nx < LEVELS.length) k.go("game", { levelIdx: nx });
@@ -334,15 +366,14 @@ export function gameScene(k, { levelIdx }) {
                 }
                 return;
             }
-            // Try With AI (y+50) — only if level has been beaten at least once
-            const beaten = getCompleted().includes(levelIdx);
-            if (beaten && Math.abs(pos.x - mx) < 90 && Math.abs(pos.y - (my + 50)) < 16) {
+            // AI — only when level has been beaten at least once
+            if (L.beaten && inBtn(L.btnY.ai)) {
                 resetToBuild();
                 handleAiClick();
                 return;
             }
-            // Secondary — Replay / Menu (y+85)
-            if (Math.abs(pos.x - mx) < 90 && Math.abs(pos.y - (my + 85)) < 16) {
+            // Secondary — Replay / Menu
+            if (inBtn(L.btnY.secondary)) {
                 if (state.modal.win) resetToBuild();
                 else k.go("menu", { view: "levelSelect" });
                 return;
@@ -366,28 +397,80 @@ export function gameScene(k, { levelIdx }) {
             const hi = state.members.findIndex(m => !m.builtin && distToSegment(wp, m.n1, m.n2) < 16 / sc);
             if (hi !== -1) {
                 const m = state.members.splice(hi, 1)[0];
-                [m.n1, m.n2].forEach(n => {
-                    if (!n.fixed && !state.members.some(mb => mb.n1 === n || mb.n2 === n))
-                        state.nodes = state.nodes.filter(nd => nd !== n);
-                });
+                // Capture orphan nodes BEFORE pruning so undo can restore them
+                const orphanNodes = [m.n1, m.n2].filter(n =>
+                    !n.fixed && !n.builtin && !state.members.some(mb => mb.n1 === n || mb.n2 === n));
+                state.nodes = state.nodes.filter(n => !orphanNodes.includes(n));
+                state.undoStack.push({ deleted: { member: m, nodes: orphanNodes } });
             }
             return;
         }
 
-        // Curve mode — click member to select, click again to apply curve
-        if (state.curveMode) {
-            if (state.curveTarget) {
-                // Second click — apply the curve
-                applyCurve();
-            } else {
-                // First click — select a member to curve
+        // Arch mode — three-phase: pick A → pick B → drag apex handle → click off to commit
+        if (state.archMode) {
+            // Phase A: choose start anchor — OR click on an existing arch to re-edit it
+            if (!state.archStart) {
                 const sc = getScale();
-                const hi = state.members.findIndex(m => !m.builtin && distToSegment(wp, m.n1, m.n2) < 16 / sc);
-                if (hi !== -1) {
-                    const m = state.members[hi];
-                    state.curveTarget = { member: m, x1: m.n1.x, y1: m.n1.y, x2: m.n2.x, y2: m.n2.y, type: m.type };
+                const archMemberIdx = state.members.findIndex(m =>
+                    m.archId != null && !m.broken && distToSegment(wp, m.n1, m.n2) < 16 / sc);
+                if (archMemberIdx !== -1) {
+                    const hit = state.members[archMemberIdx];
+                    const archData = state.arches.find(a => a.id === hit.archId);
+                    if (archData) {
+                        // Stash old members + arch record so cancel can restore them
+                        state.editingArchId = archData.id;
+                        const oldMembers = state.members.filter(m => m.archId === archData.id);
+                        state.editingOldMembers = oldMembers;
+                        state.editingOldArchData = archData;
+                        state.members = state.members.filter(m => m.archId !== archData.id);
+                        state.arches = state.arches.filter(a => a.id !== archData.id);
+                        // Also hide the old arch's interior joints — otherwise
+                        // their glue dots stay on screen while the player
+                        // drags the apex handle. They'll be re-added if the
+                        // edit is cancelled (still referenced by oldMembers).
+                        const orphanNodes = new Set();
+                        for (const m of oldMembers) {
+                            for (const n of [m.n1, m.n2]) {
+                                if (n.fixed || n.builtin) continue;
+                                if (state.members.some(mb => mb.n1 === n || mb.n2 === n)) continue;
+                                orphanNodes.add(n);
+                            }
+                        }
+                        state.nodes = state.nodes.filter(n => !orphanNodes.has(n));
+                        state.archStart = { ...archData.start };
+                        state.archEnd = { ...archData.end };
+                        state.archBulge = archData.bulge;
+                        return;
+                    }
                 }
+                const node = pickArchAnchor(wp);
+                if (node) state.archStart = { x: node.x, y: node.y };
+                return;
             }
+            // Phase B: choose end anchor (must differ from start). Direction
+            // comes from the hysteresis-tracked state (see onMouseMove).
+            if (!state.archEnd) {
+                const node = pickArchAnchor(wp);
+                if (node && (node.x !== state.archStart.x || node.y !== state.archStart.y)) {
+                    state.archEnd = { x: node.x, y: node.y };
+                    const dx = node.x - state.archStart.x;
+                    const dy = node.y - state.archStart.y;
+                    const chord = Math.hypot(dx, dy);
+                    state.archBulge = state.archBulgeDir * chord * 0.25;
+                }
+                return;
+            }
+            // Phase C: edit mode — handle drag vs commit
+            const apexS = getArchApexScreen();
+            const ms = k.mousePos();
+            if (apexS && Math.hypot(ms.x - apexS.x, ms.y - apexS.y) < 16) {
+                state.archDragging = true;       // grab the handle
+                return;
+            }
+            // Click off the handle → commit using selected material
+            const arch = computeArch();
+            if (arch) applyArch(arch);
+            resetArchState();
             return;
         }
 
@@ -405,9 +488,57 @@ export function gameScene(k, { levelIdx }) {
             const sc = getScale();
             state.hoveredMember = state.members.find(m => distToSegment(state.mouseWorld, m.n1, m.n2) < 10 / sc) || null;
         }
+        // Arch apex handle drag — recompute bulge from cursor's perpendicular offset
+        if (state.archDragging && state.archStart && state.archEnd) {
+            const A = state.archStart, B = state.archEnd;
+            const dx = B.x - A.x, dy = B.y - A.y;
+            const chord = Math.hypot(dx, dy);
+            if (chord > 0) {
+                const nx = -dy / chord, ny = dx / chord;
+                const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2;
+                state.archBulge = (state.mouseWorld.x - mx) * nx + (state.mouseWorld.y - my) * ny;
+            }
+        }
+
+        // Phase-B bulge direction update with hysteresis: only flip when the
+        // cursor moves clearly past the anchor (beyond a dead zone around the
+        // chord line). When the cursor is close to the chord, keep the previous
+        // direction so the preview doesn't flicker.
+        if (state.archMode && state.archStart && !state.archEnd) {
+            const A = state.archStart;
+            const wp = state.mouseWorld;
+            // Find nearest valid anchor to use as the "chord reference" for direction.
+            // When no anchor is in snap range, fall back to start+cursor chord —
+            // in that case the cursor is always ON the chord so direction doesn't change.
+            let refEnd = null, bestD = Infinity;
+            const snapRange = GRID * 3;
+            for (const n of state.nodes) {
+                if (n.builtin) continue;
+                if (!n.fixed && !isConnectedToAnchor(state.nodes, state.members, n.x, n.y)) continue;
+                if (n.x === A.x && n.y === A.y) continue;
+                const d = Math.hypot(n.x - wp.x, n.y - wp.y);
+                if (d < snapRange && d < bestD) { refEnd = n; bestD = d; }
+            }
+            if (refEnd) {
+                const dx = refEnd.x - A.x, dy = refEnd.y - A.y;
+                const chord = Math.hypot(dx, dy);
+                if (chord > 5) {
+                    const nx = -dy / chord, ny = dx / chord;
+                    const mxm = (A.x + refEnd.x) / 2, mym = (A.y + refEnd.y) / 2;
+                    const signedPerp = (wp.x - mxm) * nx + (wp.y - mym) * ny;
+                    const threshold = GRID * 2;  // dead-zone radius around the chord
+                    if (signedPerp >  threshold) state.archBulgeDir =  1;
+                    else if (signedPerp < -threshold) state.archBulgeDir = -1;
+                    // within ±threshold → keep previous direction (hysteresis)
+                }
+            }
+        }
     });
 
     k.onMouseRelease(() => {
+        // Releasing the apex handle just stops the drag (don't fall through to beam-drag logic)
+        if (state.archDragging) { state.archDragging = false; return; }
+
         const pos = k.mousePos();
         if (!state.dragging || state.mode !== "build") { state.dragging = false; return; }
         const wp = toWorld(pos.x, pos.y);
@@ -429,6 +560,7 @@ export function gameScene(k, { levelIdx }) {
         }
 
         if (d > 5) {
+            const added = [];
             if (state.lineMode && d > GRID) {
                 // Line fill: auto-place segments along a straight line
                 const linePts = getLinePoints(st.x, st.y, sn.x, sn.y);
@@ -442,7 +574,11 @@ export function gameScene(k, { levelIdx }) {
                     if (n1 === n2) continue;
                     const exists = state.members.some(m =>
                         (m.n1 === n1 && m.n2 === n2) || (m.n2 === n1 && m.n1 === n2));
-                    if (!exists) state.members.push(new Member(n1, n2, state.selectedMat));
+                    if (!exists) {
+                        const m = new Member(n1, n2, state.selectedMat);
+                        state.members.push(m);
+                        added.push(m);
+                    }
                 }
             } else if (d <= mat.maxLength) {
                 // Straight mode: single segment
@@ -453,8 +589,13 @@ export function gameScene(k, { levelIdx }) {
                     ((m.n1.x === st.x && m.n1.y === st.y && m.n2.x === en.x && m.n2.y === en.y) ||
                      (m.n2.x === st.x && m.n2.y === st.y && m.n1.x === en.x && m.n1.y === en.y))
                 );
-                if (!exists) state.members.push(new Member(st, en, state.selectedMat));
+                if (!exists) {
+                    const m = new Member(st, en, state.selectedMat);
+                    state.members.push(m);
+                    added.push(m);
+                }
             }
+            pushUndoAction(added);
         }
         state.dragging = false;
     });
@@ -465,12 +606,49 @@ export function gameScene(k, { levelIdx }) {
         const matKey = availMats[mi];
         k.onKeyPress(String(mi + 1), () => { state.selectedMat = matKey; });
     }
-    k.onKeyPress("d", () => { state.delMode = !state.delMode; state.lineMode = false; state.curveMode = false; state.curveTarget = null; });
-    k.onKeyPress("f", () => { state.lineMode = !state.lineMode; state.delMode = false; state.curveMode = false; state.curveTarget = null; });
-    k.onKeyPress("c", () => { state.curveMode = !state.curveMode; state.delMode = false; state.lineMode = false; state.curveTarget = null; });
-    k.onKeyPress("z", () => { undoLast(); });
+    const resetArchState = () => {
+        state.archStart = null;
+        state.archEnd = null;
+        state.archDragging = false;
+        state.archBulgeDir = -1;   // next arch starts pointing up by default
+    };
+
+    // Cancel any in-progress arch: if we were editing a placed arch, restore it
+    // from the stash so the player gets back to where they started.
+    function cancelArch() {
+        if (state.editingArchId != null && state.editingOldMembers) {
+            for (const m of state.editingOldMembers) {
+                for (const n of [m.n1, m.n2]) {
+                    if (!state.nodes.includes(n)) state.nodes.push(n);
+                }
+                state.members.push(m);
+            }
+            if (state.editingOldArchData) state.arches.push(state.editingOldArchData);
+        }
+        state.editingArchId = null;
+        state.editingOldMembers = null;
+        state.editingOldArchData = null;
+        resetArchState();
+    }
+    k.onKeyPress("d", () => { state.delMode = !state.delMode; state.lineMode = false; state.archMode = false; resetArchState(); });
+    k.onKeyPress("f", () => { state.lineMode = !state.lineMode; state.delMode = false; state.archMode = false; resetArchState(); });
+    k.onKeyPress("c", () => { state.archMode = !state.archMode; state.delMode = false; state.lineMode = false; resetArchState(); });
+    // Z cancels an in-progress arch (before committing) instead of popping undo,
+    // since an in-progress arch preview isn't in the undo stack yet.
+    k.onKeyPress("z", () => {
+        if (state.archMode && (state.archStart || state.archEnd || state.editingArchId != null)) {
+            cancelArch();
+            return;
+        }
+        undoLast();
+    });
     k.onKeyPress("space", () => { toggleSim(); });
     k.onKeyPress("escape", () => { k.go("menu", { view: "levelSelect" }); });
+
+    // Right-click cancels an in-progress arch (clears all locked state, no commit)
+    k.onMousePress("right", () => {
+        if (state.archMode && (state.archStart || state.archEnd || state.editingArchId != null)) cancelArch();
+    });
 
     // ─── Line fill: evenly spaced points along a straight line ──
     // Uses the selected material's maxLength as segment size
@@ -493,60 +671,229 @@ export function gameScene(k, { levelIdx }) {
         return pts.filter((p, i) => i === 0 || p.x !== pts[i - 1].x || p.y !== pts[i - 1].y);
     }
 
-    // ─── Curve: compute arc points from member + mouse offset ──
-    function getCurvePoints(x1, y1, x2, y2, mouseX, mouseY) {
-        const dx = x2 - x1, dy = y2 - y1;
-        const len = Math.hypot(dx, dy);
-        if (len < 5) return null;
-        // Project mouse onto the perpendicular of the member to get bulge amount
-        const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
-        const nx = -dy / len, ny = dx / len; // normal (perpendicular)
-        const bulgeH = (mouseX - mx) * nx + (mouseY - my) * ny; // signed perpendicular distance
-        if (Math.abs(bulgeH) < GRID) return null; // too small to matter
-        const segments = Math.max(2, Math.min(5, Math.round(len / (GRID * 3))));
-        const pts = [];
-        pts.push({ x: x1, y: y1 });
-        for (let i = 1; i < segments; i++) {
-            const t = i / segments;
-            const bulge = 4 * t * (1 - t) * bulgeH; // parabolic
-            pts.push({
-                x: Math.round((x1 + dx * t + nx * bulge) / GRID) * GRID,
-                y: Math.round((y1 + dy * t + ny * bulge) / GRID) * GRID,
-            });
+    // ─── Arch tool helpers ────────────────────────────
+    //
+    // Polybridge-style: click anchor A, hover (end snaps to nearest valid
+    // anchor/connected node, height = perpendicular cursor offset from chord),
+    // click again to commit. Endpoints stay grid-aligned (they ARE existing
+    // nodes), but interior arch points are NOT grid-snapped — they trace a
+    // smooth parabola. Segment count auto-scales so each ≤ material maxLength.
+
+    // Find a valid anchor/connected node near a world point (for arch endpoints)
+    function pickArchAnchor(wp) {
+        const maxPick = GRID * 3;
+        let best = null, bestD = Infinity;
+        for (const n of state.nodes) {
+            if (n.builtin) continue;
+            // Only nodes that anchor structure (fixed anchors, or already connected to one)
+            if (!n.fixed && !isConnectedToAnchor(state.nodes, state.members, n.x, n.y)) continue;
+            const d = Math.hypot(n.x - wp.x, n.y - wp.y);
+            if (d < bestD && d < maxPick) { best = n; bestD = d; }
         }
-        pts.push({ x: x2, y: y2 });
-        return pts;
+        return best;
     }
 
-    function applyCurve() {
-        const ct = state.curveTarget;
-        if (!ct) return;
-        const pts = getCurvePoints(ct.x1, ct.y1, ct.x2, ct.y2, state.mouseWorld.x, state.mouseWorld.y);
-        if (!pts) { state.curveTarget = null; return; }
-        // Remove original member
-        const idx = state.members.findIndex(m => m === ct.member);
-        if (idx !== -1) state.members.splice(idx, 1);
-        // Add curved segments
-        for (let i = 0; i < pts.length - 1; i++) {
-            const n1 = findOrCreate(pts[i].x, pts[i].y);
-            const n2 = findOrCreate(pts[i + 1].x, pts[i + 1].y);
+    // Compute arch geometry between two world points with a given bulge.
+    // Returns { points, end, bulge } or null if degenerate.
+    function buildArch(A, end, bulge) {
+        const dx = end.x - A.x, dy = end.y - A.y;
+        const chord = Math.hypot(dx, dy);
+        if (chord < GRID) return null;
+
+        const nx = -dy / chord, ny = dx / chord;
+
+        // Segment count scales with arc length so each chord ≤ material maxLength.
+        // Parabola arc length ≈ chord + (8/3)·bulge²/chord
+        const mat = MATERIALS[state.selectedMat];
+        const arcLen = chord + (8 / 3) * (bulge * bulge) / chord;
+        let segments = Math.max(2, Math.ceil(arcLen / (mat.maxLength * 0.9)));
+
+        const buildPoints = (n) => {
+            const pts = [];
+            for (let i = 0; i <= n; i++) {
+                const t = i / n;
+                const b = 4 * t * (1 - t) * bulge;
+                pts.push({
+                    x: A.x + dx * t + nx * b,
+                    y: A.y + dy * t + ny * b,
+                });
+            }
+            pts[0] = { x: A.x, y: A.y };
+            pts[n] = { x: end.x, y: end.y };
+            return pts;
+        };
+
+        let pts;
+        for (let attempt = 0; attempt < 8; attempt++) {
+            pts = buildPoints(segments);
+            let worst = 0;
+            for (let i = 0; i < pts.length - 1; i++) {
+                const sd = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+                if (sd > worst) worst = sd;
+            }
+            if (worst <= mat.maxLength) break;
+            segments++;
+        }
+
+        return { points: pts, end, bulge };
+    }
+
+    // Phase C: arch with the user-controlled bulge between locked endpoints
+    function computeArch() {
+        if (!state.archStart || !state.archEnd) return null;
+        return buildArch(state.archStart, state.archEnd, state.archBulge);
+    }
+
+    // Phase B: preview arch from locked start to the cursor. If the cursor is
+    // hovering near a valid anchor, the end snaps to that anchor so the player
+    // sees exactly what clicking would commit. Bulge direction follows whichever
+    // side of the chord the cursor is on (so aiming above → up arch, below →
+    // down arch).
+    function computeArchPhaseBPreview() {
+        if (!state.archStart || state.archEnd) return null;
+        const wp = state.mouseWorld;
+
+        // Snap to nearest valid anchor when cursor is in its grab range
+        let snapped = null, bestD = Infinity;
+        const snapRange = GRID * 3;
+        for (const n of state.nodes) {
+            if (n.builtin) continue;
+            if (!n.fixed && !isConnectedToAnchor(state.nodes, state.members, n.x, n.y)) continue;
+            if (n.x === state.archStart.x && n.y === state.archStart.y) continue;
+            const d = Math.hypot(n.x - wp.x, n.y - wp.y);
+            if (d < snapRange && d < bestD) { snapped = n; bestD = d; }
+        }
+
+        const end = snapped ? { x: snapped.x, y: snapped.y } : { x: wp.x, y: wp.y };
+        const dx = end.x - state.archStart.x, dy = end.y - state.archStart.y;
+        const chord = Math.hypot(dx, dy);
+        if (chord < GRID) return null;
+
+        // Direction comes from the hysteresis-tracked state (updated in onMouseMove)
+        const arch = buildArch(state.archStart, end, state.archBulgeDir * chord * 0.25);
+        if (arch) arch.snapped = !!snapped;
+        return arch;
+    }
+
+    // Screen position of the arch's apex (where the draggable handle sits)
+    function getArchApexScreen() {
+        if (!state.archStart || !state.archEnd) return null;
+        const A = state.archStart, B = state.archEnd;
+        const dx = B.x - A.x, dy = B.y - A.y;
+        const chord = Math.hypot(dx, dy);
+        if (chord === 0) return null;
+        const nx = -dy / chord, ny = dx / chord;
+        const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2;
+        const apex = { x: mx + nx * state.archBulge, y: my + ny * state.archBulge };
+        return toScreen(apex.x, apex.y);
+    }
+
+    function applyArch(arch) {
+        // If we were editing a placed arch, the old members and arch record are
+        // already stashed (and removed from state). Consume the stash so undo
+        // can reverse the WHOLE edit in one pop.
+        const editingOld = state.editingArchId != null ? {
+            oldMembers: state.editingOldMembers,
+            oldArchData: state.editingOldArchData,
+        } : null;
+        const archId = state.editingArchId != null ? state.editingArchId : state.nextArchId++;
+
+        const added = [];
+        for (let i = 0; i < arch.points.length - 1; i++) {
+            const p1 = arch.points[i];
+            const p2 = arch.points[i + 1];
+            const n1 = findOrCreate(p1.x, p1.y);
+            const n2 = findOrCreate(p2.x, p2.y);
             if (n1 === n2) continue;
             const exists = state.members.some(mb =>
                 (mb.n1 === n1 && mb.n2 === n2) || (mb.n2 === n1 && mb.n1 === n2));
-            if (!exists) state.members.push(new Member(n1, n2, ct.type));
+            if (!exists) {
+                const m = new Member(n1, n2, state.selectedMat);
+                m.archId = archId;
+                state.members.push(m);
+                added.push(m);
+            }
         }
-        state.curveTarget = null;
+
+        const newArchData = {
+            id: archId,
+            start: { ...state.archStart },
+            end: { ...state.archEnd },
+            bulge: state.archBulge,
+        };
+        state.arches.push(newArchData);
+
+        // Clear edit state (stash has been consumed) + sweep orphan nodes
+        state.editingArchId = null;
+        state.editingOldMembers = null;
+        state.editingOldArchData = null;
+        state.nodes = state.nodes.filter(n =>
+            n.fixed || n.builtin || state.members.some(m => m.n1 === n || m.n2 === n));
+
+        if (editingOld) {
+            state.undoStack.push({ edited: {
+                newMembers: added, newArchData,
+                oldMembers: editingOld.oldMembers, oldArchData: editingOld.oldArchData,
+            } });
+        } else {
+            pushUndoAction(added);
+        }
+    }
+
+    // Record one action (a list of members placed in a single user gesture)
+    function pushUndoAction(members) {
+        if (members && members.length) state.undoStack.push({ members });
     }
 
     function undoLast() {
-        let idx = state.members.length - 1;
-        while (idx >= 0 && state.members[idx].builtin) idx--;
-        if (idx < 0) return;
-        const last = state.members.splice(idx, 1)[0];
-        [last.n1, last.n2].forEach(n => {
-            if (!n.fixed && !n.builtin && !state.members.some(m => m.n1 === n || m.n2 === n))
-                state.nodes = state.nodes.filter(nd => nd !== n);
-        });
+        if (state.mode !== "build") return;
+        const action = state.undoStack.pop();
+        if (!action) return;
+
+        if (action.deleted) {
+            // Restore a previously-deleted member + any orphan nodes that went with it
+            for (const n of action.deleted.nodes) {
+                if (!state.nodes.includes(n)) state.nodes.push(n);
+            }
+            state.members.push(action.deleted.member);
+            return;
+        }
+
+        if (action.edited) {
+            // Arch-edit reversal: remove new arch + record, restore old arch + record
+            for (const m of action.edited.newMembers) {
+                const idx = state.members.indexOf(m);
+                if (idx !== -1) state.members.splice(idx, 1);
+            }
+            state.arches = state.arches.filter(a => a.id !== action.edited.newArchData.id);
+            for (const m of action.edited.oldMembers) {
+                for (const n of [m.n1, m.n2]) {
+                    if (!state.nodes.includes(n)) state.nodes.push(n);
+                }
+                state.members.push(m);
+            }
+            state.arches.push(action.edited.oldArchData);
+            state.nodes = state.nodes.filter(n =>
+                n.fixed || n.builtin || state.members.some(m => m.n1 === n || m.n2 === n));
+            return;
+        }
+
+        // Action added members → remove them, then sweep orphan nodes
+        const removedIds = new Set();
+        for (const m of action.members) {
+            if (m.archId != null) removedIds.add(m.archId);
+            const idx = state.members.indexOf(m);
+            if (idx !== -1) state.members.splice(idx, 1);
+        }
+        // If the removed members belonged to arch(es) and no more members from
+        // the arch remain, drop the arch record too
+        for (const id of removedIds) {
+            if (!state.members.some(mb => mb.archId === id)) {
+                state.arches = state.arches.filter(a => a.id !== id);
+            }
+        }
+        state.nodes = state.nodes.filter(n =>
+            n.fixed || n.builtin || state.members.some(m => m.n1 === n || m.n2 === n));
     }
 
     function toggleSim() {
@@ -554,9 +901,11 @@ export function gameScene(k, { levelIdx }) {
         if (state.mode === "build") {
             const cost = calcCost(state.members);
             if (cost > lvl.budget) {
-                state.modal = { win: false, title: "OVER BUDGET", desc: `$${cost.toLocaleString()} exceeds the $${lvl.budget.toLocaleString()} budget. Remove some members.`, score: null };
+                state.modal = { win: false, title: "OVER BUDGET", desc: `$${cost.toLocaleString()} exceeds the $${lvl.budget.toLocaleString()} budget. Remove some members.`, openTime: k.time() };
                 return;
             }
+            // Cancel any in-progress arch so its preview doesn't render in sim
+            cancelArch();
             initPhysicsWorld(state, lvl);
             state.mode = "sim";
         } else {
@@ -580,7 +929,7 @@ export function gameScene(k, { levelIdx }) {
             simBtn: { x: W - 230, y: pad + 8, w: 100, h: 32 },
             delBtn:   { x: matStartX + matKeys.length * (matBtnW + 4) + 10,  y: pad + 8, w: 50, h: 32 },
             lineBtn:  { x: matStartX + matKeys.length * (matBtnW + 4) + 65,  y: pad + 8, w: 50, h: 32 },
-            curveBtn: { x: matStartX + matKeys.length * (matBtnW + 4) + 120, y: pad + 8, w: 50, h: 32 },
+            archBtn: { x: matStartX + matKeys.length * (matBtnW + 4) + 120, y: pad + 8, w: 50, h: 32 },
             undoBtn:  { x: matStartX + matKeys.length * (matBtnW + 4) + 175, y: pad + 8, w: 55, h: 32 },
             speedBtn: { x: W - 125, y: pad + 8, w: 46, h: 32 },
             menuBtn: { x: W - 55, y: pad + 8, w: 48, h: 32 },
@@ -621,15 +970,17 @@ export function gameScene(k, { levelIdx }) {
         const lb = tb.lineBtn;
         if (pos.x >= lb.x && pos.x <= lb.x + lb.w && y >= lb.y && y <= lb.y + lb.h) {
             state.lineMode = !state.lineMode;
-            state.curveMode = false;
+            state.archMode = false;
+            resetArchState();
             state.delMode = false;
             return true;
         }
 
-        // Curve button
-        const cb = tb.curveBtn;
-        if (pos.x >= cb.x && pos.x <= cb.x + cb.w && y >= cb.y && y <= cb.y + cb.h) {
-            state.curveMode = !state.curveMode;
+        // Arch button
+        const arb = tb.archBtn;
+        if (pos.x >= arb.x && pos.x <= arb.x + arb.w && y >= arb.y && y <= arb.y + arb.h) {
+            state.archMode = !state.archMode;
+            resetArchState();
             state.lineMode = false;
             state.delMode = false;
             return true;
@@ -720,6 +1071,7 @@ export function gameScene(k, { levelIdx }) {
     // Place the members for the current lesson step into the world.
     function buildLessonStep(step) {
         if (!step?.members) return;
+        const added = [];
         for (const mb of step.members) {
             const x1 = Math.round(mb.x1 / GRID) * GRID;
             const y1 = Math.round(mb.y1 / GRID) * GRID;
@@ -730,8 +1082,13 @@ export function gameScene(k, { levelIdx }) {
             const n2 = findOrCreate(x2, y2);
             const exists = state.members.some(m =>
                 (m.n1 === n1 && m.n2 === n2) || (m.n2 === n1 && m.n1 === n2));
-            if (!exists) state.members.push(new Member(n1, n2, type));
+            if (!exists) {
+                const m = new Member(n1, n2, type);
+                state.members.push(m);
+                added.push(m);
+            }
         }
+        pushUndoAction(added);
     }
 
     // Handle a click on an option button or the Next button.
@@ -781,10 +1138,43 @@ export function gameScene(k, { levelIdx }) {
 
     // ═══════════════════════════════════════════════════
     //  UPDATE (physics)
+    //
+    //  Fixed-timestep accumulator: physics runs at a fixed Hz
+    //  (user-selectable via settings) independent of display
+    //  refresh rate. Without this, a 144Hz monitor runs the
+    //  simulation 2.4× faster than a 60Hz one.
+    //
+    //  fpsCap: 30 or 60 → physics ticks at that rate.
+    //  fpsCap: 0        → one tick per animation frame (matches
+    //                     display refresh — legacy uncapped).
     // ═══════════════════════════════════════════════════
+    function getFpsCap() {
+        try {
+            const s = JSON.parse(localStorage.getItem("bridgesnap_settings")) || {};
+            return typeof s.fpsCap === "number" ? s.fpsCap : 60;
+        } catch { return 60; }
+    }
+    let physicsAcc = 0;
+
     k.onUpdate(() => {
         if (state.mode !== "sim" && state.mode !== "end") return;
 
+        const fpsCap = getFpsCap();
+        let ticksThisFrame;
+        if (fpsCap === 0) {
+            ticksThisFrame = 1;
+        } else {
+            const step = 1 / fpsCap;
+            physicsAcc += k.dt();
+            ticksThisFrame = 0;
+            while (physicsAcc >= step) {
+                physicsAcc -= step;
+                ticksThisFrame++;
+                if (ticksThisFrame >= 5) { physicsAcc = 0; break; }
+            }
+        }
+
+        for (let tick = 0; tick < ticksThisFrame; tick++) {
         for (let sp = 0; sp < state.simSpeed; sp++) {
             // Physics keeps running in "end" mode so pieces fall and dangle
             physicsTick(state);
@@ -826,10 +1216,35 @@ export function gameScene(k, { levelIdx }) {
             state.particles.forEach(p => p.update());
             state.particles = state.particles.filter(p => p.life > 0);
 
+            // Consume snap events from physics → spawn popup + confetti burst
+            if (state.snapEvents.length) {
+                for (const ev of state.snapEvents) spawnSnapVfx(ev.x, ev.y);
+                state.snapEvents.length = 0;
+            }
+
+            // Snap popups: float up, age out
+            for (const p of state.snapPopups) {
+                p.age++;
+                p.y -= 0.35;
+            }
+            state.snapPopups = state.snapPopups.filter(p => p.age < p.life);
+
+            // Snap confetti: ballistic fall + rotation
+            for (const c of state.snapConfetti) {
+                c.age++;
+                c.x += c.vx;
+                c.y += c.vy;
+                c.vy += 0.18;
+                c.vx *= 0.99;
+                c.rot += c.rotSpd;
+            }
+            state.snapConfetti = state.snapConfetti.filter(c => c.age < c.life);
+
             if (state.shakeMag > 0.05) state.shakeMag *= 0.80;
             else state.shakeMag = 0;
 
             state.flagWave += 0.05;
+        }
         }
     });
 
@@ -843,16 +1258,22 @@ export function gameScene(k, { levelIdx }) {
             const sc = getScale();
 
             drawBackground(W, H, sc);
-            drawMembers(sc);      // members behind water — fallen pieces look submerged
+            // Roads first — car drives on top of them
+            drawMembers(sc, "roads");
             drawGhostBeam(sc);
-            drawCurvePreview(sc);
+            drawArchPreview(sc);
             drawNodes(sc);
             drawWater(W, H, sc);
             drawTerrain(sc);
             drawFlags(sc);        // flags behind vehicles
             drawVehicles(sc);
+            // Structural beams in front of the car for a 3D-truss feel — the car
+            // appears to pass *through* the bridge frame from the side view
+            drawMembers(sc, "structural");
             drawSplashes(sc);
             drawParticles(sc);
+            drawSnapConfetti(sc);
+            drawSnapPopups(sc);
 
             // ─── UI overlay (screen space) ──────────────
             drawToolbar();
@@ -921,32 +1342,58 @@ export function gameScene(k, { levelIdx }) {
             return;
         }
 
-        // ─── Build mode: fine grid with major/minor lines ───
+        // ─── Build mode: graph-paper grid with major/minor lines ───
+        //
+        // Renders crisp pixel-aligned lines (integer positions + width 1).
+        // Skips minor grid when world-units are too compressed to render
+        // cleanly — avoids moiré / aliased appearance at small scales.
         k.drawRect({ width: W, height: H, pos: k.vec2(0, 0), color: k.Color.fromHex("#d9c9a8"), anchor: "topleft" });
 
         const wLeft = toWorld(0, 0);
         const wRight = toWorld(W, H);
 
-        const step = GRID;       // minor grid (12px)
-        const major = GRID * 3;  // major grid (36px — old grid size)
-        const originX = lX;
-        const originY = lY;
+        const step = GRID;       // minor grid (12px world units)
+        const major = GRID * 3;  // major grid (36px world units)
+        const lineCol = k.Color.fromHex("#8a7350");
 
-        // Vertical lines — pad one extra step past each screen edge
-        const startX = originX - Math.ceil((originX - wLeft.x) / step) * step - step;
-        for (let wx = startX; wx <= wRight.x + step; wx += step) {
-            const p1 = toScreen(wx, wLeft.y - 200);
-            const p2 = toScreen(wx, wRight.y + 200);
-            const isMajor = Math.abs(Math.round(wx / major) * major - wx) < 1;
-            k.drawLine({ p1, p2, width: isMajor ? 1 : 0.5, color: k.Color.fromHex("#8a7350"), opacity: isMajor ? 0.35 : 0.18 });
+        // How many screen pixels per minor step? Skip minor lines if too cramped.
+        const minorPx = step * sc;
+        const drawMinor = minorPx >= 5;
+
+        // Align line positions to integer pixels with 0.5 offset for crisp 1px rendering.
+        const pixelAlign = (v) => Math.round(v) + 0.5;
+
+        // Vertical lines — integer index prevents FP drift on long loops
+        const iStartX = Math.floor(wLeft.x / step) - 1;
+        const iEndX   = Math.ceil(wRight.x / step) + 1;
+        for (let i = iStartX; i <= iEndX; i++) {
+            const wx = i * step;
+            const isMajor = i % 3 === 0;
+            if (!isMajor && !drawMinor) continue;
+            const sx = pixelAlign(toScreen(wx, 0).x);
+            k.drawLine({
+                p1: k.vec2(sx, 0),
+                p2: k.vec2(sx, H),
+                width: 1,
+                color: lineCol,
+                opacity: isMajor ? 0.40 : 0.18,
+            });
         }
-        // Horizontal lines — pad one extra step past each screen edge
-        const startY = originY - Math.ceil((originY - wLeft.y) / step) * step - step;
-        for (let wy = startY; wy <= wRight.y + step; wy += step) {
-            const p1 = toScreen(wLeft.x - 200, wy);
-            const p2 = toScreen(wRight.x + 200, wy);
-            const isMajor = Math.abs(Math.round(wy / major) * major - wy) < 1;
-            k.drawLine({ p1, p2, width: isMajor ? 1 : 0.5, color: k.Color.fromHex("#8a7350"), opacity: isMajor ? 0.35 : 0.18 });
+        // Horizontal lines
+        const iStartY = Math.floor(wLeft.y / step) - 1;
+        const iEndY   = Math.ceil(wRight.y / step) + 1;
+        for (let i = iStartY; i <= iEndY; i++) {
+            const wy = i * step;
+            const isMajor = i % 3 === 0;
+            if (!isMajor && !drawMinor) continue;
+            const sy = pixelAlign(toScreen(0, wy).y);
+            k.drawLine({
+                p1: k.vec2(0, sy),
+                p2: k.vec2(W, sy),
+                width: 1,
+                color: lineCol,
+                opacity: isMajor ? 0.40 : 0.18,
+            });
         }
     }
 
@@ -1119,7 +1566,16 @@ export function gameScene(k, { levelIdx }) {
     }
 
     // ─── Members ─────────────────────────────────────
-    function drawMembers(sc) {
+    // `layer` selects which subset to draw:
+    //   "roads"      — road planks only (drawn before vehicles, so the car sits on top)
+    //   "structural" — non-road beams only (drawn after vehicles for a 3D-truss feel)
+    //   "all"        — everything (default; build mode and other safe contexts)
+    function drawMembers(sc, layer = "all") {
+        const wantRoad = (m) => MATERIALS[m.type].isRoad;
+        const skipMember = (m) =>
+            (layer === "roads" && !wantRoad(m)) ||
+            (layer === "structural" && wantRoad(m));
+
         // Helper: get member color (stress-based in sim, material color in build)
         function getMemberColor(m) {
             const mat = MATERIALS[m.type];
@@ -1133,23 +1589,31 @@ export function gameScene(k, { levelIdx }) {
             return mat.color;
         }
 
-        // Draw joint fills for road segments (skip broken)
-        for (const m of state.members) {
-            if (!MATERIALS[m.type].isRoad || m.broken) continue;
-            const mat = MATERIALS[m.type];
-            const r = mat.width * sc * 0.5;
-            const col = k.Color.fromHex(getMemberColor(m));
-            for (const n of [m.n1, m.n2]) {
-                const p = toScreen(n.x, n.y);
-                if (n.fixed) {
-                    k.drawRect({ pos: k.vec2(p.x - r, p.y - r), width: r * 2, height: r * 2, color: col, anchor: "topleft" });
-                } else {
-                    k.drawCircle({ pos: p, radius: r, color: col });
+        // Draw joint fills for road segments (skip broken). Road-only by definition,
+        // so they only run when the layer wants roads.
+        if (layer !== "structural") {
+            for (const m of state.members) {
+                if (!MATERIALS[m.type].isRoad || m.broken) continue;
+                const mat = MATERIALS[m.type];
+                const r = mat.width * sc * 0.5;
+                const col = k.Color.fromHex(getMemberColor(m));
+                for (const n of [m.n1, m.n2]) {
+                    const p = toScreen(n.x, n.y);
+                    if (n.fixed) {
+                        // Squares at fixed anchors are build-time guides; they look
+                        // like artifacts once the car is crossing, so hide in sim/end.
+                        if (state.mode === "build") {
+                            k.drawRect({ pos: k.vec2(p.x - r, p.y - r), width: r * 2, height: r * 2, color: col, anchor: "topleft" });
+                        }
+                    } else {
+                        k.drawCircle({ pos: p, radius: r, color: col });
+                    }
                 }
             }
         }
 
         for (const m of state.members) {
+            if (skipMember(m)) continue;
             const p1 = toScreen(m.n1.x, m.n1.y);
             const p2 = toScreen(m.n2.x, m.n2.y);
             const mat = MATERIALS[m.type];
@@ -1351,14 +1815,17 @@ export function gameScene(k, { levelIdx }) {
 
         }
 
-        // ── Draw joint dots at free nodes ──
-        for (const m of state.members) {
-            if (m.builtin) continue;
-            const r = 2 * sc;
-            for (const n of [m.n1, m.n2]) {
-                if (n.fixed) continue;
-                const p = toScreen(n.x, n.y);
-                k.drawRect({ pos: k.vec2(p.x - r, p.y - r), width: r * 2, height: r * 2, color: k.Color.fromHex("#5a4a30"), anchor: "topleft" });
+        // ── Draw joint dots at free nodes (build-mode only — they clash with
+        //     vehicles and road art during simulation) ──
+        if (state.mode === "build") {
+            for (const m of state.members) {
+                if (m.builtin) continue;
+                const r = 2 * sc;
+                for (const n of [m.n1, m.n2]) {
+                    if (n.fixed) continue;
+                    const p = toScreen(n.x, n.y);
+                    k.drawRect({ pos: k.vec2(p.x - r, p.y - r), width: r * 2, height: r * 2, color: k.Color.fromHex("#5a4a30"), anchor: "topleft" });
+                }
             }
         }
     }
@@ -1434,30 +1901,80 @@ export function gameScene(k, { levelIdx }) {
         }
     }
 
-    // ─── Curve preview ─────────────────────────────
-    function drawCurvePreview(sc) {
-        if (!state.curveMode || !state.curveTarget) return;
-        const ct = state.curveTarget;
-        const pts = getCurvePoints(ct.x1, ct.y1, ct.x2, ct.y2, state.mouseWorld.x, state.mouseWorld.y);
+    // ─── Arch preview ──────────────────────────────
+    function drawArchPreview(sc) {
+        if (!state.archMode || state.mode !== "build") return;
 
-        // Highlight the original member
-        const op1 = toScreen(ct.x1, ct.y1);
-        const op2 = toScreen(ct.x2, ct.y2);
-        k.drawLine({ p1: op1, p2: op2, width: 4, color: k.Color.fromHex(C.accent), opacity: 0.3 });
+        const previewCol = k.Color.fromHex(C.accent);
 
-        if (pts) {
-            // Draw the curved preview
-            const previewCol = k.Color.fromHex(C.accent);
-            for (let i = 0; i < pts.length - 1; i++) {
-                const pp1 = toScreen(pts[i].x, pts[i].y);
-                const pp2 = toScreen(pts[i + 1].x, pts[i + 1].y);
-                k.drawLine({ p1: pp1, p2: pp2, width: MATERIALS[ct.type].width * sc * 0.6, color: previewCol, opacity: 0.6 });
+        // Phase A & B helper: ring every valid candidate node so player sees options
+        if (!state.archStart || !state.archEnd) {
+            for (const n of state.nodes) {
+                if (n.builtin) continue;
+                if (!n.fixed && !isConnectedToAnchor(state.nodes, state.members, n.x, n.y)) continue;
+                const np = toScreen(n.x, n.y);
+                k.drawCircle({ pos: np, radius: 6, fill: false, outline: { width: 2, color: previewCol }, opacity: 0.55 });
             }
-            // Dots at curve nodes
-            for (let i = 1; i < pts.length - 1; i++) {
-                const pp = toScreen(pts[i].x, pts[i].y);
-                k.drawCircle({ pos: pp, radius: 5, color: previewCol, opacity: 0.7 });
+        }
+
+        if (!state.archStart) return;
+
+        // Lock-in dot for the start anchor
+        const sp = toScreen(state.archStart.x, state.archStart.y);
+        k.drawCircle({ pos: sp, radius: 8, color: previewCol, opacity: 0.85 });
+
+        // Phase B: only start chosen — arch follows the cursor. End snaps to a
+        // valid anchor when hovering near one (solid dot); otherwise floats at
+        // the cursor (smaller dot, lower opacity) so the shape is always visible.
+        if (!state.archEnd) {
+            const previewArch = computeArchPhaseBPreview();
+            if (previewArch) {
+                const ep = toScreen(previewArch.end.x, previewArch.end.y);
+                const wMat = MATERIALS[state.selectedMat];
+                for (let i = 0; i < previewArch.points.length - 1; i++) {
+                    const pp1 = toScreen(previewArch.points[i].x, previewArch.points[i].y);
+                    const pp2 = toScreen(previewArch.points[i + 1].x, previewArch.points[i + 1].y);
+                    k.drawLine({ p1: pp1, p2: pp2, width: wMat.width * sc * 0.6, color: previewCol, opacity: previewArch.snapped ? 0.7 : 0.45 });
+                }
+                if (previewArch.snapped) {
+                    k.drawCircle({ pos: ep, radius: 8, color: previewCol, opacity: 0.85 });
+                } else {
+                    k.drawCircle({ pos: ep, radius: 5, color: previewCol, opacity: 0.5 });
+                }
             }
+            return;
+        }
+
+        // Phase C: both endpoints set — render full arch + apex handle
+        const arch = computeArch();
+        if (!arch) return;
+
+        const ep = toScreen(arch.end.x, arch.end.y);
+        // Faint chord reference
+        k.drawLine({ p1: sp, p2: ep, width: 1, color: previewCol, opacity: 0.25 });
+
+        const wMat = MATERIALS[state.selectedMat];
+        for (let i = 0; i < arch.points.length - 1; i++) {
+            const pp1 = toScreen(arch.points[i].x, arch.points[i].y);
+            const pp2 = toScreen(arch.points[i + 1].x, arch.points[i + 1].y);
+            k.drawLine({ p1: pp1, p2: pp2, width: wMat.width * sc * 0.6, color: previewCol, opacity: 0.7 });
+        }
+        for (let i = 1; i < arch.points.length - 1; i++) {
+            const pp = toScreen(arch.points[i].x, arch.points[i].y);
+            k.drawCircle({ pos: pp, radius: 4, color: previewCol, opacity: 0.75 });
+        }
+        // End anchor lock dot
+        k.drawCircle({ pos: ep, radius: 8, color: previewCol, opacity: 0.85 });
+
+        // Apex handle — clearly draggable: filled disc + ring + cross-hair
+        const apex = getArchApexScreen();
+        if (apex) {
+            const r = state.archDragging ? 11 : 9;
+            k.drawCircle({ pos: k.vec2(apex.x + 1, apex.y + 1), radius: r + 1, color: k.Color.fromHex("#000000"), opacity: 0.3 });
+            k.drawCircle({ pos: apex, radius: r, color: k.Color.fromHex("#fff8e0") });
+            k.drawCircle({ pos: apex, radius: r, fill: false, outline: { width: 2.5, color: previewCol } });
+            k.drawLine({ p1: k.vec2(apex.x, apex.y - r * 0.55), p2: k.vec2(apex.x, apex.y + r * 0.55), width: 2, color: previewCol });
+            k.drawLine({ p1: k.vec2(apex.x - r * 0.55, apex.y), p2: k.vec2(apex.x + r * 0.55, apex.y), width: 2, color: previewCol });
         }
     }
 
@@ -1526,6 +2043,136 @@ export function gameScene(k, { levelIdx }) {
         }
     }
 
+    // ─── SNAP! popup + confetti burst (on bridge break) ────
+    // Colors echo the logo / main-menu confetti palette for a playful craft vibe
+    const SNAP_COLORS = ["#e05080","#50a0e0","#e0c030","#50c060","#e07030","#a060d0"];
+
+    function spawnSnapVfx(wx, wy) {
+        // Shuffle palette so each letter gets a unique color (Fisher–Yates on a copy)
+        const palette = SNAP_COLORS.slice();
+        for (let i = palette.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [palette[i], palette[j]] = [palette[j], palette[i]];
+        }
+        // One popup per snap event — letters carry their own color + slight random tilt
+        const letters = "SNAP!".split("").map((ch, i) => ({
+            ch,
+            color: palette[i],  // guaranteed distinct (5 letters ≤ 6 palette entries)
+            tilt: (Math.random() - 0.5) * 24,    // degrees
+            bob:  Math.random() * Math.PI * 2,   // phase for idle wiggle
+            dy:   (Math.random() - 0.5) * 6,     // slight vertical jitter
+        }));
+        state.snapPopups.push({
+            x: wx, y: wy - 20,   // spawn slightly above the break point
+            age: 0, life: 80,    // ~1.3s at 60Hz
+            letters,
+        });
+
+        // Confetti burst — ~28 rotated rectangles exploding outward
+        for (let i = 0; i < 28; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = 2 + Math.random() * 4;
+            state.snapConfetti.push({
+                x: wx, y: wy,
+                vx: Math.cos(angle) * speed,
+                vy: Math.sin(angle) * speed - 2,   // bias upward for a pop
+                rot: Math.random() * Math.PI * 2,
+                rotSpd: (Math.random() - 0.5) * 0.4,
+                w: 4 + Math.random() * 4,
+                h: 6 + Math.random() * 5,
+                color: SNAP_COLORS[Math.floor(Math.random() * SNAP_COLORS.length)],
+                age: 0, life: 90,                  // ~1.5s at 60Hz
+            });
+        }
+    }
+
+    function drawSnapConfetti(sc) {
+        for (const c of state.snapConfetti) {
+            const cp = toScreen(c.x, c.y);
+            const t = c.age / c.life;
+            const opacity = Math.min(1, (1 - t) * 2); // fade in last half of life
+
+            const hw = c.w * 0.5 * sc;
+            const hh = c.h * 0.5 * sc;
+            const cos = Math.cos(c.rot), sin = Math.sin(c.rot);
+            const pts = [
+                k.vec2(cp.x + (-hw * cos - (-hh) * sin), cp.y + (-hw * sin + (-hh) * cos)),
+                k.vec2(cp.x + ( hw * cos - (-hh) * sin), cp.y + ( hw * sin + (-hh) * cos)),
+                k.vec2(cp.x + ( hw * cos -   hh  * sin), cp.y + ( hw * sin +   hh  * cos)),
+                k.vec2(cp.x + (-hw * cos -   hh  * sin), cp.y + (-hw * sin +   hh  * cos)),
+            ];
+            const fill = k.Color.fromHex(c.color);
+            k.drawTriangle({ p1: pts[0], p2: pts[1], p3: pts[2], color: fill, opacity });
+            k.drawTriangle({ p1: pts[0], p2: pts[2], p3: pts[3], color: fill, opacity });
+        }
+    }
+
+    function drawSnapPopups(sc) {
+        for (const p of state.snapPopups) {
+            const t = p.age / p.life;
+
+            // Scale curve: punch-in (overshoot), settle, hold, blow-up fade-out
+            let scale, opacity;
+            if (t < 0.15) {
+                const k2 = t / 0.15;
+                scale = k2 * 1.25;
+                opacity = k2;
+            } else if (t < 0.25) {
+                const k2 = (t - 0.15) / 0.10;
+                scale = 1.25 - k2 * 0.25;
+                opacity = 1;
+            } else if (t < 0.70) {
+                scale = 1;
+                opacity = 1;
+            } else {
+                const k2 = (t - 0.70) / 0.30;
+                scale = 1 + k2 * 0.35;
+                opacity = 1 - k2;
+            }
+
+            const cp = toScreen(p.x, p.y);
+            const fontSize = 28 * sc * scale;
+            const letterSpacing = fontSize * 1.05;  // PressStart2P is near-square, needs ~full-em
+            const totalW = (p.letters.length - 1) * letterSpacing;
+            const startX = cp.x - totalW / 2;
+
+            for (let i = 0; i < p.letters.length; i++) {
+                const L = p.letters[i];
+                const lx = startX + i * letterSpacing;
+                const wiggle = Math.sin(p.age * 0.2 + L.bob) * 2 * sc;
+                const ly = cp.y + L.dy * sc + wiggle;
+
+                // Rotate each letter individually via transform stack
+                k.pushTransform();
+                k.pushTranslate(lx, ly);
+                k.pushRotate(L.tilt);
+
+                // Shadow pass — dark, slightly offset, behind
+                k.drawText({
+                    text: L.ch,
+                    pos: k.vec2(2 * sc, 2 * sc),
+                    size: fontSize,
+                    font: "PressStart2P",
+                    color: k.Color.fromHex("#1a0e05"),
+                    opacity: opacity * 0.45,
+                    anchor: "center",
+                });
+                // Main colored letter
+                k.drawText({
+                    text: L.ch,
+                    pos: k.vec2(0, 0),
+                    size: fontSize,
+                    font: "PressStart2P",
+                    color: k.Color.fromHex(L.color),
+                    opacity,
+                    anchor: "center",
+                });
+
+                k.popTransform();
+            }
+        }
+    }
+
     // ─── Finish flags ───────────────────────────────
     function drawFlags(sc) {
         const FLAG_INLAND = 80;
@@ -1541,36 +2188,39 @@ export function gameScene(k, { levelIdx }) {
 
     function drawOneFlag(wx, wy, color, label, triggered, sc) {
         const p = toScreen(wx, wy);
-        const flagH = sc * 50;
+        const flagH = sc * 70;      // taller so the flag reads from the ground
         const flagW = flagH;
 
-        // Animated flag sprite — positioned at road level
+        // Animated flag sprite — pole base sits exactly on the road surface
+        const flagBottomY = p.y;
         const frame = Math.floor(state.flagWave * 3) % 5;
         try {
             k.drawSprite({
                 sprite: "flag",
                 frame: frame,
-                pos: k.vec2(p.x, p.y + flagH * 0.05),
+                pos: k.vec2(p.x, flagBottomY),
                 width: flagW,
                 height: flagH,
                 anchor: "botleft",
             });
         } catch(e) {
             // Fallback rectangle flag
-            const poleH = sc * 52;
-            k.drawLine({ p1: k.vec2(p.x, p.y), p2: k.vec2(p.x, p.y - poleH), width: 2, color: k.Color.fromHex("#94a3b8") });
-            k.drawRect({ pos: k.vec2(p.x + sc * 13, p.y - poleH + sc * 8), width: sc * 26, height: sc * 17, color: k.Color.fromHex(color), anchor: "center" });
+            const poleH = flagH;
+            k.drawLine({ p1: k.vec2(p.x, flagBottomY), p2: k.vec2(p.x, flagBottomY - poleH), width: 2, color: k.Color.fromHex("#94a3b8") });
+            k.drawRect({ pos: k.vec2(p.x + sc * 13, flagBottomY - poleH + sc * 8), width: sc * 26, height: sc * 17, color: k.Color.fromHex(color), anchor: "center" });
         }
 
-        // FINISH label
+        // FINISH label — above the top of the flag, anchored "bot" so the
+        // baseline sits right above the waving flag sprite
+        const labelY = flagBottomY - flagH - 2 * sc;
         k.drawText({
             text: label ? `CAR ${label}` : "FINISH",
-            pos: k.vec2(p.x + flagW * 0.3, p.y + 8 * sc),
-            size: Math.max(5, 5 * sc),
+            pos: k.vec2(p.x + flagW * 0.5, labelY),
+            size: Math.max(6, 6 * sc),
             font: "PressStart2P",
             color: k.Color.fromHex(triggered ? "#4ade80" : "#ffffff"),
-            anchor: "center",
-            opacity: 0.6,
+            anchor: "bot",
+            opacity: 0.85,
         });
     }
 
@@ -1658,7 +2308,7 @@ export function gameScene(k, { levelIdx }) {
         // LINE - dashed line icon
         drawIconBtn(tb.lineBtn, ICON_LINE, state.lineMode ? "#60d0ff" : "#fff8e0", state.lineMode ? "#1a5080" : null, iPx);
         // CURVE - arc icon
-        drawIconBtn(tb.curveBtn, ICON_CURVE, state.curveMode ? "#60d0ff" : "#fff8e0", state.curveMode ? "#1a5080" : null, iPx);
+        drawIconBtn(tb.archBtn, ICON_ARCH, state.archMode ? "#60d0ff" : "#fff8e0", state.archMode ? "#1a5080" : null, iPx);
         // UNDO - arrow icon
         drawIconBtn(tb.undoBtn, ICON_UNDO, "#fff8e0", null, iPx);
         // SPEED - text
@@ -1862,45 +2512,333 @@ export function gameScene(k, { levelIdx }) {
     }
 
     // ─── Modal (result screen) ──────────────────────
+    // Modal button positions — kept here so the click handler can reuse them.
+    // Y values are offsets from the modal center (my). Btn3's offset depends on
+    // whether the AI button is present.
+    // Modal layout constants. Button Y positions are computed relative to the
+    // modal BOTTOM so they stay pinned to the notebook's bottom ruled lines
+    // regardless of how tall the card grows (win vs fail, with/without AI).
+    const MODAL_BTN_W = 220;
+    const MODAL_BTN_H = 30;
+    const MODAL_BTN_SPACING = 44;              // matches every-other ruled line (22 × 2)
+    const MODAL_BTN_BOTTOM_MARGIN = 30;        // secondary button sits this far above the bottom
+
+    // Single source of truth for modal layout — both drawModal and the click
+    // handler pull positions from here so hit tests match visuals exactly.
+    function getModalLayout() {
+        if (!state.modal) return null;
+        const W = k.width(), H = k.height();
+        const beaten = getCompleted().includes(levelIdx);
+        const hasGrade = state.modal.grade != null;
+        const mh = 200 + (hasGrade ? 60 : 0) + (beaten ? 40 : 0);
+        const hh = mh / 2;
+        const secondary = hh - MODAL_BTN_BOTTOM_MARGIN;
+        const ai = beaten ? secondary - MODAL_BTN_SPACING : null;
+        const primary = beaten
+            ? secondary - 2 * MODAL_BTN_SPACING
+            : secondary - MODAL_BTN_SPACING;
+        return {
+            mx: W / 2, my: H / 2, mw: Math.min(420, W * 0.82), mh, hh,
+            beaten, hasGrade,
+            btnY: { primary, ai, secondary },
+        };
+    }
+
     function drawModal() {
         const m = state.modal;
         const W = k.width(), H = k.height();
+        const cFn = (h) => k.Color.fromHex(h);
 
-        k.drawRect({ pos: k.vec2(0, 0), width: W, height: H, color: k.Color.fromHex("#000000"), anchor: "topleft", opacity: 0.4 });
+        // Dim backdrop
+        k.drawRect({ pos: k.vec2(0, 0), width: W, height: H, color: cFn("#1a0e05"), anchor: "topleft", opacity: 0.55 });
 
-        const mw = Math.min(320, W * 0.7);
-        const mh = 240;
-        const mx = W / 2, my = H / 2;
+        // Pull shared layout (mh, hh, button Y's) — same numbers click handler uses
+        const L = getModalLayout();
+        const { mx, my, mw, mh, hh, beaten } = L;
+        const hw = mw / 2;
 
-        // Index card style
-        k.drawRect({ pos: k.vec2(mx + 3, my + 3), width: mw, height: mh, color: k.Color.fromHex("#000000"), anchor: "center", opacity: 0.15, radius: 6 });
-        k.drawRect({ pos: k.vec2(mx, my), width: mw, height: mh, color: k.Color.fromHex("#fffefa"), anchor: "center", radius: 5 });
-        k.drawRect({ pos: k.vec2(mx, my), width: mw, height: mh, fill: false, outline: { width: 2, color: k.Color.fromHex(m.win ? C.markerGreen : C.markerRed) }, anchor: "center", radius: 5 });
-
-        for (let ly = my - mh / 2 + 40; ly < my + mh / 2 - 10; ly += 18) {
-            k.drawLine({ p1: k.vec2(mx - mw / 2 + 20, ly), p2: k.vec2(mx + mw / 2 - 20, ly), width: 0.5, color: k.Color.fromHex("#c0d8e8"), opacity: 0.3 });
+        // Soft layered drop shadow
+        for (let s = 1; s <= 4; s++) {
+            k.drawRect({
+                pos: k.vec2(mx + s, my + s + 1),
+                width: mw + s, height: mh + s,
+                color: cFn("#000000"), anchor: "center", opacity: 0.07, radius: 4,
+            });
         }
 
-        k.drawText({ text: m.title, pos: k.vec2(mx, my - 80), size: 12, font: "PressStart2P", color: k.Color.fromHex(m.win ? C.markerGreen : C.markerRed), anchor: "center" });
-        k.drawText({ text: m.desc, pos: k.vec2(mx, my - 45), size: 12, font: "PatrickHand", color: k.Color.fromHex(C.pencil), anchor: "center", width: mw - 40 });
+        // Paper card — cream background
+        k.drawRect({ pos: k.vec2(mx, my), width: mw, height: mh, color: cFn(C.paper), anchor: "center", radius: 4 });
+        // Subtle warm border
+        k.drawRect({
+            pos: k.vec2(mx, my), width: mw, height: mh,
+            fill: false, outline: { width: 1.5, color: cFn("#c4a060") },
+            anchor: "center", radius: 4, opacity: 0.55,
+        });
 
-        if (m.score) {
-            k.drawText({ text: m.score, pos: k.vec2(mx, my - 15), size: 10, font: "PressStart2P", color: k.Color.fromHex(C.gold), anchor: "center" });
+        // Notebook margin (red vertical line on the left, like ruled paper)
+        const marginX = mx - hw + 32;
+        k.drawLine({
+            p1: k.vec2(marginX, my - hh + 12), p2: k.vec2(marginX, my + hh - 12),
+            width: 1.5, color: cFn(C.markerRed), opacity: 0.35,
+        });
+
+        // Horizontal ruled lines — anchored to the bottom-most button (secondary)
+        // and marching upward every 22px so every ruled line passes through a
+        // potential button baseline. Buttons spaced at every-other line (44) sit
+        // exactly on a line, giving the "written on the page" look.
+        const bottomLineY = my + L.btnY.secondary;
+        for (let ly = bottomLineY; ly > my - hh + 50; ly -= 22) {
+            k.drawLine({
+                p1: k.vec2(mx - hw + 12, ly), p2: k.vec2(mx + hw - 12, ly),
+                width: 1, color: cFn("#a8c0d8"), opacity: 0.28,
+            });
         }
 
-        // Primary button — Next Level / Try Again
-        k.drawRect({ pos: k.vec2(mx, my + 15), width: 180, height: 30, color: k.Color.fromHex(m.win ? C.markerGreen : C.accent), anchor: "center" });
-        k.drawText({ text: m.win ? "NEXT LEVEL" : "TRY AGAIN", pos: k.vec2(mx, my + 15), size: 8, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
+        // Two strips of masking tape pinning the page at the top corners
+        function drawTape(cx, cy, tw, th, ang) {
+            const cos = Math.cos(ang), sin = Math.sin(ang);
+            const corner = (dx, dy) => k.vec2(cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
+            const tl = corner(-tw / 2, -th / 2), tr = corner(tw / 2, -th / 2);
+            const br = corner(tw / 2, th / 2),    bl = corner(-tw / 2, th / 2);
+            // Drop shadow
+            const sh = (p) => k.vec2(p.x + 1.5, p.y + 2.5);
+            k.drawTriangle({ p1: sh(tl), p2: sh(tr), p3: sh(br), color: cFn("#000000"), opacity: 0.18 });
+            k.drawTriangle({ p1: sh(tl), p2: sh(br), p3: sh(bl), color: cFn("#000000"), opacity: 0.18 });
+            // Tape body — semi-transparent so the page shows through
+            k.drawTriangle({ p1: tl, p2: tr, p3: br, color: cFn(C.tape), opacity: 0.85 });
+            k.drawTriangle({ p1: tl, p2: br, p3: bl, color: cFn(C.tape), opacity: 0.85 });
+            // Subtle horizontal grain line
+            const il = corner(-tw / 2 + 3, 0), ir = corner(tw / 2 - 3, 0);
+            k.drawLine({ p1: il, p2: ir, width: 1, color: cFn("#bfae7a"), opacity: 0.45 });
+        }
+        drawTape(mx - hw + 42, my - hh - 2, 78, 22, -0.30);
+        drawTape(mx + hw - 42, my - hh - 2, 78, 22,  0.28);
 
-        // New: Try with AI — only offered when the level has been beaten at least once
-        const beaten = getCompleted().includes(levelIdx);
+        // Title — pixel font with shadow + colored marker, plus underline stroke
+        const titleColor = m.win ? C.markerGreen : C.markerRed;
+        const titleY = my - hh + 50;
+        const titleSz = 18;
+        k.drawText({ text: m.title, pos: k.vec2(mx + 2, titleY + 2), size: titleSz, font: "PressStart2P", color: cFn("#1a0e05"), anchor: "center", opacity: 0.30 });
+        k.drawText({ text: m.title, pos: k.vec2(mx, titleY), size: titleSz, font: "PressStart2P", color: cFn(titleColor), anchor: "center" });
+        // Marker underline (slight wobble for hand-drawn feel)
+        const underlineW = m.title.length * (titleSz * 0.75);
+        k.drawLine({
+            p1: k.vec2(mx - underlineW / 2, titleY + titleSz),
+            p2: k.vec2(mx + underlineW / 2, titleY + titleSz + 1),
+            width: 2.5, color: cFn(titleColor), opacity: 0.55,
+        });
+
+        // Description in handwritten font
+        k.drawText({
+            text: m.desc, pos: k.vec2(mx, titleY + 42),
+            size: 22, font: "PatrickHand", color: cFn(C.pencil),
+            anchor: "center", width: mw - 70, align: "center",
+        });
+
+        // ── Cost text + animated teacher-style GRADE (win only) ──
+        // Laid out side-by-side on the same line so the grade reads as a
+        // teacher's mark next to the student's work.
+        const elapsed = m.openTime != null ? Math.max(0, k.time() - m.openTime) : 2;
+        if (m.grade != null) {
+            const lineY = titleY + 90;
+            if (m.cost != null) {
+                k.drawText({
+                    text: `Cost: $${m.cost.toLocaleString()}`,
+                    pos: k.vec2(mx - 40, lineY),
+                    size: 20, font: "PatrickHand",
+                    color: cFn(C.pencil),
+                    anchor: "center",
+                });
+            }
+            // Grade sits to the right of the cost text
+            drawGrade(mx + 70, lineY, m.grade, elapsed);
+        }
+
+        // ── Teacher-grading animation ─────────────────────────────
+        // Phase 1 (0 → 0.4s): letter strokes in (fade + scale with slight wobble).
+        // Phase 2 (0.4 → 1.0s): red/gold marker circles around the letter.
+        // Phase 3 (1.0s+):    idle — S shimmers and spawns orbiting sparkles.
+        function drawGrade(cx, cy, letter, t) {
+            const gradeColors = {
+                S: "#d4a017",   // shiny gold
+                A: "#16a34a",   // marker green
+                B: "#2563eb",   // marker blue
+                C: "#d4823c",   // marker orange
+                F: "#dc2626",   // marker red
+            };
+            const color = gradeColors[letter] || "#dc2626";
+            const writeDur = 0.9, circleDur = 1.1;
+            const writeT  = Math.min(1, t / writeDur);
+            const circleT = Math.max(0, Math.min(1, (t - writeDur) / circleDur));
+            const idleT   = Math.max(0, t - writeDur - circleDur);
+
+            // Ease-out cubic for letter scale / fade
+            const eased = 1 - Math.pow(1 - writeT, 3);
+            // Slight rotational wobble that decays as the letter is "written"
+            const wobbleDeg = (1 - writeT) * Math.sin(t * 30) * 10;
+
+            // Shimmer for S — lerps between deep gold and a brighter highlight
+            let drawColor = color;
+            if (letter === "S" && idleT > 0) {
+                const phase = idleT * 1.6;
+                const v = (Math.sin(phase) + 1) / 2;
+                const lerp = (a, b) => Math.round(a + (b - a) * v);
+                const r = lerp(0xd4, 0xff), g = lerp(0xa0, 0xe4), b = lerp(0x17, 0x5a);
+                drawColor = "#" + [r, g, b].map(c => c.toString(16).padStart(2, "0")).join("");
+            }
+
+            // Letter (shadow + fill, rotated via transform stack) — drawn at
+            // full size right away; the writing illusion comes from a
+            // paper-colored mask that sweeps across the letter, revealing it
+            // left-to-right, plus a tiny pen-tip dot at the current write edge.
+            const letterSize = 32;
+            k.pushTransform();
+            k.pushTranslate(cx, cy);
+            k.pushRotate(wobbleDeg);
+            k.drawText({
+                text: letter, pos: k.vec2(2, 2),
+                size: letterSize, font: "PatrickHand",
+                color: cFn("#1a0e05"), opacity: 0.3,
+                anchor: "center",
+            });
+            k.drawText({
+                text: letter, pos: k.vec2(0, 0),
+                size: letterSize, font: "PatrickHand",
+                color: cFn(drawColor), opacity: 1,
+                anchor: "center",
+            });
+            k.popTransform();
+
+            // Sweep-reveal mask: paper-colored rect covers the unwritten right
+            // portion of the letter. Shrinks to zero as writeT hits 1.
+            if (writeT < 1) {
+                const letterBoxW = letterSize * 0.9;
+                const maskLeft = cx - letterBoxW / 2 + letterBoxW * writeT;
+                const maskW = letterBoxW * (1 - writeT) + 2;
+                k.drawRect({
+                    pos: k.vec2(maskLeft, cy - letterSize / 2 - 2),
+                    width: maskW,
+                    height: letterSize + 4,
+                    color: cFn(C.paper),
+                    anchor: "topleft",
+                });
+
+                // Pen-tip dot at the current write edge — the scribble
+                // oscillation is tied to absolute time so it stays lively even
+                // though the sweep itself is slower now.
+                const scribble = Math.sin(t * 22) * letterSize * 0.3;
+                const penX = maskLeft;
+                const penY = cy + scribble;
+                k.drawCircle({ pos: k.vec2(penX, penY), radius: 2.2, color: cFn("#1a0e05") });
+                // Tiny trail of short ink strokes behind the pen
+                for (let i = 1; i <= 3; i++) {
+                    const trailT = writeT - i * 0.04;
+                    if (trailT < 0) break;
+                    const trailX = cx - letterBoxW / 2 + letterBoxW * trailT;
+                    const trailY = cy + Math.sin((t - i * 0.04) * 22) * letterSize * 0.3;
+                    k.drawCircle({ pos: k.vec2(trailX, trailY), radius: 1.2, color: cFn("#1a0e05"), opacity: 0.4 - i * 0.1 });
+                }
+            }
+
+            // Marker circle — arc strokes in clockwise from the top
+            if (circleT > 0) {
+                const r = 22;
+                const segs = 40;
+                const maxA = -Math.PI / 2 + circleT * Math.PI * 2;
+                for (let i = 0; i < segs; i++) {
+                    const a0 = -Math.PI / 2 + (i / segs) * Math.PI * 2;
+                    if (a0 >= maxA) break;
+                    const a1 = Math.min(-Math.PI / 2 + ((i + 1) / segs) * Math.PI * 2, maxA);
+                    k.drawLine({
+                        p1: k.vec2(cx + Math.cos(a0) * r, cy + Math.sin(a0) * r),
+                        p2: k.vec2(cx + Math.cos(a1) * r, cy + Math.sin(a1) * r),
+                        width: 3, color: cFn(color),
+                    });
+                }
+            }
+
+            // Sparkles orbiting the S grade (after the circle completes)
+            if (letter === "S" && idleT > 0) {
+                for (let i = 0; i < 4; i++) {
+                    const angle = idleT * 0.8 + i * (Math.PI / 2);
+                    const dist = 30 + Math.sin(idleT * 1.8 + i) * 2;
+                    const sx = cx + Math.cos(angle) * dist;
+                    const sy = cy + Math.sin(angle) * dist;
+                    const spk = 2.5 + Math.sin(idleT * 3 + i * 0.7) * 1;
+                    k.drawCircle({ pos: k.vec2(sx, sy), radius: spk, color: cFn("#ffe17a"), opacity: 0.85 });
+                    k.drawLine({ p1: k.vec2(sx - spk - 2, sy), p2: k.vec2(sx + spk + 2, sy), width: 1, color: cFn("#fff7c4"), opacity: 0.9 });
+                    k.drawLine({ p1: k.vec2(sx, sy - spk - 2), p2: k.vec2(sx, sy + spk + 2), width: 1, color: cFn("#fff7c4"), opacity: 0.9 });
+                }
+            }
+        }
+
+        // ── Text-link buttons — pixel text on the page with an underline that
+        //    animates in on hover. Matches the notebook aesthetic: the text just
+        //    sits on the paper like a written-down option, and the underline is
+        //    drawn under the word like you're marking a choice.
+        // Hit test each button against current cursor
+        const mpos = k.mousePos();
+        const halfW = MODAL_BTN_W / 2, halfH = MODAL_BTN_H / 2;
+        const hoverTarget = {
+            primary:   Math.abs(mpos.x - mx) < halfW && Math.abs(mpos.y - (my + L.btnY.primary)) < halfH,
+            ai:        beaten && Math.abs(mpos.x - mx) < halfW && Math.abs(mpos.y - (my + L.btnY.ai)) < halfH,
+            secondary: Math.abs(mpos.x - mx) < halfW && Math.abs(mpos.y - (my + L.btnY.secondary)) < halfH,
+        };
+
+        // Ease hover progress toward target (fade in quick, fade out a touch quicker).
+        // Branch on whether the button IS hovered — not on a `>` comparison against
+        // the current value, which would flicker around the target when cur === tgt.
+        const dt = k.dt() || 1 / 60;
+        for (const key of ["primary", "ai", "secondary"]) {
+            const cur = state.modalBtnHover[key];
+            state.modalBtnHover[key] = hoverTarget[key]
+                ? Math.min(1, cur + dt * 6)
+                : Math.max(0, cur - dt * 8);
+        }
+
+        function linkBtn(cy, label, color, size, hoverKey, phase) {
+            const t = state.modalBtnHover[hoverKey] || 0;
+            // PatrickHand is variable-width; average glyph ≈ size * 0.5 wide
+            const textW = label.length * size * 0.5;
+            // Idle vertical bob — subtle breathing so the text doesn't feel
+            // frozen. Different phase per button so they drift independently.
+            const bob = Math.sin(k.time() * 1.3 + phase) * 0.8;
+            const lineY = cy + bob;
+
+            k.drawText({
+                text: label,
+                pos: k.vec2(mx, lineY),
+                size, font: "PatrickHand",
+                color: cFn(color),
+                anchor: "center",
+            });
+
+            // Marker strike-through through the middle of the text, draws left
+            // to right as hover progresses — like scribbling across the option
+            if (t > 0.01) {
+                const leftX = mx - textW / 2;
+                k.drawLine({
+                    p1: k.vec2(leftX, lineY),
+                    p2: k.vec2(leftX + textW * t, lineY),
+                    width: 2.5,
+                    color: cFn(color),
+                    opacity: 0.8,
+                });
+            }
+        }
+
+        // Primary — bold marker green (win) or bold marker red-orange (retry)
+        linkBtn(my + L.btnY.primary,
+                m.win ? "NEXT LEVEL" : "TRY AGAIN",
+                m.win ? C.markerGreen : "#c4622a",
+                26, "primary", 0);
+
+        // AI — muted indigo highlighter, only offered when level has been beaten
         if (beaten) {
-            k.drawRect({ pos: k.vec2(mx, my + 50), width: 180, height: 28, color: k.Color.fromHex("#8e4924"), anchor: "center" });
-            k.drawText({ text: "TRY WITH AI", pos: k.vec2(mx, my + 50), size: 8, font: "PressStart2P", color: k.Color.fromHex("#fff8e0"), anchor: "center" });
+            linkBtn(my + L.btnY.ai, "TRY WITH AI", "#6b7db5", 22, "ai", 1.5);
         }
 
-        // Secondary — Replay / Menu (bottom)
-        k.drawRect({ pos: k.vec2(mx, my + 85), width: 180, height: 26, fill: false, outline: { width: 1, color: k.Color.fromHex("#c0b8a0") }, anchor: "center" });
-        k.drawText({ text: m.win ? "REPLAY" : "MENU", pos: k.vec2(mx, my + 85), size: 8, font: "PressStart2P", color: k.Color.fromHex(C.pencil), anchor: "center" });
+        // Secondary — plain pencil gray, smaller
+        linkBtn(my + L.btnY.secondary, m.win ? "REPLAY" : "MENU", C.pencil, 22, "secondary", 3.0);
     }
 }
