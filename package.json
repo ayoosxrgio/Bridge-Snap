@@ -13,6 +13,7 @@
     "stem-assistant-bridge": "file:../../packages/stem-assistant-bridge"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.4",
     "vite": "^7.3.1",
     "vitest": "^4.1.4"
   }
