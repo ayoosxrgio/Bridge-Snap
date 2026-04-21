@@ -342,6 +342,13 @@ export function physicsTick(state) {
         worstMember.broken = true;
         state.shakeMag = 5;
 
+        // Emit snap event at break midpoint (game scene spawns SNAP! popup + confetti)
+        if (!state.snapEvents) state.snapEvents = [];
+        state.snapEvents.push({
+            x: (worstMember.n1.x + worstMember.n2.x) / 2,
+            y: (worstMember.n1.y + worstMember.n2.y) / 2,
+        });
+
         // ── Kick halves outward for a clean split ──
         // Stronger kick at the tips (far from anchors), zero at anchors.
         // This creates angular momentum so each half swings toward its wall.
