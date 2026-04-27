@@ -412,9 +412,36 @@ export function vehicleTick(state, lvl, lvlDef) {
         let roadAngle = 0;
         let bestMember = null;
 
-        // Ground surfaces at approaches
-        if (v.x < lvl.lX + 10) { roadY = lvl.lY; roadAngle = 0; }
-        else if (v.x > lvl.rX - 10) { roadY = lvl.rY; roadAngle = 0; }
+        // Drivable surface = TOP of the road geometry (approach asphalt or bridge
+        // plank), not its center. For the approach the asphalt is drawn centered
+        // on the anchor line with half-thickness 5 above, so the surface sits at
+        // anchor Y − 5. For bridge road members we subtract half the plank's
+        // visual width so the car rolls on top of the plank instead of floating
+        // at its centerline.
+        const APPROACH_SURFACE_OFFSET = 5;  // matches ROAD_H / 2 in game.js
+        // Lip pivot — the vehicle keeps a contact patch with the cliff edge until
+        // its physics-box back wheel reaches the edge. During that phase the
+        // center of mass follows an arc: drops and tilts forward together. This
+        // way the back wheel visibly stays on the cliff while the front dips,
+        // instead of the vehicle going airborne with its back wheel still
+        // appearing planted on the ground.
+        const lipReach = v.cfg.w * 0.4;
+        if (v.x < lvl.lX) {
+            roadY = lvl.lY - APPROACH_SURFACE_OFFSET;
+            roadAngle = 0;
+        } else if (v.x < lvl.lX + lipReach) {
+            const t = (v.x - lvl.lX) / lipReach;          // 0 → 1
+            roadY = lvl.lY - APPROACH_SURFACE_OFFSET + t * t * 14;
+            roadAngle = t * 0.55;
+        }
+        else if (v.x > lvl.rX) {
+            roadY = lvl.rY - APPROACH_SURFACE_OFFSET;
+            roadAngle = 0;
+        } else if (v.x > lvl.rX - lipReach) {
+            const t = (lvl.rX - v.x) / lipReach;
+            roadY = lvl.rY - APPROACH_SURFACE_OFFSET + t * t * 14;
+            roadAngle = -t * 0.55;
+        }
 
         for (const m of state.members) {
             if (m.broken || !MATERIALS[m.type].isRoad) continue;
@@ -427,7 +454,8 @@ export function vehicleTick(state, lvl, lvlDef) {
             const right = m.n1.x <= m.n2.x ? m.n2 : m.n1;
             const curAngle = Math.atan2(right.y - left.y, right.x - left.x);
             const t = x2 === x1 ? 0.5 : Math.max(0, Math.min(1, (v.x - x1) / (x2 - x1)));
-            const ry = left.y + t * (right.y - left.y);
+            const centerY = left.y + t * (right.y - left.y);
+            const ry = centerY - MATERIALS[m.type].width / 2;   // top of plank
 
             if (roadY === null || ry < roadY) {
                 roadY = ry;
@@ -442,6 +470,7 @@ export function vehicleTick(state, lvl, lvlDef) {
 
         if (onSurface) {
             v._falling = false;
+            v._wasOnSurface = true;
             const spd = v.cfg.speed * 1.2;
             v.x += spd * Math.cos(roadAngle);
             const targetY = roadY - v.cfg.h * 0.5;
@@ -464,23 +493,34 @@ export function vehicleTick(state, lvl, lvlDef) {
             }
         } else {
             // Falling
-            if (!v._falling) { v._falling = true; if (!v.vx) v.vx = v.cfg.speed; }
-            v.vy += 0.5;   // heavier falling gravity for vehicle
+            const sign = v.vx >= 0 ? 1 : -1;
+            if (!v._falling) {
+                v._falling = true;
+                if (!v.vx) v.vx = v.cfg.speed;
+                // Small initial nudge to keep angVel pointing forward — the edge
+                // tipping above already puts the vehicle at a forward angle, so
+                // we just need a gentle push to continue the rotation.
+                if (v._wasOnSurface) v.angVel = 0.008 * sign;
+            }
+            v.vy += 0.5;
             v.x += v.vx;
             v.y += v.vy;
             v.vx *= 0.998;
-            v.angVel = (v.angVel || 0) * 0.99 + 0.003 * (v.vx >= 0 ? 1 : -1);
+            v.angVel = (v.angVel || 0) * 0.99 + 0.004 * sign;
             v.angle += v.angVel;
 
-            // Wall collision
+            // Wall collision — only kicks in when the vehicle is actually moving
+            // INTO the cliff face (e.g. drifted back into the wall after splashing).
+            // Skipping this on outward motion avoids a visible sideways teleport
+            // the moment the vehicle drops below cliff height after going off.
             const hw = v.cfg.w * 0.4;
             const hh = v.cfg.h * 0.4;
-            if (v.x - hw < lvl.lX && v.y + hh > lvl.lY) {
+            if (v.vx < 0 && v.x - hw < lvl.lX && v.y + hh > lvl.lY) {
                 v.x = lvl.lX + hw;
                 v.vx = Math.abs(v.vx) * 0.1;
                 v.angVel = -0.02;
             }
-            if (v.x + hw > lvl.rX && v.y + hh > lvl.rY) {
+            if (v.vx > 0 && v.x + hw > lvl.rX && v.y + hh > lvl.rY) {
                 v.x = lvl.rX - hw;
                 v.vx = -Math.abs(v.vx) * 0.1;
                 v.angVel = 0.02;

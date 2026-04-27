@@ -4,9 +4,17 @@ import { menuScene } from "./scenes/menu.js";
 import { gameScene } from "./scenes/game.js";
 import { initAssistantBridge } from "./assistantBridge.js";
 
+// Fixed logical "design" resolution so all UI is laid out on a consistent
+// 1280×720 grid, regardless of which monitor the player is on. `stretch: true`
+// with `letterbox: false` makes Kaplay fill the entire browser window with the
+// canvas — any aspect-ratio mismatch is absorbed as a mild non-uniform stretch
+// instead of letterbox bars. Laptop 16:10 and desktop 16:9 both end up full-screen.
+const DESIGN_W = 1280;
+const DESIGN_H = 720;
+
 const k = kaplay({
-    width: window.innerWidth || 1280,
-    height: window.innerHeight || 720,
+    width: DESIGN_W,
+    height: DESIGN_H,
     background: [59, 47, 32],
     stretch: true,
     letterbox: false,

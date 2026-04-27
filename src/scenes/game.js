@@ -1,4 +1,4 @@
-import { C, GRID, MATERIALS, VEHICLES, WORLD_MID_Y, ANCHOR_L_X, PAD_X } from "../constants.js";
+import { C, GRID, MATERIALS, MATERIAL_UPGRADES, VEHICLES, WORLD_MID_Y, ANCHOR_L_X, PAD_X } from "../constants.js";
 import { LEVELS } from "../levels.js";
 import { Node, Member, Spark, snapToGrid, distToSegment, isConnectedToAnchor, calcCost, physicsTick, vehicleTick, initPhysicsWorld, destroyPhysicsWorld } from "../physics.js";
 import { solveBridge, setApiKey, getApiKey } from "../aiHelper.js";
@@ -51,6 +51,15 @@ export function gameScene(k, { levelIdx }) {
         dragging: false,
         lineMode: false,      // line fill: drag to auto-place segments along a straight line
         archMode: false,      // arch tool: click A → click B → drag apex handle → click off to commit
+        // ── Select tool ────────────────────────
+        selectMode: false,
+        selectBoxing: false,   // drawing a marquee rectangle right now
+        selectBoxStart: null,  // world coords {x, y} where the drag started
+        selectBoxEnd: null,    // world coords {x, y} current cursor while drawing
+        selectedMembers: new Set(),
+        selectMoving: false,   // dragging the current selection to a new spot
+        selectMoveStart: null, // world coords where the move drag began
+        selectMoveOrig: null,  // Map<Node, {x,y,rx,ry}> — snapshot for undo
         archStart: null,      // { x, y } — first anchor (set after first click)
         archEnd: null,        // { x, y } — second anchor (set after second click — enters edit mode)
         archBulge: 0,         // signed perpendicular distance from chord midpoint to apex
@@ -64,12 +73,16 @@ export function gameScene(k, { levelIdx }) {
         arches: [],
         nextArchId: 0,
         editingArchId: null,       // non-null while re-editing a placed arch
-        editingOldMembers: null,   // stashed members — restored on cancel
-        editingOldArchData: null,  // stashed arch record — restored on cancel
+        // Snapshot taken on edit-select so cancel/undo can restore exactly:
+        //   origBulge:   archData.bulge before the edit
+        //   nodeStates:  Map<Node, {x, y, rx, ry}> of every node in the arch
+        //   restStates:  Map<Member, number> of every arch member's rest length
+        editingArchOrig: null,
         // Undo: each entry is one user action; an action may have placed many
         // members at once (line-fill, arch). Undo pops the latest action and
         // removes everything it added.
         undoStack: [],
+        redoStack: [],
         mouseWorld: { x: 0, y: 0 },
         // Modal
         modal: null,         // { title, desc, score, win }
@@ -82,8 +95,8 @@ export function gameScene(k, { levelIdx }) {
         aiChoiceIdx: -1,     // index of the option the player picked (for feedback coloring)
         aiOptionRects: [],   // click-targets rebuilt every frame
         aiNextRect: null,    // "Next" / "Build!" button rect
-        // Hint
-        hintOpen: true,
+        // Hint — closed by default; player opens it via the "?" button when needed
+        hintOpen: false,
         // Lesson panel
         lessonOpen: false,
         // Splash effects
@@ -94,7 +107,37 @@ export function gameScene(k, { levelIdx }) {
         snapConfetti: [],
         // Hover progress [0..1] for modal text buttons — animates the underline
         modalBtnHover: { primary: 0, ai: 0, secondary: 0 },
+        // Hover progress [0..1] per material icon — animates the zoom
+        matHover: {},
+        // Hover progress [0..1] per tool button — animates the zoom
+        toolHover: {},
+        // Set of base-material keys whose slot is currently REVEALING the
+        // upgraded tier-2 version (toggled by double-clicking the slot).
+        matExpanded: new Set(),
+        // 0..1 reveal animation per slot — drives a flash + scale-bounce.
+        matRevealT: {},
+        // Tracks the last material slot click for double-click detection:
+        // { key, time }. A second click on the same slot within ~0.3s flips
+        // the slot to its upgraded form.
+        matLastClick: null,
+        // First-level tutorial — step-by-step popups with typing animation.
+        // Activated below for level 1 only.
+        tutorialActive: false,
+        tutorialStep: 0,
+        tutorialTyped: 0,       // number of chars revealed so far (fractional)
     };
+
+    // Tier-2 (upgraded) materials unlock from level 2 onwards. Level 1 stays
+    // single-tier so the player learns the basics before gaining the
+    // double-click reveal.
+    const upgradesUnlocked = levelIdx > 0;
+
+    // Kick off the tutorial on the first two levels. Suppress the hint sticky
+    // note during the walkthrough so it doesn't compete with the popup.
+    if (levelIdx === 0 || levelIdx === 1) {
+        state.tutorialActive = true;
+        state.hintOpen = false;
+    }
 
     // ─── Initialize nodes & anchors ─────────────────
     state.nodes.push(new Node(lX, lY, true));
@@ -111,16 +154,21 @@ export function gameScene(k, { levelIdx }) {
     });
 
     // ─── Initialize vehicles ────────────────────────
+    // Spawn vehicles resting ON the approach surface in build mode — wheels on
+    // the asphalt top, not hovering. toggleSim lifts them just before the sim
+    // starts so the landing drop effect still plays.
     function initVehicles() {
+        const ROAD_SURFACE = 5;                        // asphalt top sits above anchor by this much
+        const surfaceLeft = lY - ROAD_SURFACE;
         if (lvlDef.multiVehicle) {
             state.vehicles = lvlDef.multiVehicle.map(mv => {
                 const base = VEHICLES[mv.vType];
                 const cfg = { ...base, color: mv.color, name: mv.label };
-                return { cfg, x: lX + mv.startXOffset, y: lY - base.h * 1.4, active: true, finished: false, vy: 0, vx: base.speed, angle: 0, angVel: 0, wheelAngle: 0, label: mv.label };
+                return { cfg, x: lX + mv.startXOffset, y: surfaceLeft - base.h * 0.5, active: true, finished: false, vy: 0, vx: base.speed, angle: 0, angVel: 0, wheelAngle: 0, label: mv.label };
             });
         } else {
             const vcfg = VEHICLES[lvl.vType];
-            state.vehicles = [{ cfg: vcfg, x: lX - 55, y: lY - vcfg.h * 1.4, active: true, finished: false, vy: 0, vx: vcfg.speed, angle: 0, angVel: 0, wheelAngle: 0, label: null }];
+            state.vehicles = [{ cfg: vcfg, x: lX + (lvlDef.vStartXOffset ?? -55), y: surfaceLeft - vcfg.h * 0.5, active: true, finished: false, vy: 0, vx: vcfg.speed, angle: 0, angVel: 0, wheelAngle: 0, label: null }];
         }
     }
 
@@ -178,25 +226,25 @@ export function gameScene(k, { levelIdx }) {
         [1,1,0,0,0,1,1],
         [1,0,0,0,0,0,1],
     ];
-    // Line fill icon (dashed horizontal line)
+    // Line fill icon: two endpoint dots with dashed connector
     const ICON_LINE = [
         [0,0,0,0,0,0,0],
         [0,0,0,0,0,0,0],
-        [0,0,0,0,0,0,0],
-        [1,1,0,1,1,0,1],
-        [0,0,0,0,0,0,0],
+        [1,1,0,0,0,1,1],
+        [1,1,1,1,1,1,1],
+        [1,1,0,0,0,1,1],
         [0,0,0,0,0,0,0],
         [0,0,0,0,0,0,0],
     ];
-    // Arch icon (arc bending upward)
+    // Arch icon: bolder arc with anchor feet
     const ICON_ARCH = [
-        [0,0,0,1,0,0,0],
-        [0,0,1,0,1,0,0],
-        [0,1,0,0,0,1,0],
-        [0,1,0,0,0,1,0],
+        [0,0,1,1,1,0,0],
+        [0,1,1,0,1,1,0],
+        [1,1,0,0,0,1,1],
         [1,0,0,0,0,0,1],
         [1,0,0,0,0,0,1],
-        [1,0,0,0,0,0,1],
+        [0,0,0,0,0,0,0],
+        [1,1,0,0,0,1,1],
     ];
     const ICON_UNDO = [
         [0,0,0,1,1,1,0],
@@ -214,6 +262,36 @@ export function gameScene(k, { levelIdx }) {
         [1,1,1,1,1,1,1],
         [0,0,0,0,0,0,0],
         [1,1,1,1,1,1,1],
+        [0,0,0,0,0,0,0],
+    ];
+    // AI icon: robot face (brain alternative)
+    const ICON_AI = [
+        [0,0,1,0,1,0,0],
+        [0,1,1,1,1,1,0],
+        [1,1,0,1,0,1,1],
+        [1,1,1,1,1,1,1],
+        [1,1,0,1,0,1,1],
+        [0,1,1,1,1,1,0],
+        [0,1,0,0,0,1,0],
+    ];
+    // Hint icon: lightbulb
+    const ICON_HINT = [
+        [0,0,1,1,1,0,0],
+        [0,1,1,1,1,1,0],
+        [0,1,1,1,1,1,0],
+        [0,1,1,1,1,1,0],
+        [0,0,1,1,1,0,0],
+        [0,0,1,1,1,0,0],
+        [0,0,0,1,0,0,0],
+    ];
+    // Speed icon: double right chevrons
+    const ICON_SPEED = [
+        [0,0,0,0,0,0,0],
+        [1,0,0,1,0,0,0],
+        [1,1,0,1,1,0,0],
+        [0,1,1,0,1,1,0],
+        [1,1,0,1,1,0,0],
+        [1,0,0,1,0,0,0],
         [0,0,0,0,0,0,0],
     ];
 
@@ -280,6 +358,647 @@ export function gameScene(k, { levelIdx }) {
                     k.drawRect({ pos: k.vec2(ox + c * pxSize, oy + r * pxSize), width: pxSize + 0.5, height: pxSize + 0.5, color: k.Color.fromHex(color), anchor: "topleft" });
     }
 
+    // ─── Procedural icons (material-accurate shapes) ──
+    // Each takes (cx, cy, color) and draws a small silhouette centered on (cx, cy).
+    // They read as miniature versions of what they represent instead of boxes with dots.
+
+    // All material icons are HORIZONTAL and share the same footprint (~28w × 8h)
+    // so they read as a consistent row regardless of material type.
+    const MAT_ICON_W = 28, MAT_ICON_H = 8;
+
+    function drawPlankIcon(cx, cy, col) {
+        const w = MAT_ICON_W, h = MAT_ICON_H;
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, fill: false, outline: { width: 1, color: k.Color.fromHex("#000000") }, anchor: "topleft", opacity: 0.4, radius: 1 });
+        // Vertical grain notches
+        for (let i = 1; i <= 3; i++) {
+            const x = cx - w/2 + i * w / 4;
+            k.drawLine({ p1: k.vec2(x, cy - h/2 + 1), p2: k.vec2(x, cy + h/2 - 1), width: 0.8, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        }
+        // Top highlight
+        k.drawLine({ p1: k.vec2(cx - w/2 + 1, cy - h/2 + 0.5), p2: k.vec2(cx + w/2 - 1, cy - h/2 + 0.5), width: 0.8, color: k.Color.fromHex("#ffffff"), opacity: 0.25 });
+    }
+
+    function drawReinforcedPlankIcon(cx, cy, col) {
+        drawPlankIcon(cx, cy - 2, col);
+        // Red reinforcement stripe below the plank
+        k.drawRect({ pos: k.vec2(cx - MAT_ICON_W/2, cy + MAT_ICON_H/2 - 1), width: MAT_ICON_W, height: 3, color: k.Color.fromHex("#cc3333"), anchor: "topleft", radius: 1 });
+    }
+
+    // Stone road shares the wood plank's exact silhouette — just rendered in
+    // the stone-grey colour. Same shape, recolored = clearly an upgrade.
+    function drawStoneIcon(cx, cy, col) {
+        drawPlankIcon(cx, cy, col);
+    }
+
+    function drawBeamIcon(cx, cy, col) {
+        // Horizontal timber with bolt dots at each end
+        const w = MAT_ICON_W, h = MAT_ICON_H;
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, fill: false, outline: { width: 1, color: k.Color.fromHex("#000000") }, anchor: "topleft", opacity: 0.4, radius: 1 });
+        // Bolt dots at each end
+        k.drawCircle({ pos: k.vec2(cx - w/2 + 3, cy), radius: 1.4, color: k.Color.fromHex("#000000"), opacity: 0.55 });
+        k.drawCircle({ pos: k.vec2(cx + w/2 - 3, cy), radius: 1.4, color: k.Color.fromHex("#000000"), opacity: 0.55 });
+        // Top highlight
+        k.drawLine({ p1: k.vec2(cx - w/2 + 1, cy - h/2 + 0.5), p2: k.vec2(cx + w/2 - 1, cy - h/2 + 0.5), width: 0.8, color: k.Color.fromHex("#ffffff"), opacity: 0.3 });
+    }
+
+    // Steel beam shares the wood beam's silhouette — just rendered in the
+    // steel-red colour. Same shape, recolored = clearly an upgrade.
+    function drawSteelIcon(cx, cy, col) {
+        drawBeamIcon(cx, cy, col);
+    }
+
+    function drawRopeIcon(cx, cy, col) {
+        const hw = MAT_ICON_W / 2;
+        // Outline (same width ratio as cable)
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 4, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        // Rope body — one tick thicker than cable
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 2.8, color: k.Color.fromHex(col) });
+        // Tight braid marks — stay inside the line width so nothing sticks out
+        for (let i = 1; i <= 6; i++) {
+            const xc = cx - hw + MAT_ICON_W * i / 7;
+            k.drawLine({ p1: k.vec2(xc - 1, cy - 1), p2: k.vec2(xc + 1, cy + 1), width: 0.8, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        }
+        // Nubs — same size as cable
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 2.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 2.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8, color: k.Color.fromHex(col) });
+    }
+
+    function drawCableIcon(cx, cy, col) {
+        const hw = MAT_ICON_W / 2;
+        // Outline
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 3.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        // Cable body
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 2.2, color: k.Color.fromHex(col) });
+        // Highlight
+        k.drawLine({ p1: k.vec2(cx - hw + 1, cy - 0.7), p2: k.vec2(cx + hw - 1, cy - 0.7), width: 0.7, color: k.Color.fromHex("#ffffff"), opacity: 0.32 });
+        // Nubs
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 2.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 2.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8, color: k.Color.fromHex(col) });
+    }
+
+    // ─── Tool icons (procedural, non-pixelated, generously sized) ──
+    function drawLineToolIcon(cx, cy, col) {
+        // o—o—o : three connector dots with line segments between them.
+        // Tightened spread so its silhouette matches the other tool icons.
+        const positions = [cx - 13, cx, cx + 13];
+        const lw = 3;
+        k.drawLine({ p1: k.vec2(positions[0] + 4, cy), p2: k.vec2(positions[1] - 4, cy), width: lw, color: k.Color.fromHex(col) });
+        k.drawLine({ p1: k.vec2(positions[1] + 4, cy), p2: k.vec2(positions[2] - 4, cy), width: lw, color: k.Color.fromHex(col) });
+        for (const px of positions) {
+            k.drawCircle({ pos: k.vec2(px, cy), radius: 3.6, color: k.Color.fromHex(col) });
+        }
+    }
+
+    function drawArchToolIcon(cx, cy, col) {
+        const r = 13;
+        const segs = 32;               // more segments → smoother curve
+        const baseY = cy + 6;
+        const lw = 3.2;
+        let prev = null;
+        for (let i = 0; i <= segs; i++) {
+            const angle = Math.PI - (i / segs) * Math.PI;
+            const x = cx + Math.cos(angle) * r;
+            const y = baseY - Math.sin(angle) * r;
+            if (prev) k.drawLine({ p1: prev, p2: k.vec2(x, y), width: lw, color: k.Color.fromHex(col) });
+            // Round cap at each vertex so the curve doesn't show gaps
+            k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: k.Color.fromHex(col) });
+            prev = k.vec2(x, y);
+        }
+        k.drawCircle({ pos: k.vec2(cx - r, baseY), radius: 3.8, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx + r, baseY), radius: 3.8, color: k.Color.fromHex(col) });
+    }
+
+    // Delete icon — bigger trash can, same line-art style as the other tools.
+    function drawXIcon(cx, cy, col) {
+        const c = k.Color.fromHex(col);
+        const lw = 3;
+        const w = 18, h = 20;
+        const top = cy - h / 2 + 2;
+        const bot = cy + h / 2;
+        // Lid — wider than the body
+        k.drawLine({ p1: k.vec2(cx - w / 2 - 2, top), p2: k.vec2(cx + w / 2 + 2, top), width: lw, color: c });
+        // Handle notch above the lid
+        k.drawLine({ p1: k.vec2(cx - 4, top - 4), p2: k.vec2(cx + 4, top - 4), width: lw, color: c });
+        k.drawLine({ p1: k.vec2(cx - 4, top - 4), p2: k.vec2(cx - 4, top),     width: lw, color: c });
+        k.drawLine({ p1: k.vec2(cx + 4, top - 4), p2: k.vec2(cx + 4, top),     width: lw, color: c });
+        // Body — slightly tapered toward the bottom
+        k.drawLine({ p1: k.vec2(cx - w / 2 + 1, top + 1), p2: k.vec2(cx - w / 2 + 2, bot), width: lw, color: c });
+        k.drawLine({ p1: k.vec2(cx + w / 2 - 1, top + 1), p2: k.vec2(cx + w / 2 - 2, bot), width: lw, color: c });
+        // Bottom edge
+        k.drawLine({ p1: k.vec2(cx - w / 2 + 2, bot), p2: k.vec2(cx + w / 2 - 2, bot), width: lw, color: c });
+        // Three vertical ridges inside
+        const ridgeTop = top + 5, ridgeBot = bot - 2;
+        k.drawLine({ p1: k.vec2(cx - 4, ridgeTop), p2: k.vec2(cx - 4, ridgeBot), width: 1.8, color: c });
+        k.drawLine({ p1: k.vec2(cx,     ridgeTop), p2: k.vec2(cx,     ridgeBot), width: 1.8, color: c });
+        k.drawLine({ p1: k.vec2(cx + 4, ridgeTop), p2: k.vec2(cx + 4, ridgeBot), width: 1.8, color: c });
+    }
+
+    // Select tool icon — classic pointer cursor, drawn as a single polygon.
+    // Vertices trace the outline clockwise from the tip. Kaplay handles the
+    // triangulation internally.
+    function drawSelectToolIcon(cx, cy, col) {
+        const c = k.Color.fromHex(col);
+        const ox = cx - 10, oy = cy - 12;
+        k.drawPolygon({
+            pts: [
+                k.vec2(ox + 0,  oy + 0),    // tip
+                k.vec2(ox + 18, oy + 15),   // right extent (arrowhead corner)
+                k.vec2(ox + 11, oy + 16),   // notch outer (where tail meets arrowhead)
+                k.vec2(ox + 17, oy + 24),   // tail bottom-right
+                k.vec2(ox + 12, oy + 24),   // tail bottom-left
+                k.vec2(ox + 7,  oy + 17),   // notch inner
+                k.vec2(ox + 3,  oy + 21),   // body foot (pointy bottom-left)
+            ],
+            color: c,
+        });
+    }
+
+    // Generic "arrow that follows a circular arc" helper. Draws a thick arc from
+    // aStart → aEnd (CCW if aEnd > aStart, CW otherwise) and places a tangent-
+    // aligned triangular arrowhead at the end so the tip "continues" the curve.
+    function drawCurvedArrow(cx, cy, r, aStart, aEnd, col, lw, flipY = false) {
+        const ys = flipY ? 1 : -1;
+        const sign = Math.sign(aEnd - aStart);
+        const segs = Math.max(24, Math.ceil(40 * Math.abs(aEnd - aStart) / (2 * Math.PI)));
+        let prev = null;
+        for (let i = 0; i <= segs; i++) {
+            const t = i / segs;
+            const a = aStart + t * (aEnd - aStart);
+            const x = cx + Math.cos(a) * r;
+            const y = cy + ys * Math.sin(a) * r;
+            if (prev) k.drawLine({ p1: prev, p2: k.vec2(x, y), width: lw, color: k.Color.fromHex(col) });
+            // Round cap at vertex — fills tiny gaps between line segments.
+            k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: k.Color.fromHex(col) });
+            prev = k.vec2(x, y);
+        }
+        // Arrowhead at aEnd — tip points along the tangent direction of motion.
+        const a = aEnd;
+        const ex = cx + Math.cos(a) * r;
+        const ey = cy + ys * Math.sin(a) * r;
+        const ux = -Math.sin(a) * sign;
+        const uy = ys * Math.cos(a) * sign;
+        const px = -uy, py = ux;        // perpendicular (width axis)
+        const headLen = 9;
+        const headW   = 6;
+        k.drawTriangle({
+            p1: k.vec2(ex + ux * headLen, ey + uy * headLen),           // tip
+            p2: k.vec2(ex + px * headW,   ey + py * headW),             // left back
+            p3: k.vec2(ex - px * headW,   ey - py * headW),             // right back
+            color: k.Color.fromHex(col),
+        });
+    }
+
+    function drawUndoIcon(cx, cy, col) {
+        // CW 270° arc, gap on the LEFT. Arrow ends near 7–8 o'clock pointing
+        // up-left — reads as "go back".
+        drawCurvedArrow(cx, cy, 10, 3 * Math.PI / 4, 3 * Math.PI / 4 - 3 * Math.PI / 2, col, 3.5, true);
+    }
+
+    function drawRedoIcon(cx, cy, col) {
+        // CCW 270° arc, gap on the RIGHT. Arrow ends near 4–5 o'clock pointing
+        // up-right — reads as "go forward".
+        drawCurvedArrow(cx, cy, 10, Math.PI / 4, Math.PI / 4 + 3 * Math.PI / 2, col, 3.5, true);
+    }
+
+    // Double chevron pointing RIGHT — two thin line pairs forming ">>". The
+    // previous open-chevron look the user liked.
+    function drawSpeedUpIcon(cx, cy, col) {
+        const s = 8, gap = 4, lw = 3;
+        const c = k.Color.fromHex(col);
+        // First (inner) chevron
+        const p1tip = k.vec2(cx - gap / 2, cy);
+        k.drawLine({ p1: k.vec2(cx - s - gap / 2, cy - s), p2: p1tip, width: lw, color: c });
+        k.drawLine({ p1: p1tip, p2: k.vec2(cx - s - gap / 2, cy + s), width: lw, color: c });
+        // Second (outer) chevron
+        const p2tip = k.vec2(cx + s + gap / 2, cy);
+        k.drawLine({ p1: k.vec2(cx + gap / 2, cy - s), p2: p2tip, width: lw, color: c });
+        k.drawLine({ p1: p2tip, p2: k.vec2(cx + gap / 2, cy + s), width: lw, color: c });
+    }
+
+    // Mirror — "<<".
+    function drawSpeedDownIcon(cx, cy, col) {
+        const s = 8, gap = 4, lw = 3;
+        const c = k.Color.fromHex(col);
+        // First (inner) chevron
+        const p1tip = k.vec2(cx + gap / 2, cy);
+        k.drawLine({ p1: k.vec2(cx + s + gap / 2, cy - s), p2: p1tip, width: lw, color: c });
+        k.drawLine({ p1: p1tip, p2: k.vec2(cx + s + gap / 2, cy + s), width: lw, color: c });
+        // Second (outer) chevron
+        const p2tip = k.vec2(cx - s - gap / 2, cy);
+        k.drawLine({ p1: k.vec2(cx - gap / 2, cy - s), p2: p2tip, width: lw, color: c });
+        k.drawLine({ p1: p2tip, p2: k.vec2(cx - gap / 2, cy + s), width: lw, color: c });
+    }
+
+    // ─── Tiny 3×5 pixel font for inline readouts (speed, etc.) ──
+    // Hand-drawn so the glyphs sit consistently next to the other pixel icons
+    // instead of using a TTF font that visually "floats".
+    const PIXEL_FONT = {
+        "0": [[1,1,1],[1,0,1],[1,0,1],[1,0,1],[1,1,1]],
+        "1": [[0,1,0],[1,1,0],[0,1,0],[0,1,0],[1,1,1]],
+        "2": [[1,1,1],[0,0,1],[1,1,1],[1,0,0],[1,1,1]],
+        "3": [[1,1,1],[0,0,1],[0,1,1],[0,0,1],[1,1,1]],
+        "4": [[1,0,1],[1,0,1],[1,1,1],[0,0,1],[0,0,1]],
+        "5": [[1,1,1],[1,0,0],[1,1,1],[0,0,1],[1,1,1]],
+        "6": [[1,1,1],[1,0,0],[1,1,1],[1,0,1],[1,1,1]],
+        "7": [[1,1,1],[0,0,1],[0,1,0],[1,0,0],[1,0,0]],
+        "8": [[1,1,1],[1,0,1],[1,1,1],[1,0,1],[1,1,1]],
+        "9": [[1,1,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1]],
+        ".": [[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,1,0]],
+        "x": [[0,0,0],[1,0,1],[0,1,0],[1,0,1],[0,0,0]],
+    };
+
+    function drawPixelText(text, cx, cy, col, pxSize = 2) {
+        const charW = 3, charH = 5, charGap = 1;
+        const totalW = text.length * charW * pxSize + (text.length - 1) * charGap * pxSize;
+        let x = cx - totalW / 2;
+        const y = cy - (charH * pxSize) / 2;
+        const c = k.Color.fromHex(col);
+        for (const ch of text) {
+            const grid = PIXEL_FONT[ch];
+            if (grid) {
+                for (let r = 0; r < charH; r++) {
+                    for (let cc = 0; cc < charW; cc++) {
+                        if (grid[r][cc]) {
+                            k.drawRect({
+                                pos: k.vec2(x + cc * pxSize, y + r * pxSize),
+                                width: pxSize + 0.5,
+                                height: pxSize + 0.5,
+                                color: c,
+                                anchor: "topleft",
+                            });
+                        }
+                    }
+                }
+            }
+            x += (charW + charGap) * pxSize;
+        }
+    }
+
+    // Back-compat alias while old call sites catch up.
+    const drawSpeedIcon = drawSpeedUpIcon;
+
+    function drawMenuIcon(cx, cy, col) {
+        const w = 20, lw = 3, rowGap = 7;
+        for (let i = -1; i <= 1; i++) {
+            k.drawLine({ p1: k.vec2(cx - w/2, cy + i * rowGap), p2: k.vec2(cx + w/2, cy + i * rowGap), width: lw, color: k.Color.fromHex(col) });
+        }
+    }
+
+    function drawPlayIcon(cx, cy, col) {
+        const s = 11;
+        k.drawTriangle({
+            p1: k.vec2(cx - s * 0.7, cy - s),
+            p2: k.vec2(cx + s,        cy),
+            p3: k.vec2(cx - s * 0.7, cy + s),
+            color: k.Color.fromHex(col),
+        });
+    }
+
+    function drawStopIcon(cx, cy, col) {
+        const s = 17;
+        k.drawRect({ pos: k.vec2(cx - s/2, cy - s/2), width: s, height: s, color: k.Color.fromHex(col), anchor: "topleft", radius: 1.5 });
+    }
+
+    // Bare (no-background) icon button — just draws the icon centered in the rect,
+    // with optional text to the right. Hitbox is still the full rect.
+    function drawFlatIconBtn(rect, drawFn, color, text) {
+        const cx = rect.x + rect.w / 2;
+        const cy = rect.y + rect.h / 2;
+        if (drawFn && text) {
+            drawFn(cx - 10, cy, color);
+            k.drawText({ text, pos: k.vec2(cx + 6, cy - 4), size: 7, font: "PressStart2P", color: k.Color.fromHex(color) });
+        } else if (drawFn) {
+            drawFn(cx, cy, color);
+        } else if (text) {
+            k.drawText({ text, pos: k.vec2(cx, cy), size: 8, font: "PressStart2P", color: k.Color.fromHex(color), anchor: "center" });
+        }
+    }
+
+    // Tool icon button with hover zoom + silhouette outline when active. Same
+    // selection animation as the material icons. Outline color is customizable
+    // so play/stop can use green/red while other tools stay brown.
+    //   outerOutlineCol: optional thin grey (or any) edge drawn FURTHER out than
+    //                    the main colored outline — makes the colored outline
+    //                    "pop" with a drop-shadow feel.
+    function drawToolIconBtn(rect, drawFn, active, key, outlineCol = "#5a3418", outerOutlineCol = null) {
+        const cx = rect.x + rect.w / 2;
+        const cy = rect.y + rect.h / 2;
+        const mpos = k.mousePos();
+        const dt = k.dt() || 1 / 60;
+        const hovered = mpos.x >= rect.x && mpos.x <= rect.x + rect.w
+                     && mpos.y >= rect.y && mpos.y <= rect.y + rect.h;
+        const prev = state.toolHover[key] || 0;
+        state.toolHover[key] = hovered
+            ? Math.min(1, prev + dt * 10)
+            : Math.max(0, prev - dt * 12);
+        const h = state.toolHover[key];
+
+        const scale = (active ? 1.12 : 1) * (1 + h * 0.14);
+        k.pushTransform();
+        k.pushTranslate(cx, cy);
+        k.pushScale(scale, scale);
+
+        if (active) {
+            // Outer edge (optional) — thin grey band of edge color beyond the main outline.
+            if (outerOutlineCol) {
+                const outerR = 4.2;
+                for (let a = 0; a < 16; a++) {
+                    const rad = (a * Math.PI) / 8;
+                    k.pushTransform();
+                    k.pushTranslate(Math.cos(rad) * outerR, Math.sin(rad) * outerR);
+                    drawFn(0, 0, outerOutlineCol);
+                    k.popTransform();
+                }
+            }
+            // Main colored outline — thicker when layered with an outer edge.
+            const innerR = outerOutlineCol ? 3.2 : 1.6;
+            const rays = outerOutlineCol ? 16 : 8;
+            for (let a = 0; a < rays; a++) {
+                const rad = (a * Math.PI * 2) / rays;
+                k.pushTransform();
+                k.pushTranslate(Math.cos(rad) * innerR, Math.sin(rad) * innerR);
+                drawFn(0, 0, outlineCol);
+                k.popTransform();
+            }
+        }
+        drawFn(0, 0, "#fff8e0");
+        k.popTransform();
+    }
+
+    // AI + Hint icon buttons. Drawn ON a wooden plate that hangs off the
+    // bottom of the toolbar so the cream icons read against brown wood — the
+    // same visual language as the toolbar tools above. Hover scales them up,
+    // active brightens the wood + cream-outlines the icon for a "pressed in"
+    // feel matching drawToolIconBtn's active treatment.
+    function drawPaperIconBtn(rect, drawFn, active, key) {
+        const mpos = k.mousePos();
+        const dt = k.dt() || 1 / 60;
+        const hovered = mpos.x >= rect.x && mpos.x <= rect.x + rect.w
+                     && mpos.y >= rect.y && mpos.y <= rect.y + rect.h;
+        const prev = state.toolHover[key] || 0;
+        state.toolHover[key] = hovered
+            ? Math.min(1, prev + dt * 10)
+            : Math.max(0, prev - dt * 12);
+        const h = state.toolHover[key];
+
+        const cx = rect.x + rect.w / 2;
+        const cy = rect.y + rect.h / 2;
+        const scale = (active ? 1.12 : 1) * (1 + h * 0.14);
+
+        k.pushTransform();
+        k.pushTranslate(cx, cy);
+        k.pushScale(scale, scale);
+
+        // Active state — silhouette outline ring in brown, then the cream icon
+        // on top. Same pattern drawToolIconBtn uses for the toolbar tools.
+        if (active) {
+            const innerR = 1.6;
+            for (let a = 0; a < 8; a++) {
+                const rad = (a * Math.PI * 2) / 8;
+                k.pushTransform();
+                k.pushTranslate(Math.cos(rad) * innerR, Math.sin(rad) * innerR);
+                drawFn(0, 0, "#5a3418");
+                k.popTransform();
+            }
+        }
+        drawFn(0, 0, "#fff8e0");
+        k.popTransform();
+    }
+
+    // The AI + Hint cluster renders as a hanging wooden sign suspended from
+    // two ropes. The whole group sways gently around the rope attachment
+    // points so it feels like a real shop sign in the breeze.
+    function drawHangingAiHintSign(tb) {
+        const ai = tb.aiBtn, hint = tb.hintBtn;
+
+        // Swing angle in degrees — slower sine wave with a bigger amplitude
+        // so the ropes visibly tilt during the sway. Click hit-testing on the
+        // static rects is still close enough at these angles.
+        const swing = Math.sin(k.time() * 0.9) * 3.5;
+
+        // Sign geometry
+        const padX = 6, padY = 4;
+        const sx = ai.x - padX;
+        const sy = ai.y - padY;
+        const sw = (hint.x + hint.w) - ai.x + padX * 2;
+        const sh = ai.h + padY * 2;
+
+        // Rope endpoints — TOP and BOT share the same X so the ropes hang
+        // perfectly vertically at rest. They only angle when the sign swings.
+        const toolbarBot = tb.h + tb.pad;
+        const ropeInset = 16;
+        const ropeTopL = { x: sx + ropeInset,       y: toolbarBot };
+        const ropeTopR = { x: sx + sw - ropeInset,  y: toolbarBot };
+        const ropeBotL = { x: sx + ropeInset,       y: sy };
+        const ropeBotR = { x: sx + sw - ropeInset,  y: sy };
+
+        // Pivot — midpoint of the two rope tops. Sign rotates around this.
+        const pivotX = (ropeTopL.x + ropeTopR.x) / 2;
+        const pivotY = toolbarBot;
+
+        // Rotate a point around the pivot by `swing` degrees.
+        const swingRad = swing * Math.PI / 180;
+        const cos = Math.cos(swingRad), sin = Math.sin(swingRad);
+        const rotPt = (p) => {
+            const dx = p.x - pivotX, dy = p.y - pivotY;
+            return { x: pivotX + dx * cos - dy * sin, y: pivotY + dx * sin + dy * cos };
+        };
+        const swungBotL = rotPt(ropeBotL);
+        const swungBotR = rotPt(ropeBotR);
+
+        // ── Ropes (top static, bottom rotates with the sign) ──
+        const drawRopeLine = (top, bot) => {
+            k.drawLine({ p1: k.vec2(top.x, top.y), p2: k.vec2(bot.x, bot.y), width: 3,   color: k.Color.fromHex("#4a2810") });
+            k.drawLine({ p1: k.vec2(top.x, top.y), p2: k.vec2(bot.x, bot.y), width: 1.5, color: k.Color.fromHex("#a87838") });
+        };
+        drawRopeLine(ropeTopL, swungBotL);
+        drawRopeLine(ropeTopR, swungBotR);
+
+        // ── Sign + icons (rotated as one unit around the rope pivot) ──
+        k.pushTransform();
+        k.pushTranslate(pivotX, pivotY);
+        k.pushRotate(swing);
+        k.pushTranslate(-pivotX, -pivotY);
+
+        // Drop shadow
+        k.drawRect({ pos: k.vec2(sx + 1, sy + 3), width: sw, height: sh, color: k.Color.fromHex("#010101"), opacity: 0.32, anchor: "topleft", radius: 4 });
+        // Wooden body
+        k.drawRect({ pos: k.vec2(sx, sy), width: sw, height: sh, color: k.Color.fromHex("#d37e3d"), anchor: "topleft", radius: 4 });
+        // Wood grain — horizontal streaks for "sign" feel (vs vertical toolbar grain)
+        for (let gy = 4; gy < sh - 4; gy += 5) {
+            k.drawLine({
+                p1: k.vec2(sx + 4, sy + gy),
+                p2: k.vec2(sx + sw - 4, sy + gy + 1),
+                width: 0.6, color: k.Color.fromHex("#8e4924"), opacity: 0.18,
+            });
+        }
+        // Top highlight
+        k.drawRect({ pos: k.vec2(sx, sy), width: sw, height: 1, color: k.Color.fromHex("#ffffff"), opacity: 0.22, anchor: "topleft" });
+        // Bottom edge
+        k.drawRect({ pos: k.vec2(sx, sy + sh - 3), width: sw, height: 3, color: k.Color.fromHex("#8e4924"), anchor: "topleft" });
+        // Outline
+        k.drawRect({
+            pos: k.vec2(sx, sy), width: sw, height: sh,
+            fill: false, outline: { width: 1, color: k.Color.fromHex("#3a2110") },
+            anchor: "topleft", radius: 4, opacity: 0.45,
+        });
+        // (No hardware — the rope just terminates at the wood. Cleaner read.)
+
+        // Buttons — rendered inside the rotation so they swing with the sign
+        drawPaperIconBtn(tb.aiBtn,   drawRobotIcon,    state.aiPanelOpen, "ai");
+        drawPaperIconBtn(tb.hintBtn, drawQuestionIcon, state.hintOpen,    "hint");
+
+        k.popTransform();
+    }
+
+    function drawMatIconFor(key, cx, cy, col) {
+        switch (key) {
+            case "wood_road":       return drawPlankIcon(cx, cy, col);
+            case "reinforced_road": return drawReinforcedPlankIcon(cx, cy, col);
+            case "stone_road":      return drawStoneIcon(cx, cy, col);
+            case "wood_beam":       return drawBeamIcon(cx, cy, col);
+            case "steel":           return drawSteelIcon(cx, cy, col);
+            case "rope":            return drawRopeIcon(cx, cy, col);
+            case "cable":           return drawCableIcon(cx, cy, col);
+            default: {
+                const g = MAT_ICONS[key];
+                if (g) drawIcon(g, cx, cy, col, 2);
+            }
+        }
+    }
+
+    // ─── Silhouette outline renderers — draw the icon's SHAPE inflated by `inf`
+    // pixels in the given color. Called BEFORE the main icon to produce a proper
+    // stroke-around effect that hugs the silhouette instead of a rectangle.
+    function drawPlankOutline(cx, cy, col, inf) {
+        const w = MAT_ICON_W + inf * 2;
+        const h = MAT_ICON_H + inf * 2;
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 + inf });
+    }
+    function drawBeamOutline(cx, cy, col, inf) {
+        const w = MAT_ICON_W + inf * 2;
+        const h = MAT_ICON_H + inf * 2;
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 + inf });
+    }
+    function drawReinforcedOutline(cx, cy, col, inf) {
+        // Plank body + red stripe bundled into one silhouette
+        const w = MAT_ICON_W + inf * 2;
+        const topY = cy - 2 - MAT_ICON_H/2 - inf;
+        const botY = cy + MAT_ICON_H/2 + 2 + inf;   // red stripe base +2 thickness
+        const h = botY - topY;
+        k.drawRect({ pos: k.vec2(cx - w/2, topY), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 + inf });
+    }
+    function drawStoneOutline(cx, cy, col, inf) {
+        // Tight rect hugging the whole brick course
+        const w = MAT_ICON_W + inf * 2;
+        const h = MAT_ICON_H + inf * 2;
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: inf });
+    }
+    function drawSteelOutline(cx, cy, col, inf) {
+        // Same silhouette as the wood beam (single rectangle), just inflated.
+        const w = MAT_ICON_W + inf * 2;
+        const h = MAT_ICON_H + inf * 2;
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 + inf });
+    }
+    function drawRopeOutline(cx, cy, col, inf) {
+        const hw = MAT_ICON_W / 2;
+        const lw = 2.8 + inf * 2;
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: lw, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8 + inf, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8 + inf, color: k.Color.fromHex(col) });
+    }
+    function drawCableOutline(cx, cy, col, inf) {
+        const lw = 2.2 + inf * 2;
+        k.drawLine({ p1: k.vec2(cx - MAT_ICON_W/2, cy), p2: k.vec2(cx + MAT_ICON_W/2, cy), width: lw, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx - MAT_ICON_W/2, cy), radius: 1.8 + inf, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx + MAT_ICON_W/2, cy), radius: 1.8 + inf, color: k.Color.fromHex(col) });
+    }
+
+    function drawMatIconOutlineFor(key, cx, cy, col, inf) {
+        switch (key) {
+            case "wood_road":       return drawPlankOutline(cx, cy, col, inf);
+            case "reinforced_road": return drawReinforcedOutline(cx, cy, col, inf);
+            case "stone_road":      return drawStoneOutline(cx, cy, col, inf);
+            case "wood_beam":       return drawBeamOutline(cx, cy, col, inf);
+            case "steel":           return drawSteelOutline(cx, cy, col, inf);
+            case "rope":            return drawRopeOutline(cx, cy, col, inf);
+            case "cable":           return drawCableOutline(cx, cy, col, inf);
+        }
+    }
+
+    function drawRobotIcon(cx, cy, col) {
+        const c = k.Color.fromHex(col);
+        // Antenna — stem + knob on top
+        k.drawLine({ p1: k.vec2(cx, cy - 15), p2: k.vec2(cx, cy - 10), width: 2, color: c });
+        k.drawCircle({ pos: k.vec2(cx, cy - 16), radius: 2.4, color: c });
+        // Head — rounded rectangle outline
+        const w = 22, h = 18;
+        k.drawRect({
+            pos: k.vec2(cx - w / 2, cy - h / 2 + 1),
+            width: w, height: h,
+            fill: false,
+            outline: { width: 2.2, color: c },
+            anchor: "topleft",
+            radius: 4,
+        });
+        // Side "ear" bolts — add character without clutter
+        k.drawCircle({ pos: k.vec2(cx - w / 2 - 1, cy + 3), radius: 1.4, color: c });
+        k.drawCircle({ pos: k.vec2(cx + w / 2 + 1, cy + 3), radius: 1.4, color: c });
+        // Eyes — two chunky dots
+        k.drawCircle({ pos: k.vec2(cx - 4.5, cy - 1), radius: 2, color: c });
+        k.drawCircle({ pos: k.vec2(cx + 4.5, cy - 1), radius: 2, color: c });
+        // Smile — little U (5 short segments for a slightly rounded curve)
+        const my = cy + 5;
+        const sw = 1.7;
+        const pts = [
+            k.vec2(cx - 4,   my),
+            k.vec2(cx - 2.4, my + 1.7),
+            k.vec2(cx,       my + 2.2),
+            k.vec2(cx + 2.4, my + 1.7),
+            k.vec2(cx + 4,   my),
+        ];
+        for (let i = 0; i < pts.length - 1; i++) {
+            k.drawLine({ p1: pts[i], p2: pts[i + 1], width: sw, color: c });
+            k.drawCircle({ pos: pts[i + 1], radius: sw / 2, color: c });
+        }
+    }
+
+    // Hand-drawn question mark: top hook (CW arc from upper-left over the top
+    // down to lower-right) → diagonal stem to the center → dot below. All strokes
+    // in the passed color so the silhouette-outline pass of drawToolIconBtn works.
+    function drawQuestionIcon(cx, cy, col) {
+        const c = k.Color.fromHex(col);
+        const r = 7;
+        const lw = 3;
+        const topY = cy - 5;
+        const aStart = Math.PI * 3 / 4;   // upper-left
+        const aEnd   = -Math.PI / 4;      // lower-right
+        const segs = 26;
+        let prev = null;
+        for (let i = 0; i <= segs; i++) {
+            const t = i / segs;
+            const a = aStart + t * (aEnd - aStart);
+            const x = cx + Math.cos(a) * r;
+            const y = topY - Math.sin(a) * r;
+            if (prev) k.drawLine({ p1: prev, p2: k.vec2(x, y), width: lw, color: c });
+            k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: c });
+            prev = k.vec2(x, y);
+        }
+        // Stem — from arc end diagonally down to center line
+        const endX = cx + Math.cos(aEnd) * r;
+        const endY = topY - Math.sin(aEnd) * r;
+        k.drawLine({ p1: k.vec2(endX, endY), p2: k.vec2(cx, cy + 5), width: lw, color: c });
+        k.drawCircle({ pos: k.vec2(cx, cy + 5), radius: lw / 2, color: c });
+        // Dot
+        k.drawCircle({ pos: k.vec2(cx, cy + 11), radius: 2.2, color: c });
+    }
+
 
 
     // ─── Terrain collision rectangles (for physics) ──
@@ -291,6 +1010,19 @@ export function gameScene(k, { levelIdx }) {
         // Right table surface
         { x1: rX, y1: rY, x2: rX + 600, y2: rY + TABLE_COL_H },
     ];
+    // Mid-gap rock piers — extra solid colliders so a collapsing bridge can
+    // actually rest on / slide off the rock instead of clipping through it.
+    if (lvlDef.extraAnchors) {
+        for (const a of lvlDef.extraAnchors) {
+            if (a.side !== "MID") continue;
+            const ax = Math.round((lvl.midX + a.dx) / GRID) * GRID;
+            const ay = Math.round((lvl.lY + a.dy) / GRID) * GRID;
+            state._terrainColliders.push({
+                x1: ax - 24, y1: ay - 4,
+                x2: ax + 24, y2: ay + 1000,
+            });
+        }
+    }
 
     // Helper: nodes that the cursor can snap to.
     // Includes fixed anchors AND any existing non-builtin node — so dragging
@@ -309,6 +1041,54 @@ export function gameScene(k, { levelIdx }) {
         const nd = new Node(x, y, inLWall || inRWall);
         state.nodes.push(nd);
         return nd;
+    }
+
+    // Place a member, subdividing tension-only materials (rope/cable) into a
+    // chain of short segments connected by free intermediate nodes. The chain
+    // articulates naturally under gravity in sim — a single straight constraint
+    // can never droop, no matter what compliance you set.
+    function placeMemberOrChain(st, en, type) {
+        const mat = MATERIALS[type];
+        const dist = Math.hypot(en.x - st.x, en.y - st.y);
+        // Don't subdivide short tension members or non-tension members
+        if (!mat.tensionOnly || dist < GRID * 1.6) {
+            const m = new Member(st, en, type);
+            state.members.push(m);
+            return [m];
+        }
+        const segs = Math.max(2, Math.round(dist / 22));
+        const chainId = `chn_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`;
+        // Steel cable is significantly heavier per unit length than hemp rope.
+        // Lower invMass = heavier node → more sag, more inertia when swinging.
+        const nodeInvMass = type === "cable" ? 0.35 : 1;
+        const created = [];
+        let prev = st;
+        for (let i = 1; i <= segs; i++) {
+            const t = i / segs;
+            let next;
+            if (i === segs) {
+                next = en;
+            } else {
+                const nx = st.x + (en.x - st.x) * t;
+                const ny = st.y + (en.y - st.y) * t;
+                next = new Node(nx, ny, false);
+                next._chainNode = true;
+                next.invMass = nodeInvMass;
+                state.nodes.push(next);
+            }
+            const m = new Member(prev, next, type);
+            m.chainId = chainId;
+            state.members.push(m);
+            created.push(m);
+            prev = next;
+        }
+        return created;
+    }
+
+    // Given a hit member, return all members in its chain (or just itself).
+    function chainMembersOf(m) {
+        if (!m.chainId) return [m];
+        return state.members.filter(x => x.chainId === m.chainId);
     }
 
     // ─── End game ───────────────────────────────────
@@ -349,6 +1129,24 @@ export function gameScene(k, { levelIdx }) {
     // ═══════════════════════════════════════════════════
     k.onMousePress(() => {
         const pos = k.mousePos();
+        // Tutorial overlay normally swallows clicks (first click finishes
+        // typing, next advances). EXCEPTION: when the current step has an
+        // interactive gate (awaitExpand) AND the click lands inside the
+        // step's spotlight target, let it pass through so the player can
+        // perform the action the tutorial is asking for.
+        if (state.tutorialActive) {
+            const tStep = TUTORIAL_STEPS[state.tutorialStep];
+            const tgt = tStep ? getTutorialTarget(tStep.key) : null;
+            const inTarget = tgt &&
+                pos.x >= tgt.x && pos.x <= tgt.x + tgt.w &&
+                pos.y >= tgt.y && pos.y <= tgt.y + tgt.h;
+            const passthrough = tStep && tStep.awaitExpand &&
+                state.tutorialTyped >= tStep.text.length && inTarget;
+            if (!passthrough) {
+                handleTutorialClick();
+                return;
+            }
+        }
         // Modal button clicks — mirrors the linkBtn positions in drawModal
         if (state.modal) {
             const L = getModalLayout();
@@ -396,12 +1194,44 @@ export function gameScene(k, { levelIdx }) {
             const sc = getScale();
             const hi = state.members.findIndex(m => !m.builtin && distToSegment(wp, m.n1, m.n2) < 16 / sc);
             if (hi !== -1) {
-                const m = state.members.splice(hi, 1)[0];
-                // Capture orphan nodes BEFORE pruning so undo can restore them
-                const orphanNodes = [m.n1, m.n2].filter(n =>
+                const hit = state.members[hi];
+                const group = chainMembersOf(hit);
+                state.members = state.members.filter(m => !group.includes(m));
+                const orphanNodes = state.nodes.filter(n =>
                     !n.fixed && !n.builtin && !state.members.some(mb => mb.n1 === n || mb.n2 === n));
                 state.nodes = state.nodes.filter(n => !orphanNodes.includes(n));
-                state.undoStack.push({ deleted: { member: m, nodes: orphanNodes } });
+                if (group.length > 1) {
+                    pushNewUserAction({ deletedBatch: { members: group, nodes: orphanNodes } });
+                } else {
+                    pushNewUserAction({ deleted: { member: hit, nodes: orphanNodes } });
+                }
+            }
+            return;
+        }
+
+        // Select mode — marquee selection & move
+        if (state.selectMode) {
+            const sc = getScale();
+            // If there's already a selection AND the cursor is on one of the
+            // selected members, start a MOVE. Otherwise start a new MARQUEE.
+            const hitSelected = state.selectedMembers.size > 0 && [...state.selectedMembers].some(m =>
+                !m.broken && distToSegment(wp, m.n1, m.n2) < 16 / sc);
+            if (hitSelected) {
+                state.selectMoving = true;
+                state.selectMoveStart = { x: wp.x, y: wp.y };
+                // Snapshot the original positions of every node in the selection
+                // so we can undo the move AND produce the new-position delta later.
+                const orig = new Map();
+                for (const n of getSelectedNodes()) {
+                    orig.set(n, { x: n.x, y: n.y, rx: n.rx, ry: n.ry });
+                }
+                state.selectMoveOrig = orig;
+            } else {
+                // Start a fresh marquee — clear any existing selection.
+                state.selectedMembers = new Set();
+                state.selectBoxing = true;
+                state.selectBoxStart = { x: wp.x, y: wp.y };
+                state.selectBoxEnd = { x: wp.x, y: wp.y };
             }
             return;
         }
@@ -417,26 +1247,27 @@ export function gameScene(k, { levelIdx }) {
                     const hit = state.members[archMemberIdx];
                     const archData = state.arches.find(a => a.id === hit.archId);
                     if (archData) {
-                        // Stash old members + arch record so cancel can restore them
+                        // In-place edit: keep all arch members/nodes in the world
+                        // and just move their positions as the apex handle drags.
+                        // This way any user-added beams that connect to the
+                        // arch's interior joints follow the arch around.
                         state.editingArchId = archData.id;
-                        const oldMembers = state.members.filter(m => m.archId === archData.id);
-                        state.editingOldMembers = oldMembers;
-                        state.editingOldArchData = archData;
-                        state.members = state.members.filter(m => m.archId !== archData.id);
-                        state.arches = state.arches.filter(a => a.id !== archData.id);
-                        // Also hide the old arch's interior joints — otherwise
-                        // their glue dots stay on screen while the player
-                        // drags the apex handle. They'll be re-added if the
-                        // edit is cancelled (still referenced by oldMembers).
-                        const orphanNodes = new Set();
-                        for (const m of oldMembers) {
-                            for (const n of [m.n1, m.n2]) {
-                                if (n.fixed || n.builtin) continue;
-                                if (state.members.some(mb => mb.n1 === n || mb.n2 === n)) continue;
-                                orphanNodes.add(n);
+                        const nodeStates = new Map();
+                        const restStates = new Map();
+                        if (archData.nodeSequence) {
+                            for (const n of archData.nodeSequence) {
+                                nodeStates.set(n, { x: n.x, y: n.y, rx: n.rx, ry: n.ry });
                             }
                         }
-                        state.nodes = state.nodes.filter(n => !orphanNodes.has(n));
+                        for (const m of state.members) {
+                            if (m.archId === archData.id) restStates.set(m, m.rest);
+                        }
+                        state.editingArchOrig = {
+                            archId: archData.id,
+                            origBulge: archData.bulge,
+                            nodeStates,
+                            restStates,
+                        };
                         state.archStart = { ...archData.start };
                         state.archEnd = { ...archData.end };
                         state.archBulge = archData.bulge;
@@ -488,6 +1319,66 @@ export function gameScene(k, { levelIdx }) {
             const sc = getScale();
             state.hoveredMember = state.members.find(m => distToSegment(state.mouseWorld, m.n1, m.n2) < 10 / sc) || null;
         }
+
+        // Select mode — update marquee rectangle or translate the moving selection
+        if (state.selectMode) {
+            if (state.selectBoxing && state.selectBoxStart) {
+                state.selectBoxEnd = { x: state.mouseWorld.x, y: state.mouseWorld.y };
+            } else if (state.selectMoving && state.selectMoveStart && state.selectMoveOrig) {
+                let dx = state.mouseWorld.x - state.selectMoveStart.x;
+                let dy = state.mouseWorld.y - state.selectMoveStart.y;
+                const moving = state.selectMoveOrig;
+
+                // Realistic clamp: for any member where only ONE endpoint is in
+                // the moving set (a boundary member), the move would stretch it.
+                // Scale (dx, dy) down so no boundary member exceeds its material
+                // maxLength. All nodes translate by the same factor → the
+                // selection still moves rigidly, just capped at the stretch limit.
+                const a = dx * dx + dy * dy;
+                let t = 1;
+                if (a > 1e-9) {
+                    for (const m of state.members) {
+                        if (m.broken || m.builtin) continue;
+                        const n1In = moving.has(m.n1);
+                        const n2In = moving.has(m.n2);
+                        if (n1In === n2In) continue;
+                        const movingN = n1In ? m.n1 : m.n2;
+                        const staticN = n1In ? m.n2 : m.n1;
+                        const origM   = moving.get(movingN);
+                        const vx = origM.x - staticN.x;
+                        const vy = origM.y - staticN.y;
+                        const maxLen = MATERIALS[m.type].maxLength;
+                        // Allow a small tolerance so already-at-max members can
+                        // still move tangentially without a completely blocked t.
+                        const limit = maxLen * 1.02;
+                        const b = 2 * (vx * dx + vy * dy);
+                        const c = vx * vx + vy * vy - limit * limit;
+                        if (c > 0) continue;
+                        const disc = b * b - 4 * a * c;
+                        if (disc < 0) continue;
+                        const tCand = (-b + Math.sqrt(disc)) / (2 * a);
+                        if (tCand >= 0 && tCand < t) t = tCand;
+                    }
+                }
+                dx *= t;
+                dy *= t;
+
+                for (const [n, orig] of moving) {
+                    n.x  = orig.x + dx;
+                    n.y  = orig.y + dy;
+                    n.rx = n.x;
+                    n.ry = n.y;
+                }
+                // Keep rest lengths in sync so sim uses the updated geometry.
+                for (const m of state.members) {
+                    if (m.broken || m.builtin) continue;
+                    if (!moving.has(m.n1) && !moving.has(m.n2)) continue;
+                    const d = Math.hypot(m.n2.x - m.n1.x, m.n2.y - m.n1.y);
+                    const maxLen = MATERIALS[m.type].maxLength;
+                    m.rest = Math.min(d, maxLen);
+                }
+            }
+        }
         // Arch apex handle drag — recompute bulge from cursor's perpendicular offset
         if (state.archDragging && state.archStart && state.archEnd) {
             const A = state.archStart, B = state.archEnd;
@@ -496,7 +1387,26 @@ export function gameScene(k, { levelIdx }) {
             if (chord > 0) {
                 const nx = -dy / chord, ny = dx / chord;
                 const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2;
-                state.archBulge = (state.mouseWorld.x - mx) * nx + (state.mouseWorld.y - my) * ny;
+                let newBulge = (state.mouseWorld.x - mx) * nx + (state.mouseWorld.y - my) * ny;
+
+                // In-place edit: clamp the bulge so the arch's fixed-count
+                // segments never stretch past the material's maxLength.
+                // (Fresh placement doesn't need this — buildArch picks N
+                // dynamically to respect maxLength.)
+                if (state.editingArchId != null) {
+                    const archData = state.arches.find(a => a.id === state.editingArchId);
+                    if (archData?.nodeSequence) {
+                        const N = archData.nodeSequence.length - 1;
+                        const maxLen = MATERIALS[state.selectedMat].maxLength;
+                        const maxBulge = maxBulgeForStretch(chord, N, maxLen);
+                        if (Math.abs(newBulge) > maxBulge) {
+                            newBulge = Math.sign(newBulge) * maxBulge;
+                        }
+                    }
+                }
+
+                state.archBulge = newBulge;
+                if (state.editingArchId != null) syncArchInPlace();
             }
         }
 
@@ -539,6 +1449,44 @@ export function gameScene(k, { levelIdx }) {
         // Releasing the apex handle just stops the drag (don't fall through to beam-drag logic)
         if (state.archDragging) { state.archDragging = false; return; }
 
+        // Select mode — finalize marquee selection or commit a move to the undo stack.
+        if (state.selectMode) {
+            if (state.selectBoxing && state.selectBoxStart && state.selectBoxEnd) {
+                const dx = state.selectBoxEnd.x - state.selectBoxStart.x;
+                const dy = state.selectBoxEnd.y - state.selectBoxStart.y;
+                const dragLen = Math.hypot(dx, dy);
+                if (dragLen < 5) {
+                    // Barely moved — treat as a click and pick the single member under the cursor.
+                    const sc = getScale();
+                    const hit = state.members.find(m =>
+                        !m.builtin && !m.broken
+                        && distToSegment(state.selectBoxStart, m.n1, m.n2) < 16 / sc);
+                    state.selectedMembers = hit ? new Set([hit]) : new Set();
+                } else {
+                    const found = getMembersInBox(state.selectBoxStart, state.selectBoxEnd);
+                    state.selectedMembers = new Set(found);
+                }
+                state.selectBoxing = false;
+                state.selectBoxStart = null;
+                state.selectBoxEnd = null;
+            } else if (state.selectMoving && state.selectMoveOrig) {
+                // Build the undo entry: pre/post-move positions for every moved node
+                const nodeStates = new Map();    // orig map (used by existing editedInPlace undo path)
+                const restStates = new Map();    // empty — members keep their rest lengths
+                for (const [n, p] of state.selectMoveOrig) nodeStates.set(n, p);
+                // Only push if anything actually moved
+                let moved = false;
+                for (const [n, p] of state.selectMoveOrig) {
+                    if (n.x !== p.x || n.y !== p.y) { moved = true; break; }
+                }
+                if (moved) pushNewUserAction({ editedInPlace: { archId: -1, origBulge: 0, nodeStates, restStates } });
+                state.selectMoving = false;
+                state.selectMoveStart = null;
+                state.selectMoveOrig = null;
+            }
+            return;
+        }
+
         const pos = k.mousePos();
         if (!state.dragging || state.mode !== "build") { state.dragging = false; return; }
         const wp = toWorld(pos.x, pos.y);
@@ -550,11 +1498,18 @@ export function gameScene(k, { levelIdx }) {
         const d = Math.hypot(sn.x - st.x, sn.y - st.y);
         const mat = MATERIALS[state.selectedMat];
 
-        // Road materials: stay within bridge zone, max 2 road connections per node
+        // Road materials: stay within bridge zone, max 2 road connections per
+        // node. In LINE mode the endpoint must already be an existing node so
+        // a missed line-fill click can't create a long unsupported chain that
+        // dead-ends mid-span. In single-segment mode we allow new endpoints —
+        // the player is laying the deck one piece at a time toward the next
+        // anchor, and forcing each segment to land on an existing node would
+        // make that impossible.
         if (mat.isRoad) {
             if (sn.x < lX || sn.x > rX) { state.dragging = false; return; }
-            const roadsOnStart = state.members.filter(m => MATERIALS[m.type].isRoad && (m.n1 === st || m.n2 === st)).length;
             const existingEnd = state.nodes.find(n => n.x === sn.x && n.y === sn.y);
+            if (state.lineMode && !existingEnd) { state.dragging = false; return; }
+            const roadsOnStart = state.members.filter(m => MATERIALS[m.type].isRoad && (m.n1 === st || m.n2 === st)).length;
             const roadsOnEnd = existingEnd ? state.members.filter(m => MATERIALS[m.type].isRoad && (m.n1 === existingEnd || m.n2 === existingEnd)).length : 0;
             if (roadsOnStart >= 2 || roadsOnEnd >= 2) { state.dragging = false; return; }
         }
@@ -581,7 +1536,7 @@ export function gameScene(k, { levelIdx }) {
                     }
                 }
             } else if (d <= mat.maxLength) {
-                // Straight mode: single segment
+                // Straight mode: single segment (or chain for tension-only)
                 const en = findOrCreate(sn.x, sn.y);
                 if (en === st) { state.dragging = false; return; }
                 const exists = state.members.some(m =>
@@ -590,9 +1545,8 @@ export function gameScene(k, { levelIdx }) {
                      (m.n2.x === st.x && m.n2.y === st.y && m.n1.x === en.x && m.n1.y === en.y))
                 );
                 if (!exists) {
-                    const m = new Member(st, en, state.selectedMat);
-                    state.members.push(m);
-                    added.push(m);
+                    const created = placeMemberOrChain(st, en, state.selectedMat);
+                    for (const m of created) added.push(m);
                 }
             }
             pushUndoAction(added);
@@ -604,7 +1558,12 @@ export function gameScene(k, { levelIdx }) {
     const availMats = lvlDef.materials || Object.keys(MATERIALS);
     for (let mi = 0; mi < availMats.length && mi < 9; mi++) {
         const matKey = availMats[mi];
-        k.onKeyPress(String(mi + 1), () => { state.selectedMat = matKey; });
+        k.onKeyPress(String(mi + 1), () => {
+            // Pick the upgraded tier if the slot is currently revealing it;
+            // otherwise pick the base — match what the slot shows visually.
+            const upgradeKey = upgradesUnlocked ? MATERIAL_UPGRADES[matKey] : null;
+            state.selectedMat = (upgradeKey && state.matExpanded.has(matKey)) ? upgradeKey : matKey;
+        });
     }
     const resetArchState = () => {
         state.archStart = null;
@@ -613,26 +1572,106 @@ export function gameScene(k, { levelIdx }) {
         state.archBulgeDir = -1;   // next arch starts pointing up by default
     };
 
+    // Every non-fixed, non-builtin node that's an endpoint of a selected member.
+    function getSelectedNodes() {
+        const nodes = new Set();
+        for (const m of state.selectedMembers) {
+            if (!m.n1.fixed && !m.n1.builtin) nodes.add(m.n1);
+            if (!m.n2.fixed && !m.n2.builtin) nodes.add(m.n2);
+        }
+        return nodes;
+    }
+
+    // All non-builtin members whose midpoint falls inside the world-space marquee box.
+    function getMembersInBox(p1, p2) {
+        const lo = { x: Math.min(p1.x, p2.x), y: Math.min(p1.y, p2.y) };
+        const hi = { x: Math.max(p1.x, p2.x), y: Math.max(p1.y, p2.y) };
+        return state.members.filter(m => {
+            if (m.builtin || m.broken) return false;
+            const mx = (m.n1.x + m.n2.x) / 2;
+            const my = (m.n1.y + m.n2.y) / 2;
+            return mx >= lo.x && mx <= hi.x && my >= lo.y && my <= hi.y;
+        });
+    }
+
+    // Delete every currently-selected member (and any nodes orphaned by it).
+    // Recorded as a SINGLE batched undo entry so one undo restores the whole
+    // group at once — feels consistent with how the deletion happened.
+    function deleteSelected() {
+        if (!state.selectedMembers || state.selectedMembers.size === 0) return;
+        const toDelete = [...state.selectedMembers];
+        const remaining = state.members.filter(m => !state.selectedMembers.has(m));
+        const orphan = [];
+        for (const m of toDelete) {
+            for (const n of [m.n1, m.n2]) {
+                if (n.fixed || n.builtin) continue;
+                if (orphan.includes(n)) continue;
+                if (remaining.some(mb => mb.n1 === n || mb.n2 === n)) continue;
+                orphan.push(n);
+            }
+        }
+        state.members = remaining;
+        state.nodes = state.nodes.filter(n => !orphan.includes(n));
+        pushNewUserAction({ deletedBatch: { members: toDelete, nodes: orphan } });
+        state.selectedMembers = new Set();
+    }
+
+    // Reset all ephemeral select-tool state (pending box, in-flight move, etc.).
+    function clearSelectState() {
+        state.selectBoxing = false;
+        state.selectBoxStart = null;
+        state.selectBoxEnd = null;
+        state.selectMoving = false;
+        state.selectMoveStart = null;
+        state.selectMoveOrig = null;
+    }
+
+    // Turn off every build-mode tool mode and clean up any pending state from
+    // each. Use when activating a new tool so they stay mutually exclusive.
+    function clearToolModes() {
+        state.delMode = false;
+        state.lineMode = false;
+        state.archMode = false;
+        state.selectMode = false;
+        state.selectedMembers = new Set();
+        resetArchState();
+        clearSelectState();
+    }
+
     // Cancel any in-progress arch: if we were editing a placed arch, restore it
     // from the stash so the player gets back to where they started.
     function cancelArch() {
-        if (state.editingArchId != null && state.editingOldMembers) {
-            for (const m of state.editingOldMembers) {
-                for (const n of [m.n1, m.n2]) {
-                    if (!state.nodes.includes(n)) state.nodes.push(n);
-                }
-                state.members.push(m);
+        if (state.editingArchId != null && state.editingArchOrig) {
+            const orig = state.editingArchOrig;
+            // Restore every node's position + rest origin
+            for (const [n, p] of orig.nodeStates) {
+                n.x = p.x; n.y = p.y; n.rx = p.rx; n.ry = p.ry;
             }
-            if (state.editingOldArchData) state.arches.push(state.editingOldArchData);
+            // Restore every member's rest length
+            for (const [m, rest] of orig.restStates) {
+                m.rest = rest;
+            }
+            // Restore archData.bulge
+            const arch = state.arches.find(a => a.id === state.editingArchId);
+            if (arch) arch.bulge = orig.origBulge;
         }
         state.editingArchId = null;
-        state.editingOldMembers = null;
-        state.editingOldArchData = null;
+        state.editingArchOrig = null;
         resetArchState();
     }
-    k.onKeyPress("d", () => { state.delMode = !state.delMode; state.lineMode = false; state.archMode = false; resetArchState(); });
-    k.onKeyPress("f", () => { state.lineMode = !state.lineMode; state.delMode = false; state.archMode = false; resetArchState(); });
-    k.onKeyPress("c", () => { state.archMode = !state.archMode; state.delMode = false; state.lineMode = false; resetArchState(); });
+    k.onKeyPress("d", () => { const on = !state.delMode;    clearToolModes(); state.delMode = on; });
+    k.onKeyPress("f", () => { const on = !state.lineMode;   clearToolModes(); state.lineMode = on; });
+    k.onKeyPress("c", () => { const on = !state.archMode;   clearToolModes(); state.archMode = on; });
+    k.onKeyPress("s", () => { if (state.mode !== "build") return; const on = !state.selectMode; clearToolModes(); state.selectMode = on; });
+    // Delete / Backspace — removes the current selection (only in select mode).
+    const deleteSelKey = () => {
+        if (state.mode !== "build") return;
+        if (!state.selectMode) return;
+        if (!state.selectedMembers || state.selectedMembers.size === 0) return;
+        deleteSelected();
+    };
+    k.onKeyPress("delete",    deleteSelKey);
+    k.onKeyPress("backspace", deleteSelKey);
     // Z cancels an in-progress arch (before committing) instead of popping undo,
     // since an in-progress arch preview isn't in the undo stack yet.
     k.onKeyPress("z", () => {
@@ -643,11 +1682,49 @@ export function gameScene(k, { levelIdx }) {
         undoLast();
     });
     k.onKeyPress("space", () => { toggleSim(); });
-    k.onKeyPress("escape", () => { k.go("menu", { view: "levelSelect" }); });
+    k.onKeyPress("escape", () => {
+        // In select mode with an active selection, Escape clears it first
+        // instead of jumping back to the menu.
+        if (state.selectMode && state.selectedMembers && state.selectedMembers.size > 0) {
+            state.selectedMembers = new Set();
+            clearSelectState();
+            return;
+        }
+        k.go("menu", { view: "levelSelect" });
+    });
 
-    // Right-click cancels an in-progress arch (clears all locked state, no commit)
+    // Right-click: cancels in-progress arch, deletes the select-tool selection
+    // (when any), otherwise deletes the hovered member.
     k.onMousePress("right", () => {
-        if (state.archMode && (state.archStart || state.archEnd || state.editingArchId != null)) cancelArch();
+        if (state.archMode && (state.archStart || state.archEnd || state.editingArchId != null)) {
+            cancelArch();
+            return;
+        }
+        if (state.mode !== "build") return;
+        // Select tool: nuke the whole selection with a single right-click
+        if (state.selectMode && state.selectedMembers && state.selectedMembers.size > 0) {
+            deleteSelected();
+            return;
+        }
+        const pos = k.mousePos();
+        // Block right-clicks that land on the toolbar
+        const tb = getToolbar();
+        if (pos.y < tb.h + tb.pad * 2 + 40) return;
+        const wp = toWorld(pos.x, pos.y);
+        const sc = getScale();
+        const hi = state.members.findIndex(m => !m.builtin && distToSegment(wp, m.n1, m.n2) < 16 / sc);
+        if (hi === -1) return;
+        const hit = state.members[hi];
+        const group = chainMembersOf(hit);
+        state.members = state.members.filter(m => !group.includes(m));
+        const orphanNodes = state.nodes.filter(n =>
+            !n.fixed && !n.builtin && !state.members.some(mb => mb.n1 === n || mb.n2 === n));
+        state.nodes = state.nodes.filter(n => !orphanNodes.includes(n));
+        if (group.length > 1) {
+            pushNewUserAction({ deletedBatch: { members: group, nodes: orphanNodes } });
+        } else {
+            pushNewUserAction({ deleted: { member: hit, nodes: orphanNodes } });
+        }
     });
 
     // ─── Line fill: evenly spaced points along a straight line ──
@@ -663,8 +1740,8 @@ export function gameScene(k, { levelIdx }) {
         for (let i = 0; i <= steps; i++) {
             const t = Math.min(1, i / steps);
             pts.push({
-                x: Math.round((x1 + dx * t) / GRID) * GRID,
-                y: Math.round((y1 + dy * t) / GRID) * GRID,
+                x: x1 + dx * t,
+                y: y1 + dy * t,
             });
         }
         // Deduplicate consecutive same points
@@ -744,6 +1821,68 @@ export function gameScene(k, { levelIdx }) {
         return buildArch(state.archStart, state.archEnd, state.archBulge);
     }
 
+    // Max parabolic bulge such that the longest adjacent-sample chord in a
+    // uniform-t N-segment sampling stays ≤ maxLen.
+    //
+    // For point i at t=i/N with y=4b·t(1-t), the adjacent step's Δy peaks at
+    // the endpoints with magnitude 4|b|(N−1)/N². Segment length² equals
+    // (L/N)² + (4b(N−1)/N²)². Solving that ≤ maxLen² for b:
+    //   |b| ≤ N · √(N²·maxLen² − L²) / (4·(N−1))
+    function maxBulgeForStretch(chord, N, maxLen) {
+        if (N < 1) return 0;
+        const inner = N * N * maxLen * maxLen - chord * chord;
+        if (inner <= 0) return 0;
+        const denom = 4 * Math.max(1, N - 1);
+        return (N * Math.sqrt(inner)) / denom;
+    }
+
+    // While editing a placed arch, move its interior joint nodes to match the
+    // current archBulge using the same parabolic formula used at creation time.
+    // Keeps user-added beams that are connected to arch joints following the
+    // arch shape as the apex handle is dragged. Also updates member rest
+    // lengths so a later sim doesn't spring the arch back to its old shape.
+    // If the player switched materials while editing, re-stamps the arch's
+    // member types and compliances to match the new material.
+    function syncArchInPlace() {
+        if (state.editingArchId == null) return;
+        const archData = state.arches.find(a => a.id === state.editingArchId);
+        if (!archData || !archData.nodeSequence || archData.nodeSequence.length < 3) return;
+        const seq = archData.nodeSequence;
+
+        // Material switch during edit — update every arch member's type/compliance
+        const selMat = MATERIALS[state.selectedMat];
+        for (const m of state.members) {
+            if (m.archId !== state.editingArchId) continue;
+            if (m.type !== state.selectedMat) {
+                m.type = state.selectedMat;
+                m.compliance = selMat.compliance;
+            }
+        }
+
+        const A = state.archStart, end = state.archEnd;
+        const dx = end.x - A.x, dy = end.y - A.y;
+        const chord = Math.hypot(dx, dy);
+        if (chord < 5) return;
+        const nx = -dy / chord, ny = dx / chord;
+        const bulge = state.archBulge;
+        const N = seq.length - 1;  // number of segments
+
+        for (let i = 1; i < N; i++) {
+            const t = i / N;
+            const b = 4 * t * (1 - t) * bulge;
+            const newX = A.x + dx * t + nx * b;
+            const newY = A.y + dy * t + ny * b;
+            const n = seq[i];
+            n.x = newX; n.y = newY;
+            n.rx = newX; n.ry = newY;      // rest position = current, so reset-to-build preserves
+        }
+        // Refresh rest lengths for every member of this arch
+        for (const m of state.members) {
+            if (m.archId !== state.editingArchId) continue;
+            m.rest = Math.hypot(m.n1.x - m.n2.x, m.n1.y - m.n2.y);
+        }
+    }
+
     // Phase B: preview arch from locked start to the cursor. If the cursor is
     // hovering near a valid anchor, the end snaps to that anchor so the player
     // sees exactly what clicking would commit. Bulge direction follows whichever
@@ -789,21 +1928,34 @@ export function gameScene(k, { levelIdx }) {
     }
 
     function applyArch(arch) {
-        // If we were editing a placed arch, the old members and arch record are
-        // already stashed (and removed from state). Consume the stash so undo
-        // can reverse the WHOLE edit in one pop.
-        const editingOld = state.editingArchId != null ? {
-            oldMembers: state.editingOldMembers,
-            oldArchData: state.editingOldArchData,
-        } : null;
-        const archId = state.editingArchId != null ? state.editingArchId : state.nextArchId++;
+        // ── In-place edit commit ──
+        // Arch was edited by dragging the apex handle; member/node positions
+        // are already synced via syncArchInPlace() while dragging. Nothing to
+        // create — just persist the new bulge and record a reversible action.
+        if (state.editingArchId != null) {
+            const archData = state.arches.find(a => a.id === state.editingArchId);
+            if (archData) archData.bulge = state.archBulge;
+            if (state.editingArchOrig) {
+                pushNewUserAction({ editedInPlace: {
+                    ...state.editingArchOrig,
+                    newBulge: state.archBulge,
+                } });
+            }
+            state.editingArchId = null;
+            state.editingArchOrig = null;
+            return;
+        }
 
+        // ── Fresh placement ──
+        const archId = state.nextArchId++;
+        const nodeSequence = [];
         const added = [];
-        for (let i = 0; i < arch.points.length - 1; i++) {
-            const p1 = arch.points[i];
-            const p2 = arch.points[i + 1];
-            const n1 = findOrCreate(p1.x, p1.y);
-            const n2 = findOrCreate(p2.x, p2.y);
+        for (let i = 0; i < arch.points.length; i++) {
+            const p = arch.points[i];
+            nodeSequence.push(findOrCreate(p.x, p.y));
+        }
+        for (let i = 0; i < nodeSequence.length - 1; i++) {
+            const n1 = nodeSequence[i], n2 = nodeSequence[i + 1];
             if (n1 === n2) continue;
             const exists = state.members.some(mb =>
                 (mb.n1 === n1 && mb.n2 === n2) || (mb.n2 === n1 && mb.n1 === n2));
@@ -820,29 +1972,42 @@ export function gameScene(k, { levelIdx }) {
             start: { ...state.archStart },
             end: { ...state.archEnd },
             bulge: state.archBulge,
+            nodeSequence,          // keeps ordered references for in-place edits
         };
         state.arches.push(newArchData);
-
-        // Clear edit state (stash has been consumed) + sweep orphan nodes
-        state.editingArchId = null;
-        state.editingOldMembers = null;
-        state.editingOldArchData = null;
         state.nodes = state.nodes.filter(n =>
             n.fixed || n.builtin || state.members.some(m => m.n1 === n || m.n2 === n));
-
-        if (editingOld) {
-            state.undoStack.push({ edited: {
-                newMembers: added, newArchData,
-                oldMembers: editingOld.oldMembers, oldArchData: editingOld.oldArchData,
-            } });
-        } else {
-            pushUndoAction(added);
-        }
+        pushUndoAction(added);
     }
 
     // Record one action (a list of members placed in a single user gesture)
     function pushUndoAction(members) {
-        if (members && members.length) state.undoStack.push({ members });
+        if (members && members.length) {
+            state.undoStack.push({ members });
+            state.redoStack = [];
+        }
+    }
+
+    // Applies a new user action (not triggered by undo/redo). Clears redo stack.
+    function pushNewUserAction(action) {
+        state.undoStack.push(action);
+        state.redoStack = [];
+    }
+
+    // Drop any UI references (arch-edit handle, select-tool selection) that
+    // point at members/arches no longer in `state`. Call after any undo/redo
+    // path that removes structures — otherwise the apex handle + blue anchors
+    // linger as a ghost of the deleted arch.
+    function pruneDanglingUIState() {
+        if (state.editingArchId != null && !state.arches.some(a => a.id === state.editingArchId)) {
+            state.editingArchId = null;
+            state.editingArchOrig = null;
+        }
+        if (state.selectedMembers && state.selectedMembers.size) {
+            for (const m of [...state.selectedMembers]) {
+                if (!state.members.includes(m)) state.selectedMembers.delete(m);
+            }
+        }
     }
 
     function undoLast() {
@@ -856,25 +2021,43 @@ export function gameScene(k, { levelIdx }) {
                 if (!state.nodes.includes(n)) state.nodes.push(n);
             }
             state.members.push(action.deleted.member);
+            // Redo = delete it again
+            state.redoStack.push({ redoDelete: action.deleted });
             return;
         }
 
-        if (action.edited) {
-            // Arch-edit reversal: remove new arch + record, restore old arch + record
-            for (const m of action.edited.newMembers) {
-                const idx = state.members.indexOf(m);
-                if (idx !== -1) state.members.splice(idx, 1);
+        if (action.deletedBatch) {
+            // Restore every member + every orphan node that went with them in a
+            // single undo step (inverse of select-tool batch delete).
+            for (const n of action.deletedBatch.nodes) {
+                if (!state.nodes.includes(n)) state.nodes.push(n);
             }
-            state.arches = state.arches.filter(a => a.id !== action.edited.newArchData.id);
-            for (const m of action.edited.oldMembers) {
-                for (const n of [m.n1, m.n2]) {
-                    if (!state.nodes.includes(n)) state.nodes.push(n);
-                }
-                state.members.push(m);
+            for (const m of action.deletedBatch.members) {
+                if (!state.members.includes(m)) state.members.push(m);
             }
-            state.arches.push(action.edited.oldArchData);
-            state.nodes = state.nodes.filter(n =>
-                n.fixed || n.builtin || state.members.some(m => m.n1 === n || m.n2 === n));
+            state.redoStack.push({ redoDeleteBatch: action.deletedBatch });
+            return;
+        }
+
+        if (action.editedInPlace) {
+            // Arch apex-handle edit reversal: restore every arch node's position
+            // (so connected beams snap back too) + member rest lengths + bulge.
+            const orig = action.editedInPlace;
+            // Capture current (post-edit) state so redo can re-apply it
+            const newNodeStates = new Map();
+            const newRestStates = new Map();
+            for (const [n, _] of orig.nodeStates) newNodeStates.set(n, { x: n.x, y: n.y, rx: n.rx, ry: n.ry });
+            for (const [m, _] of orig.restStates) newRestStates.set(m, m.rest);
+            const arch = state.arches.find(a => a.id === orig.archId);
+            const newBulge = arch?.bulge;
+
+            for (const [n, p] of orig.nodeStates) {
+                n.x = p.x; n.y = p.y; n.rx = p.rx; n.ry = p.ry;
+            }
+            for (const [m, rest] of orig.restStates) m.rest = rest;
+            if (arch) arch.bulge = orig.origBulge;
+
+            state.redoStack.push({ editedInPlace: { archId: orig.archId, origBulge: newBulge, nodeStates: newNodeStates, restStates: newRestStates } });
             return;
         }
 
@@ -887,13 +2070,82 @@ export function gameScene(k, { levelIdx }) {
         }
         // If the removed members belonged to arch(es) and no more members from
         // the arch remain, drop the arch record too
+        const droppedArches = [];
         for (const id of removedIds) {
             if (!state.members.some(mb => mb.archId === id)) {
-                state.arches = state.arches.filter(a => a.id !== id);
+                const a = state.arches.find(ar => ar.id === id);
+                if (a) droppedArches.push(a);
+                state.arches = state.arches.filter(ar => ar.id !== id);
             }
         }
-        state.nodes = state.nodes.filter(n =>
-            n.fixed || n.builtin || state.members.some(m => m.n1 === n || m.n2 === n));
+        const droppedNodes = [];
+        state.nodes = state.nodes.filter(n => {
+            const keep = n.fixed || n.builtin || state.members.some(m => m.n1 === n || m.n2 === n);
+            if (!keep) droppedNodes.push(n);
+            return keep;
+        });
+
+        state.redoStack.push({ redoAdd: { members: action.members, nodes: droppedNodes, arches: droppedArches } });
+        pruneDanglingUIState();
+    }
+
+    function redoLast() {
+        if (state.mode !== "build") return;
+        const action = state.redoStack.pop();
+        if (!action) return;
+
+        if (action.redoDelete) {
+            // Delete the member again (and sweep its orphan nodes)
+            const m = action.redoDelete.member;
+            const idx = state.members.indexOf(m);
+            if (idx !== -1) state.members.splice(idx, 1);
+            state.nodes = state.nodes.filter(n => !action.redoDelete.nodes.includes(n));
+            state.undoStack.push({ deleted: action.redoDelete });
+            pruneDanglingUIState();
+            return;
+        }
+
+        if (action.redoDeleteBatch) {
+            const batch = action.redoDeleteBatch;
+            state.members = state.members.filter(m => !batch.members.includes(m));
+            state.nodes = state.nodes.filter(n => !batch.nodes.includes(n));
+            state.undoStack.push({ deletedBatch: batch });
+            pruneDanglingUIState();
+            return;
+        }
+
+        if (action.editedInPlace) {
+            // Re-apply the post-edit state; capture pre-edit as the new undo target
+            const orig = action.editedInPlace;
+            const preNodeStates = new Map();
+            const preRestStates = new Map();
+            for (const [n, _] of orig.nodeStates) preNodeStates.set(n, { x: n.x, y: n.y, rx: n.rx, ry: n.ry });
+            for (const [m, _] of orig.restStates) preRestStates.set(m, m.rest);
+            const arch = state.arches.find(a => a.id === orig.archId);
+            const preBulge = arch?.bulge;
+
+            for (const [n, p] of orig.nodeStates) {
+                n.x = p.x; n.y = p.y; n.rx = p.rx; n.ry = p.ry;
+            }
+            for (const [m, rest] of orig.restStates) m.rest = rest;
+            if (arch) arch.bulge = orig.origBulge;
+
+            state.undoStack.push({ editedInPlace: { archId: orig.archId, origBulge: preBulge, nodeStates: preNodeStates, restStates: preRestStates } });
+            return;
+        }
+
+        if (action.redoAdd) {
+            for (const n of action.redoAdd.nodes) {
+                if (!state.nodes.includes(n)) state.nodes.push(n);
+            }
+            for (const a of action.redoAdd.arches) {
+                if (!state.arches.some(ar => ar.id === a.id)) state.arches.push(a);
+            }
+            for (const m of action.redoAdd.members) {
+                if (!state.members.includes(m)) state.members.push(m);
+            }
+            state.undoStack.push({ members: action.redoAdd.members });
+        }
     }
 
     function toggleSim() {
@@ -904,8 +2156,16 @@ export function gameScene(k, { levelIdx }) {
                 state.modal = { win: false, title: "OVER BUDGET", desc: `$${cost.toLocaleString()} exceeds the $${lvl.budget.toLocaleString()} budget. Remove some members.`, openTime: k.time() };
                 return;
             }
+            // Select tool is build-only — dragging nodes mid-sim fights the XPBD
+            // solver and makes stress readings jump around. Clear it on entry.
+            state.selectMode = false;
+            state.selectedMembers = new Set();
+            clearSelectState();
             // Cancel any in-progress arch so its preview doesn't render in sim
             cancelArch();
+            // Mark vehicles as already on the surface so vehicleTick snaps
+            // immediately on the first frame — no drop animation.
+            for (const v of state.vehicles) { v.vy = 0; v._falling = false; }
             initPhysicsWorld(state, lvl);
             state.mode = "sim";
         } else {
@@ -919,22 +2179,63 @@ export function gameScene(k, { levelIdx }) {
         const pad = 8;
         const tbH = 50;
         const matKeys = lvlDef.materials || Object.keys(MATERIALS);
-        const matBtnW = matKeys.length > 5 ? 56 : 70;
-        const matStartX = W / 2 - (matKeys.length * (matBtnW + 4)) / 2;
+        // Bigger material slots for the bumped-up icons.
+        const matBtnW = 74;
+        const matGap = 8;
+        const toolGap = 2;     // tighter, uniform spacing between tool buttons
+        const toolW = 48;
+        const toolCount = 6;                  // line, arch, select, delete, undo, redo
+        // Per-slot x positions — small extra gap between material groups (road/structural/tension).
+        const matGroupExtra = 6;
+        const matGroup = k => MATERIALS[k]?.tensionOnly ? 2 : MATERIALS[k]?.isRoad ? 0 : 1;
+        const matOffsets = [];
+        let off = 0;
+        for (let i = 0; i < matKeys.length; i++) {
+            matOffsets.push(off);
+            if (i < matKeys.length - 1) {
+                const extra = matGroup(matKeys[i]) !== matGroup(matKeys[i + 1]) ? matGroupExtra : 0;
+                off += matBtnW + matGap + extra;
+            }
+        }
+        const matGroupW = off + matBtnW;
+        const toolGroupW = toolCount * toolW + (toolCount - 1) * toolGap;
+        // Anchor tools at the position they'd occupy with 2 material slots so the
+        // divider and tool buttons don't shift when more materials are added.
+        const BASE_MATS = 2;
+        const baseMatGroupW = BASE_MATS * matBtnW + (BASE_MATS - 1) * matGap;
+        const groupSep = 32;
+        const baseTotalW = baseMatGroupW + groupSep + toolGroupW;
+        const toolStartX = Math.round((W - baseTotalW) / 2) + baseMatGroupW + groupSep + 40;
+        const matStartX = toolStartX - groupSep - matGroupW;
+        const matX = matOffsets.map(o => matStartX + o);
+        const matsEnd = matStartX + matGroupW;
+        // Vertically center every button on the bar's midline.
+        const barMid = (tbH + pad) / 2;
+        const btnY = Math.round(barMid - 16);  // h=32 → offset 16
+        // Tool button order: select, line, arch, delete, undo, redo
+        const toolX = (slot) => toolStartX + slot * (toolW + toolGap);
 
         return {
             h: tbH, pad,
-            matKeys, matBtnW, matStartX,
+            matKeys, matBtnW, matGap, matStartX, matX,
             // Button positions (approximate bounding boxes)
-            simBtn: { x: W - 230, y: pad + 8, w: 100, h: 32 },
-            delBtn:   { x: matStartX + matKeys.length * (matBtnW + 4) + 10,  y: pad + 8, w: 50, h: 32 },
-            lineBtn:  { x: matStartX + matKeys.length * (matBtnW + 4) + 65,  y: pad + 8, w: 50, h: 32 },
-            archBtn: { x: matStartX + matKeys.length * (matBtnW + 4) + 120, y: pad + 8, w: 50, h: 32 },
-            undoBtn:  { x: matStartX + matKeys.length * (matBtnW + 4) + 175, y: pad + 8, w: 55, h: 32 },
-            speedBtn: { x: W - 125, y: pad + 8, w: 46, h: 32 },
-            menuBtn: { x: W - 55, y: pad + 8, w: 48, h: 32 },
-            aiBtn: { x: 10, y: pad + tbH + 8, w: 42, h: 36 },
-            hintBtn: { x: 58, y: pad + tbH + 8, w: 42, h: 36 },
+            simBtn:    { x: W - 220, y: btnY, w: 46, h: 32 },
+            selectBtn: { x: toolX(0), y: btnY, w: toolW, h: 32 },
+            lineBtn:   { x: toolX(1), y: btnY, w: toolW, h: 32 },
+            archBtn:   { x: toolX(2), y: btnY, w: toolW, h: 32 },
+            delBtn:    { x: toolX(3), y: btnY, w: toolW, h: 32 },
+            undoBtn:   { x: toolX(4), y: btnY, w: toolW, h: 32 },
+            redoBtn:   { x: toolX(5), y: btnY, w: toolW, h: 32 },
+            // Split speed control: arrows sit tight against the central value.
+            speedDownBtn: { x: W - 158, y: btnY, w: 30, h: 32 },
+            speedUpBtn:   { x: W - 88,  y: btnY, w: 30, h: 32 },
+            menuBtn:      { x: W - 50,  y: btnY, w: 40, h: 32 },
+            // AI + Hint sit just under the left edge of the toolbar, tucked out
+            // of the way to keep the notebook area clear for the bridge build.
+            // Hangs ~30px below the toolbar so the suspension ropes have a
+            // visible length and can tilt convincingly during the swing.
+            aiBtn:     { x: 26, y: pad + tbH + 32, w: 48, h: 36 },
+            hintBtn:   { x: 76, y: pad + tbH + 32, w: 48, h: 36 },
         };
     }
 
@@ -942,11 +2243,35 @@ export function gameScene(k, { levelIdx }) {
         const tb = getToolbar();
         const y = pos.y;
 
-        // Material buttons
+        // Material buttons — match the draw layout exactly (gap matters for hit testing)
+        const matY = tb.simBtn.y;  // same vertical row
         for (let i = 0; i < tb.matKeys.length; i++) {
-            const bx = tb.matStartX + i * (tb.matBtnW + 4);
-            if (pos.x >= bx && pos.x <= bx + tb.matBtnW && y >= tb.pad + 8 && y <= tb.pad + 40) {
-                state.selectedMat = tb.matKeys[i];
+            const bx = tb.matX[i];
+            if (pos.x >= bx && pos.x <= bx + tb.matBtnW && y >= matY && y <= matY + 32) {
+                const baseKey = tb.matKeys[i];
+                const upgradeKey = upgradesUnlocked ? MATERIAL_UPGRADES[baseKey] : null;
+                const now = k.time();
+                const last = state.matLastClick;
+                const isDouble = upgradeKey && last && last.key === baseKey && (now - last.time) < 0.3;
+
+                if (isDouble) {
+                    // Toggle the upgraded reveal for this slot. Restart the
+                    // reveal animation in BOTH directions so collapsing back
+                    // to the base tier feels just as snappy as the upgrade.
+                    if (state.matExpanded.has(baseKey)) {
+                        state.matExpanded.delete(baseKey);
+                        if (state.selectedMat === upgradeKey) state.selectedMat = baseKey;
+                    } else {
+                        state.matExpanded.add(baseKey);
+                        state.selectedMat = upgradeKey;       // jumping straight to the upgrade feels right
+                    }
+                    state.matRevealT[baseKey] = 0;
+                    state.matLastClick = null;
+                } else {
+                    // Single click — pick whatever's currently displayed in the slot.
+                    state.selectedMat = state.matExpanded.has(baseKey) ? upgradeKey : baseKey;
+                    state.matLastClick = { key: baseKey, time: now };
+                }
                 state.delMode = false;
                 return true;
             }
@@ -962,27 +2287,37 @@ export function gameScene(k, { levelIdx }) {
         // Delete button
         const db = tb.delBtn;
         if (pos.x >= db.x && pos.x <= db.x + db.w && y >= db.y && y <= db.y + db.h) {
-            state.delMode = !state.delMode;
+            const on = !state.delMode;
+            clearToolModes();
+            state.delMode = on;
             return true;
         }
 
         // Line fill button
         const lb = tb.lineBtn;
         if (pos.x >= lb.x && pos.x <= lb.x + lb.w && y >= lb.y && y <= lb.y + lb.h) {
-            state.lineMode = !state.lineMode;
-            state.archMode = false;
-            resetArchState();
-            state.delMode = false;
+            const on = !state.lineMode;
+            clearToolModes();
+            state.lineMode = on;
             return true;
         }
 
         // Arch button
         const arb = tb.archBtn;
         if (pos.x >= arb.x && pos.x <= arb.x + arb.w && y >= arb.y && y <= arb.y + arb.h) {
-            state.archMode = !state.archMode;
-            resetArchState();
-            state.lineMode = false;
-            state.delMode = false;
+            const on = !state.archMode;
+            clearToolModes();
+            state.archMode = on;
+            return true;
+        }
+
+        // Select button — build-only (nothing to select/move while the sim is running)
+        const selb = tb.selectBtn;
+        if (pos.x >= selb.x && pos.x <= selb.x + selb.w && y >= selb.y && y <= selb.y + selb.h) {
+            if (state.mode !== "build") return true;
+            const on = !state.selectMode;
+            clearToolModes();
+            state.selectMode = on;
             return true;
         }
 
@@ -993,11 +2328,27 @@ export function gameScene(k, { levelIdx }) {
             return true;
         }
 
-        // Speed button
-        const spb = tb.speedBtn;
-        if (pos.x >= spb.x && pos.x <= spb.x + spb.w && y >= spb.y && y <= spb.y + spb.h) {
-            const speeds = [1, 2, 4];
-            state.simSpeed = speeds[(speeds.indexOf(state.simSpeed) + 1) % 3];
+        // Redo button
+        const rb = tb.redoBtn;
+        if (pos.x >= rb.x && pos.x <= rb.x + rb.w && y >= rb.y && y <= rb.y + rb.h) {
+            redoLast();
+            return true;
+        }
+
+        // Speed down — steps backward through [0.5, 1, 2, 4] (clamped at 0.5)
+        const spd = tb.speedDownBtn;
+        if (pos.x >= spd.x && pos.x <= spd.x + spd.w && y >= spd.y && y <= spd.y + spd.h) {
+            const speeds = [0.5, 1, 2, 4];
+            const idx = Math.max(0, speeds.indexOf(state.simSpeed) - 1);
+            state.simSpeed = speeds[idx];
+            return true;
+        }
+        // Speed up — steps forward through [0.5, 1, 2, 4] (clamped at 4)
+        const spu = tb.speedUpBtn;
+        if (pos.x >= spu.x && pos.x <= spu.x + spu.w && y >= spu.y && y <= spu.y + spu.h) {
+            const speeds = [0.5, 1, 2, 4];
+            const idx = Math.min(speeds.length - 1, speeds.indexOf(state.simSpeed) + 1);
+            state.simSpeed = speeds[idx];
             return true;
         }
 
@@ -1185,7 +2536,7 @@ export function gameScene(k, { levelIdx }) {
 
                 if (state.simTime > 38) {
                     // Check for splash when vehicle falls into water
-                    const splashY = Math.max(lY, rY) + TABLE_DEPTH * 0.35;
+                    const splashY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
                     for (const v of state.vehicles) {
                         if (v.active && !v._splashed && v.y > splashY && v.x > lX && v.x < rX && v.vy > 1) {
                             v._splashed = true;
@@ -1196,11 +2547,70 @@ export function gameScene(k, { levelIdx }) {
                     const result = vehicleTick(state, lvl, lvlDef);
                     if (result === "win") endGame(true);
                     else if (result === "fail") endGame(false);
+
+                    // Exhaust smoke — periodic puffs from the rear of motorized
+                    // vehicles to make the static sprites feel like they're running.
+                    for (const v of state.vehicles) {
+                        if (!v.active || v._splashed || v._falling || v.finished) continue;
+                        if (v.cfg.sprite === "veh_bicycle") continue;
+                        v._smokeTimer = (v._smokeTimer || 0) - 1;
+                        if (v._smokeTimer <= 0) {
+                            // Heavier vehicles smoke more often
+                            const interval = v.cfg.mass > 100 ? 8 : 14;
+                            v._smokeTimer = interval + Math.random() * 4;
+                            const dir = v.vx >= 0 ? -1 : 1;       // smoke trails behind motion
+                            const sX = v.x + dir * v.cfg.w * 0.42;
+                            const sY = v.y + v.cfg.h * 0.18;
+                            state.particles.push({
+                                x: sX, y: sY,
+                                vx: dir * 0.45 + (Math.random() - 0.5) * 0.3,
+                                vy: -0.35 - Math.random() * 0.25,
+                                life: 1,
+                                decay: 0.018 + Math.random() * 0.010,
+                                r: 2.4 + Math.random() * 1.4,
+                                color: "#bdbdbd",
+                                update() {
+                                    this.x += this.vx;
+                                    this.y += this.vy;
+                                    this.vy += 0.004;
+                                    this.vx *= 0.94;
+                                    this.r *= 1.018;
+                                    this.life -= this.decay;
+                                },
+                            });
+                        }
+                    }
+
+                    // Water drag — once a vehicle has splashed in, water resists
+                    // its motion. Heavy vehicles (camper, truck, bus) nose-dive
+                    // slowly with their engine weight pulling the front down.
+                    // Lighter vehicles can still tumble as they sink.
+                    for (const v of state.vehicles) {
+                        if (!v._splashed) continue;
+                        const isHeavy = v.cfg.mass > 100;
+                        if (isHeavy) {
+                            // Rotate toward nose-down (forward direction)
+                            const targetAngle = (Math.PI / 2) * (v.vx >= 0 ? 1 : -1);
+                            v.angle += (targetAngle - v.angle) * 0.035;
+                            if (typeof v.angVel === "number") v.angVel *= 0.7;
+                            v.vy *= 0.82;
+                            if (v.vy < 0.18) v.vy = 0.18;
+                            if (v.vy > 0.7)  v.vy = 0.7;
+                            if (typeof v.vx === "number") v.vx *= 0.82;
+                        } else {
+                            // Light vehicle — some residual spin and tumble
+                            v.vy *= 0.85;
+                            if (v.vy < 0.35) v.vy = 0.35;
+                            if (v.vy > 1.2)  v.vy = 1.2;
+                            if (typeof v.vx === "number")    v.vx     *= 0.88;
+                            if (typeof v.angVel === "number") v.angVel *= 0.92;
+                        }
+                    }
                 }
             }
 
             // Check for bridge nodes hitting water (fallen halves)
-            const splashWY = Math.max(lY, rY) + TABLE_DEPTH * 0.35;
+            const splashWY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
             for (const n of state.nodes) {
                 if (n.invMass === 0 || n._splashed) continue;
                 if (n.y > splashWY && n.x > lX - 20 && n.x < rX + 20 && n.vy > 1) {
@@ -1258,18 +2668,41 @@ export function gameScene(k, { levelIdx }) {
             const sc = getScale();
 
             drawBackground(W, H, sc);
-            // Roads first — car drives on top of them
-            drawMembers(sc, "roads");
-            drawGhostBeam(sc);
-            drawArchPreview(sc);
-            drawNodes(sc);
             drawWater(W, H, sc);
+            // Submerged member halves render AFTER the water so fallen pieces
+            // stay visible; the draw layers a blue tint in-place to sell "seen
+            // through water" rather than being hidden by the solid water rect.
+            drawMembers(sc, "structural-submerged");
+            // Wave surface drawn AFTER submerged members so the wave sprite
+            // overlays any bridge piece dipping into the water.
+            drawWaterSurface(W, sc);
+            // Terrain (cliffs + rock pier) draws OVER the submerged layer so
+            // anything truly underwater is occluded by the rock when behind it.
             drawTerrain(sc);
+            // Above-water road planks render AFTER the terrain — a fallen
+            // plank resting on the rock should appear ON TOP of the rock,
+            // not behind it. Halo first so the select glow sits behind.
+            drawSelectHalo(sc, "roads");
+            drawMembers(sc, "roads");
+            drawAnchorDots(sc);   // drawn after roads so dots are never buried under planks
+            drawGhostBeam(sc);
             drawFlags(sc);        // flags behind vehicles
             drawVehicles(sc);
-            // Structural beams in front of the car for a 3D-truss feel — the car
-            // appears to pass *through* the bridge frame from the side view
+            // Blue halo behind selected arch (must precede structural draw)
+            drawArchEditHalo(sc);
+            // Blue halo behind STRUCTURAL selected members (the road-member halo
+            // was already drawn before the "roads" pass above).
+            drawSelectHalo(sc, "structural");
+            // Above-water structural beams in front of the car for a 3D-truss
+            // feel — the car appears to pass *through* the bridge frame
             drawMembers(sc, "structural");
+            // Yellow node handles render LAST among the bridge stack so beam
+            // line caps and grain marks can't peek through the handle.
+            drawNodes(sc);
+            // Arch preview on top of structural so apex handle is always visible
+            drawArchPreview(sc);
+            // Select-tool marquee rectangle — drawn on top of everything so it's always visible
+            drawSelectBox(sc);
             drawSplashes(sc);
             drawParticles(sc);
             drawSnapConfetti(sc);
@@ -1280,6 +2713,7 @@ export function gameScene(k, { levelIdx }) {
             drawHintPanel();
             drawAiPanel();
             if (state.modal) drawModal();
+            if (state.tutorialActive) drawTutorialOverlay();
         } catch(e) {
             // Show error on screen so we can debug
             k.drawRect({ width: k.width(), height: 60, pos: k.vec2(0, 0), color: k.Color.fromHex("#cc0000"), anchor: "topleft" });
@@ -1328,10 +2762,15 @@ export function gameScene(k, { levelIdx }) {
             // Sky color base
             k.drawRect({ width: W, height: H, pos: k.vec2(0, 0), color: k.Color.fromHex("#4a90c8"), anchor: "topleft" });
 
-            bgScroll += 0.3;
+            // Scroll rate scales with sim speed so the parallax matches the
+            // pace of the rest of the simulation (flags, water, vehicles).
+            bgScroll += 0.3 * state.simSpeed;
 
-            // Draw backgrounds scaled to top 65% of screen so they don't stretch
-            const bgH = H * 0.65;
+            // Stretch the parallax bg down to (or just past) the waterline so
+            // its grassy bottom edge meets the water naturally — no flat-green
+            // band, no sky-blue stripe between bg and water.
+            const waterScreenY = toScreen(0, Math.max(lY, rY) + TABLE_DEPTH * 0.36).y;
+            const bgH = Math.max(H * 0.65, waterScreenY + 4);
             for (const layer of BG_LAYERS) {
                 try {
                     const offset = (bgScroll * layer.speed) % W;
@@ -1407,28 +2846,283 @@ export function gameScene(k, { levelIdx }) {
         // Draw right ground
         drawGround(rX, rX + 600, rY, sc, "right");
 
-        // Anchor dots — only in build mode
-        if (state.mode === "build") {
+        // Cliff tower masts — extra anchors on the cliff surface above cliff top.
+        for (const n of state.nodes) {
+            if (!n.fixed || n.builtin) continue;
+            if (n.x < lX && n.y < lY) drawCliffTower(n.x, n.y, lY, sc);
+            else if (n.x > rX && n.y < rY) drawCliffTower(n.x, n.y, rY, sc);
+        }
+
+        // Mid-gap rock piers — anchors with x strictly between the two cliffs
+        // get a visible rock/pillar underneath them. Drawn BEFORE the anchor
+        // dots so the red dot reads as sitting on top of the rock. Visible in
+        // all modes since the rock is part of the level geometry.
+        for (const n of state.nodes) {
+            if (!n.fixed || n.builtin) continue;
+            if (n.x <= lX || n.x >= rX) continue;  // only MID anchors get a pier
+            drawMidPier(n.x, n.y, sc);
+        }
+
+        // Anchor dots drawn separately (drawAnchorDots) so they render after roads.
+    }
+
+    function drawAnchorDots(sc) {
+        if (state.mode !== "build") return;
+        {
+            const t = k.time();
+            const mpos = k.mousePos();
             state.nodes.filter(n => n.fixed && !n.builtin).forEach(n => {
                 const p = toScreen(n.x, n.y);
-                const isMain = (n.x === lX && n.y === lY) || (n.x === rX && n.y === rY);
-                const r = isMain ? sc * 4.5 : sc * 3.5;
+                const onCliffTop = (n.x === lX && n.y === lY) || (n.x === rX && n.y === rY);
+                const onMidPier  = n.x > lX && n.x < rX;
+                const onTower    = !onCliffTop && !onMidPier && n.y < Math.min(lY, rY);
+                const isPrimary  = onCliffTop || onMidPier || onTower;
+                const baseR = isPrimary ? sc * 4.5 : sc * 3.5;
 
-                if (!isMain) {
+                const phase = (n.x * 0.013 + n.y * 0.017);
+                const breathe = 0.5 + 0.5 * Math.sin(t * 1.6 + phase);  // 0..1
+                const hovered = isPrimary && Math.hypot(mpos.x - p.x, mpos.y - p.y) < baseR * 2.4;
+                const hoverPop = hovered ? 1.18 : 1;
+                const r = baseR * (1 + breathe * 0.06) * hoverPop;
+
+                // Only the cliff-wall "extra" anchors get the grey socket plate
+                // underneath — mid-pier anchors sit directly on their rock.
+                if (!isPrimary) {
                     const bw = r * 2.5, bh = r * 0.8;
                     k.drawRect({ pos: k.vec2(p.x - bw / 2, p.y - bh / 2), width: bw, height: bh, color: k.Color.fromHex("#555555"), anchor: "topleft" });
                 }
 
+                // Outer glow halo — pulses with the breathing, brighter on hover.
+                if (isPrimary) {
+                    const glowR = r * (2.2 + 0.4 * breathe + (hovered ? 0.6 : 0));
+                    const glowOp = (0.10 + 0.18 * breathe) * (hovered ? 2.2 : 1);
+                    // Layered rings for soft falloff
+                    for (let g = 3; g >= 1; g--) {
+                        k.drawCircle({
+                            pos: p,
+                            radius: glowR * (0.7 + 0.15 * g),
+                            color: k.Color.fromHex("#ff6464"),
+                            opacity: glowOp * (0.4 / g),
+                        });
+                    }
+                }
+
+                // Drop shadow
                 k.drawCircle({ pos: k.vec2(p.x + 0.5, p.y + 0.5), radius: r + 1, color: k.Color.fromHex("#010101"), opacity: 0.25 });
-                k.drawCircle({ pos: p, radius: r, color: k.Color.fromHex(isMain ? "#c43030" : "#606878") });
-                k.drawCircle({ pos: k.vec2(p.x - r * 0.25, p.y - r * 0.25), radius: r * 0.3, color: k.Color.fromHex("#ffffff"), opacity: 0.35 });
+                // Main dot
+                k.drawCircle({ pos: p, radius: r, color: k.Color.fromHex(isPrimary ? "#c43030" : "#606878") });
+                // Highlight pip — subtle shimmer that tracks the breathing
+                k.drawCircle({
+                    pos: k.vec2(p.x - r * 0.25, p.y - r * 0.25),
+                    radius: r * 0.3,
+                    color: k.Color.fromHex("#ffffff"),
+                    opacity: 0.35 + 0.25 * breathe,
+                });
+                // Hover ring — crisp outline that appears only when the cursor
+                // is nearby, signaling "you can grab/build off this".
+                if (hovered) {
+                    k.drawCircle({
+                        pos: p,
+                        radius: r + 2.5,
+                        fill: false,
+                        outline: { width: 2, color: k.Color.fromHex("#ffd479") },
+                        opacity: 0.8,
+                    });
+                }
             });
         }
     }
 
+    // Draw a stone pillar rising out of the water to support a mid-gap anchor.
+    // Greyscale stone palette so the rock reads as a distinct element from the
+    // dirt/cliff approach tables.
+    function drawMidPier(ax, ay, sc) {
+        const H = k.height();
+        const screenTop = toScreen(ax, ay);
+        // Rock top sits just above the anchor so the red dot plants onto it
+        // rather than floating above.
+        const topY = screenTop.y - 4 * sc;
+        const botY = H + 20;   // run past the bottom of the screen
+        const topHalfW = 22 * sc;
+        const botHalfW = 52 * sc;
+
+        const lerp = (a, b, t) => a + (b - a) * t;
+
+        // Main stone body — horizontal slices for a taper. Cool greys with a
+        // subtle gradient from lighter at top to darker at the base.
+        const sliceH = Math.max(2, 6 * sc);
+        for (let y = topY; y < botY; y += sliceH) {
+            const t = Math.min(1, (y - topY) / (botY - topY));
+            const halfW = lerp(topHalfW, botHalfW, t);
+            // Light stone → mid stone → dark stone
+            const col = t < 0.22 ? "#a5a095" : t < 0.55 ? "#7d7870" : "#5a5650";
+            k.drawRect({
+                pos: k.vec2(screenTop.x - halfW, y),
+                width: halfW * 2, height: sliceH + 0.5,
+                color: k.Color.fromHex(col),
+                anchor: "topleft",
+            });
+        }
+
+        // Weathered cap right under the anchor — a slightly warmer/darker
+        // stone band so the red dot reads as sitting on a solid ledge, not
+        // just painted onto the top of the pillar.
+        const capH = Math.max(3, 5 * sc);
+        k.drawRect({
+            pos: k.vec2(screenTop.x - topHalfW, topY),
+            width: topHalfW * 2, height: capH,
+            color: k.Color.fromHex("#8a857a"),
+            anchor: "topleft",
+        });
+        // Tiny highlight along the very top of the cap
+        k.drawRect({
+            pos: k.vec2(screenTop.x - topHalfW, topY),
+            width: topHalfW * 2, height: Math.max(1, 1.5 * sc),
+            color: k.Color.fromHex("#c0bcb2"),
+            anchor: "topleft", opacity: 0.7,
+        });
+
+        // Thin dark silhouette edges on both sides.
+        const edgeN = 20;
+        for (let i = 0; i < edgeN; i++) {
+            const t = i / edgeN;
+            const y = lerp(topY + capH, botY, t);
+            const halfW = lerp(topHalfW, botHalfW, t);
+            k.drawRect({
+                pos: k.vec2(screenTop.x - halfW, y),
+                width: 1, height: (botY - topY) / edgeN + 1,
+                color: k.Color.fromHex("#2a2824"),
+                anchor: "topleft", opacity: 0.35,
+            });
+            k.drawRect({
+                pos: k.vec2(screenTop.x + halfW - 1, y),
+                width: 1, height: (botY - topY) / edgeN + 1,
+                color: k.Color.fromHex("#2a2824"),
+                anchor: "topleft", opacity: 0.35,
+            });
+        }
+
+        // Horizontal rock seams — stone layering look.
+        const seamStep = Math.max(10, 18 * sc);
+        for (let y = topY + capH + seamStep; y < botY; y += seamStep) {
+            const t = (y - topY) / (botY - topY);
+            const halfW = lerp(topHalfW, botHalfW, t);
+            k.drawLine({
+                p1: k.vec2(screenTop.x - halfW + 2, y),
+                p2: k.vec2(screenTop.x + halfW - 2, y),
+                width: 1, color: k.Color.fromHex("#2a2824"), opacity: 0.18,
+            });
+        }
+
+        // Build-mode underwater dim — subtler than the sim-mode tint, just a
+        // soft cool overlay on the submerged portion of the rock so the
+        // waterline reads consistently with the screen-wide marker line.
+        if (state.mode === "build") {
+            const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
+            const waterScreen = toScreen(lX, waterWorldY);
+            const submergedStart = Math.max(topY, waterScreen.y);
+            if (submergedStart < botY) {
+                for (let y = submergedStart; y < botY; y += sliceH) {
+                    const t = Math.min(1, (y - topY) / (botY - topY));
+                    const halfW = lerp(topHalfW, botHalfW, t);
+                    k.drawRect({
+                        pos: k.vec2(screenTop.x - halfW, y),
+                        width: halfW * 2, height: sliceH + 0.5,
+                        color: k.Color.fromHex("#2a4f7a"),
+                        anchor: "topleft", opacity: 0.18,
+                    });
+                }
+            }
+        }
+
+        // Underwater tint — only when the sim is running (water is drawn).
+        // Two passes: a heavier blue overlay tints the stone toward the water
+        // hue, then a darken pass deepens the lower portion. Together they
+        // sell "we're looking at this through several feet of water".
+        if (state.mode !== "build") {
+            const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
+            const waterScreen = toScreen(lX, waterWorldY);
+            const submergedStart = Math.max(topY, waterScreen.y);
+            if (submergedStart < botY) {
+                for (let y = submergedStart; y < botY; y += sliceH) {
+                    const t  = Math.min(1, (y - topY) / (botY - topY));
+                    const halfW = lerp(topHalfW, botHalfW, t);
+                    const depth = (y - submergedStart) / Math.max(1, botY - submergedStart);
+                    // Hue shift — strong at the surface, even stronger deep
+                    k.drawRect({
+                        pos: k.vec2(screenTop.x - halfW, y),
+                        width: halfW * 2, height: sliceH + 0.5,
+                        color: k.Color.fromHex("#3b6d9e"),
+                        anchor: "topleft", opacity: 0.55 + 0.15 * depth,
+                    });
+                    // Darken-with-depth pass — deeper water swallows light
+                    k.drawRect({
+                        pos: k.vec2(screenTop.x - halfW, y),
+                        width: halfW * 2, height: sliceH + 0.5,
+                        color: k.Color.fromHex("#0a1530"),
+                        anchor: "topleft", opacity: 0.10 + 0.30 * depth,
+                    });
+                }
+            }
+
+            // Re-draw the animated wave strip ON TOP of the rock so the wave
+            // visibly passes IN FRONT of the pillar at the surface — gives the
+            // 3D illusion that the rock is sticking up out of the water rather
+            // than pasted on top. Tiles align with drawWater's grid so the
+            // animation reads as one continuous strip.
+            try {
+                const tileW = 16 * sc * 1.5;
+                const tileH = 16 * sc * 1.5;
+                const frame = Math.floor(waterFrame) % 32;
+                const rockLeft  = screenTop.x - topHalfW - tileW;
+                const rockRight = screenTop.x + topHalfW + tileW;
+                const startTx = Math.floor(rockLeft / tileW) * tileW;
+                const tileY = waterScreen.y - tileH * 0.4;
+                for (let tx = startTx; tx < rockRight; tx += tileW) {
+                    k.drawSprite({
+                        sprite: "water_tile",
+                        frame,
+                        pos: k.vec2(tx, tileY),
+                        width: tileW + 1,
+                        height: tileH,
+                        anchor: "topleft",
+                    });
+                }
+            } catch (e) { /* sprite not loaded yet */ }
+        }
+    }
+
+    // Draw a steel tower mast rising from the cliff top to a high anchor point.
+    // Used whenever an extraAnchor sits above the cliff edge (dy < 0).
+    function drawCliffTower(ax, ay, cliffY, sc) {
+        const base = toScreen(ax, cliffY);
+        const tip  = toScreen(ax, ay);
+        const h    = base.y - tip.y;
+        const mW   = 7 * sc;
+
+        // Body
+        k.drawRect({ pos: k.vec2(base.x - mW / 2, tip.y), width: mW, height: h, color: k.Color.fromHex("#3a3a3a"), anchor: "topleft" });
+        // Highlight stripe (left face)
+        k.drawRect({ pos: k.vec2(base.x - mW / 2, tip.y), width: mW * 0.3, height: h, color: k.Color.fromHex("#585858"), opacity: 0.8, anchor: "topleft" });
+        // Cross-bracing marks
+        const steps = Math.max(2, Math.floor(h / (18 * sc)));
+        for (let i = 1; i < steps; i++) {
+            const yy = tip.y + (h * i) / steps;
+            k.drawLine({ p1: k.vec2(base.x - mW * 0.5, yy), p2: k.vec2(base.x + mW * 0.5, yy), width: sc, color: k.Color.fromHex("#606060"), opacity: 0.6 });
+        }
+        // Cap plate at top
+        const capW = mW * 2.4, capH = Math.max(3, mW * 0.55);
+        k.drawRect({ pos: k.vec2(tip.x - capW / 2, tip.y - capH / 2), width: capW, height: capH, color: k.Color.fromHex("#282828"), anchor: "topleft" });
+    }
+
     function drawGround(wx1, wx2, wy, sc, side) {
-        const roadTop = toScreen(wx1, wy - ROAD_H);
-        const roadBot = toScreen(wx2, wy);
+        // Asphalt is drawn CENTERED on the anchor line (half above, half below)
+        // so its top aligns with the top of a wood_road plank on the bridge
+        // (plank center at wy, half-width 5). The car's drivable surface therefore
+        // reads as a single continuous line across approach and bridge.
+        const HALF_ROAD = ROAD_H / 2;
+        const roadTop = toScreen(wx1, wy - HALF_ROAD);
+        const roadBot = toScreen(wx2, wy + HALF_ROAD);
         const cliffBot = toScreen(wx2, wy + TABLE_DEPTH);
         const w = roadBot.x - roadTop.x;
         const roadH = Math.max(roadBot.y - roadTop.y, 6 * sc);
@@ -1436,12 +3130,17 @@ export function gameScene(k, { levelIdx }) {
 
         // ── Asphalt road surface ──
         k.drawRect({ pos: roadTop, width: w, height: roadH, color: k.Color.fromHex("#3a3a3a"), anchor: "topleft" });
-        // Dashed yellow center line
-        const lineY = roadTop.y + roadH * 0.45;
+        // Dashed yellow line — drawn right at the driving surface (top edge of
+        // the asphalt) so the "stand on the yellow line" visual holds.
+        const lineY = roadTop.y + Math.max(1, 1.5 * sc);
         const dashW = 12 * sc;
         const gapW = 8 * sc;
         for (let dx = 0; dx < w; dx += dashW + gapW) {
-            k.drawRect({ pos: k.vec2(roadTop.x + dx, lineY - 1), width: dashW, height: Math.max(2, 1.5 * sc), color: k.Color.fromHex("#e8c840"), anchor: "topleft", opacity: 0.7 });
+            // Clip the final dash to the road width so it doesn't hang out
+            // over the cliff edge when the road length isn't a clean multiple
+            // of (dash + gap).
+            const segW = Math.min(dashW, w - dx);
+            k.drawRect({ pos: k.vec2(roadTop.x + dx, lineY - 1), width: segW, height: Math.max(2, 1.5 * sc), color: k.Color.fromHex("#e8c840"), anchor: "topleft", opacity: 0.7 });
         }
         // Subtle top highlight
         k.drawRect({ pos: roadTop, width: w, height: Math.max(1, 1.5 * sc), color: k.Color.fromHex("#ffffff"), anchor: "topleft", opacity: 0.12 });
@@ -1479,13 +3178,34 @@ export function gameScene(k, { levelIdx }) {
 
     // ─── Water in the gap (sim/end mode only) ────────
     function drawWater(W, H, sc) {
-        if (state.mode === "build") return;
+        if (state.mode === "build") {
+            // Build-mode waterline marker — a subtle horizontal line at the
+            // water surface plus a faint blue dim below it. Helps the player
+            // see where the water level will be without obscuring the layout.
+            const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
+            const waterY = toScreen(lX, waterWorldY).y;
+            // Dim band underneath — kept low-opacity so beams stay readable.
+            k.drawRect({
+                pos: k.vec2(0, waterY),
+                width: W, height: H - waterY,
+                color: k.Color.fromHex("#2a4f7a"),
+                anchor: "topleft", opacity: 0.12,
+            });
+            // Thin marker line at the surface.
+            k.drawLine({
+                p1: k.vec2(0, waterY), p2: k.vec2(W, waterY),
+                width: 1, color: k.Color.fromHex("#3b6d9e"), opacity: 0.55,
+            });
+            return;
+        }
 
-        waterFrame += 0.08;
+        // Wave animation also keys off sim speed — keeps the surface ripples
+        // in lockstep with everything else when the player fast-forwards.
+        waterFrame += 0.08 * state.simSpeed;
         const frame = Math.floor(waterFrame) % 32;
 
         // Water surface position
-        const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.35;
+        const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
         const waterScreen = toScreen(lX, waterWorldY);
         const waterY = waterScreen.y;
         const tileW = 16 * sc * 1.5;
@@ -1493,20 +3213,8 @@ export function gameScene(k, { levelIdx }) {
 
         // Solid fill from just below the wave sprite to screen bottom
         k.drawRect({ pos: k.vec2(0, waterY + tileH * 0.4), width: W, height: H - waterY, color: k.Color.fromHex("#3b6d9e"), anchor: "topleft" });
-
-        // Animated water tile strip on top
-        try {
-            for (let tx = -tileW; tx < W + tileW; tx += tileW) {
-                k.drawSprite({
-                    sprite: "water_tile",
-                    frame: frame,
-                    pos: k.vec2(tx, waterY - tileH * 0.4),
-                    width: tileW + 1,
-                    height: tileH,
-                    anchor: "topleft",
-                });
-            }
-        } catch(e) {}
+        // (Wave tile strip is drawn separately via drawWaterSurface so it can
+        // overlay submerged bridge pieces.)
 
         // Subtle darker bands below surface for depth
         const bandStart = waterY + tileH * 0.6;
@@ -1515,31 +3223,100 @@ export function gameScene(k, { levelIdx }) {
             k.drawRect({ pos: k.vec2(0, wy), width: W, height: 10, color: k.Color.fromHex("#2a5a8a"), anchor: "topleft", opacity: bandOp });
         }
 
-        // Fish animation
+        // ── Fish (stateful) ──
+        // Positions are remembered frame-to-frame so fish can turn around when
+        // they approach a mid-gap rock instead of swimming straight through it.
+        if (!state._fish) {
+            // speed is in pixels per SECOND (multiplied by dt below). The
+            // original mathematical fish drifted at ~60 px/sec; staying close
+            // to that so they feel like they're idling, not racing.
+            state._fish = [
+                { x: 80,      yOff: 40, dir:  1, phase: 0,   speed: 55 },
+                { x: W - 80,  yOff: 60, dir: -1, phase: 2.1, speed: 42 },
+            ];
+        }
         const fishFrame = Math.floor(waterFrame * 0.5) % 10;
         const fishSz = 16 * sc;
+        const dt = k.dt() || 1 / 60;
+
+        // Mid-gap rock positions (screen X + rock half-width at the fish's Y).
+        const rockBlocks = [];
+        for (const n of state.nodes) {
+            if (!n.fixed || n.builtin) continue;
+            if (n.x <= lX || n.x >= rX) continue;
+            const rockTop = toScreen(n.x, n.y);
+            // Match drawMidPier's taper math so "close to rock" is accurate at
+            // the fish's actual depth.
+            const topHalfW = 22 * sc;
+            const botHalfW = 52 * sc;
+            rockBlocks.push({ topY: rockTop.y - 4 * sc, botY: H + 20, cx: rockTop.x, topHalfW, botHalfW });
+        }
+        const rockHalfAt = (r, y) => {
+            const t = Math.max(0, Math.min(1, (y - r.topY) / (r.botY - r.topY)));
+            return r.topHalfW + (r.botHalfW - r.topHalfW) * t;
+        };
+
         try {
-            const fishY = waterY + 40 * sc;
-            const fishX = ((waterFrame * 12) % (W + 100)) - 50;
-            k.drawSprite({
-                sprite: "fish",
-                frame: fishFrame,
-                pos: k.vec2(fishX, fishY + Math.sin(waterFrame * 0.8) * 6),
-                width: fishSz,
-                height: fishSz,
-                anchor: "center",
-            });
-            const fishX2 = W - ((waterFrame * 8 + 200) % (W + 100)) + 50;
-            k.drawSprite({
-                sprite: "fish",
-                frame: (fishFrame + 3) % 10,
-                pos: k.vec2(fishX2, fishY + 20 * sc + Math.sin(waterFrame * 0.6 + 2) * 8),
-                width: fishSz,
-                height: fishSz,
-                anchor: "center",
-                flipX: true,
-            });
+            for (const f of state._fish) {
+                // Update position — speed is px/sec, dt is seconds.
+                f.x += f.dir * f.speed * dt;
+                // Wrap around the screen edges (with a margin so the fish
+                // slides off and back on cleanly).
+                if (f.dir > 0 && f.x > W + 60) f.x = -60;
+                if (f.dir < 0 && f.x < -60)    f.x = W + 60;
+
+                const fy = waterY + f.yOff * sc + Math.sin(waterFrame * 0.8 + f.phase) * 6;
+
+                // Turn around if the fish is about to swim into a rock pier.
+                for (const r of rockBlocks) {
+                    const half = rockHalfAt(r, fy);
+                    const clearance = 18 * sc;                // turn-around distance
+                    const approaching = f.dir > 0 ? (f.x < r.cx && f.x > r.cx - half - clearance)
+                                                  : (f.x > r.cx && f.x < r.cx + half + clearance);
+                    if (approaching) {
+                        f.dir *= -1;
+                        // Nudge the fish away so it doesn't immediately flip back.
+                        f.x += f.dir * 2;
+                        break;
+                    }
+                }
+
+                k.drawSprite({
+                    sprite: "fish",
+                    frame: (fishFrame + Math.round(f.phase * 2)) % 10,
+                    pos: k.vec2(f.x, fy),
+                    width: fishSz,
+                    height: fishSz,
+                    anchor: "center",
+                    // Sprite faces RIGHT by default — flip when swimming left.
+                    flipX: f.dir < 0,
+                });
+            }
         } catch(e) {}
+    }
+
+    // Draw just the animated wave tile surface — called AFTER submerged members
+    // so waves overlay any bridge pieces dipping into the water, instead of
+    // being hidden behind them.
+    function drawWaterSurface(W, sc) {
+        if (state.mode === "build") return;
+        const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
+        const waterY = toScreen(lX, waterWorldY).y;
+        const tileW = 16 * sc * 1.5;
+        const tileH = 16 * sc * 1.5;
+        const frame = Math.floor(waterFrame) % 32;
+        try {
+            for (let tx = -tileW; tx < W + tileW; tx += tileW) {
+                k.drawSprite({
+                    sprite: "water_tile",
+                    frame,
+                    pos: k.vec2(tx, waterY - tileH * 0.4),
+                    width: tileW + 1,
+                    height: tileH,
+                    anchor: "topleft",
+                });
+            }
+        } catch (e) {}
     }
 
     // ─── Splash effects ─────────────────────────────
@@ -1572,13 +3349,64 @@ export function gameScene(k, { levelIdx }) {
     //   "all"        — everything (default; build mode and other safe contexts)
     function drawMembers(sc, layer = "all") {
         const wantRoad = (m) => MATERIALS[m.type].isRoad;
-        const skipMember = (m) =>
-            (layer === "roads" && !wantRoad(m)) ||
-            (layer === "structural" && wantRoad(m));
+        // Water surface (mirrors drawWater's math). Structural members get
+        // CLIPPED at this line: the above-water portion draws after the water
+        // layer, the submerged portion draws before it. So a beam dangling
+        // halfway into the water shows only its upper half.
+        const waterY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
+
+        // Returns effective endpoints {x1,y1,x2,y2} for this layer, or null
+        // if the member shouldn't render in this pass.
+        // Road members get water-clipped too — when a fallen plank dips below
+        // the surface, its submerged portion shows up in "structural-submerged"
+        // (where the underwater tint is applied) instead of being hidden by
+        // the opaque water rect.
+        function clipForLayer(m) {
+            const a = m.n1, b = m.n2;
+            if (layer === "all") return { x1: a.x, y1: a.y, x2: b.x, y2: b.y };
+
+            const aSub = a.y >= waterY;
+            const bSub = b.y >= waterY;
+            const isRoad = wantRoad(m);
+
+            // Both endpoints below water → only the submerged layer renders.
+            if (aSub && bSub) {
+                return layer === "structural-submerged"
+                    ? { x1: a.x, y1: a.y, x2: b.x, y2: b.y }
+                    : null;
+            }
+            // Both endpoints above water → roads pass for road members,
+            // structural pass for everything else.
+            if (!aSub && !bSub) {
+                if (isRoad) return layer === "roads" ? { x1: a.x, y1: a.y, x2: b.x, y2: b.y } : null;
+                return layer === "structural" ? { x1: a.x, y1: a.y, x2: b.x, y2: b.y } : null;
+            }
+            // Member crosses the waterline — clip at waterY into above/below halves.
+            const t = (waterY - a.y) / (b.y - a.y);
+            const ix = a.x + t * (b.x - a.x);
+            const iy = waterY;
+            const above = isRoad ? "roads" : "structural";
+            if (layer === above) {
+                const top = aSub ? b : a;                          // above-water endpoint
+                return { x1: top.x, y1: top.y, x2: ix, y2: iy };
+            }
+            if (layer === "structural-submerged") {
+                const bot = aSub ? a : b;                          // below-water endpoint
+                return { x1: bot.x, y1: bot.y, x2: ix, y2: iy };
+            }
+            return null;
+        }
 
         // Helper: get member color (stress-based in sim, material color in build)
         function getMemberColor(m) {
             const mat = MATERIALS[m.type];
+            // Steel beams are already red (their material color) — overlaying
+            // a red stress tint on top is redundant and washes out the look,
+            // so keep steel rendered in its material color even in sim mode.
+            if (m.type === "steel") {
+                if (state.delMode && distToSegment(state.mouseWorld, m.n1, m.n2) < 12 / sc) return C.danger;
+                return mat.color;
+            }
             if (state.mode === "sim" || state.mode === "end") {
                 const s = Math.min(1, m.stress);
                 if (s < 0.15) return C.stressLow;
@@ -1589,33 +3417,41 @@ export function gameScene(k, { levelIdx }) {
             return mat.color;
         }
 
-        // Draw joint fills for road segments (skip broken). Road-only by definition,
-        // so they only run when the layer wants roads.
-        if (layer !== "structural") {
+        // Draw joint fills for road segments (skip broken). Above-water joints
+        // render in the "roads" pass; submerged joints render in the
+        // "structural-submerged" pass with the same blue/dark tint as members.
+        if (layer === "roads" || layer === "structural-submerged" || layer === "all") {
             for (const m of state.members) {
                 if (!MATERIALS[m.type].isRoad || m.broken) continue;
                 const mat = MATERIALS[m.type];
                 const r = mat.width * sc * 0.5;
                 const col = k.Color.fromHex(getMemberColor(m));
                 for (const n of [m.n1, m.n2]) {
+                    const submerged = n.y >= waterY;
+                    if (layer === "roads" && submerged) continue;
+                    if (layer === "structural-submerged" && !submerged) continue;
                     const p = toScreen(n.x, n.y);
                     if (n.fixed) {
-                        // Squares at fixed anchors are build-time guides; they look
-                        // like artifacts once the car is crossing, so hide in sim/end.
-                        if (state.mode === "build") {
+                        if (state.mode === "build" && layer !== "structural-submerged") {
                             k.drawRect({ pos: k.vec2(p.x - r, p.y - r), width: r * 2, height: r * 2, color: col, anchor: "topleft" });
                         }
-                    } else {
+                    } else if (state.mode !== "build") {
                         k.drawCircle({ pos: p, radius: r, color: col });
+                        if (submerged) {
+                            // Match the underwater tint applied to submerged members
+                            k.drawCircle({ pos: p, radius: r, color: k.Color.fromHex("#3b6d9e"), opacity: 0.55 });
+                            k.drawCircle({ pos: p, radius: r, color: k.Color.fromHex("#0a1530"), opacity: 0.20 });
+                        }
                     }
                 }
             }
         }
 
         for (const m of state.members) {
-            if (skipMember(m)) continue;
-            const p1 = toScreen(m.n1.x, m.n1.y);
-            const p2 = toScreen(m.n2.x, m.n2.y);
+            const clip = clipForLayer(m);
+            if (!clip) continue;
+            const p1 = toScreen(clip.x1, clip.y1);
+            const p2 = toScreen(clip.x2, clip.y2);
             const mat = MATERIALS[m.type];
             const w = mat.width * sc;
             const dx = p2.x - p1.x, dy = p2.y - p1.y;
@@ -1691,30 +3527,28 @@ export function gameScene(k, { levelIdx }) {
                 }
 
             } else if (m.type === "steel") {
-                // ── STEEL — I-beam with rivet dots ──
+                // ── STEEL — solid red beam with rivet dots, no shine line ──
                 const bw = Math.max(w, 3);
                 // Main beam
                 k.drawLine({ p1, p2, width: bw, color: col, opacity });
-                // Top/bottom flanges (thicker ends)
+                // Top/bottom flange shading — darker reds, no metallic blues
                 const flangeOff = bw * 0.4;
                 k.drawLine({
                     p1: k.vec2(p1.x + nx * flangeOff, p1.y + ny * flangeOff),
                     p2: k.vec2(p2.x + nx * flangeOff, p2.y + ny * flangeOff),
-                    width: 1.5, color: k.Color.fromHex("#8a9aaa"), opacity: 0.6 * opacity,
+                    width: 1.5, color: k.Color.fromHex("#e06060"), opacity: 0.55 * opacity,
                 });
                 k.drawLine({
                     p1: k.vec2(p1.x - nx * flangeOff, p1.y - ny * flangeOff),
                     p2: k.vec2(p2.x - nx * flangeOff, p2.y - ny * flangeOff),
-                    width: 1.5, color: k.Color.fromHex("#6a7a8a"), opacity: 0.5 * opacity,
+                    width: 1.5, color: k.Color.fromHex("#7a2020"), opacity: 0.6 * opacity,
                 });
-                // Shine line
-                k.drawLine({ p1, p2, width: 1, color: k.Color.fromHex(C.wireShine), opacity: 0.4 * opacity });
-                // Rivet dots
+                // Rivet dots — small dark-red squares evenly spaced
                 const rivetSp = Math.max(10, 16 * sc);
                 for (let t = rivetSp * 0.5; t < len; t += rivetSp) {
                     const rx = p1.x + (dx / len) * t;
                     const ry = p1.y + (dy / len) * t;
-                    k.drawRect({ pos: k.vec2(rx - 1, ry - 1), width: 2, height: 2, color: k.Color.fromHex("#d4dde6"), opacity: 0.5 * opacity, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(rx - 1, ry - 1), width: 2, height: 2, color: k.Color.fromHex("#5a1010"), opacity: 0.6 * opacity, anchor: "topleft" });
                 }
 
             } else if (m.type === "reinforced_road") {
@@ -1771,48 +3605,120 @@ export function gameScene(k, { levelIdx }) {
                 }
 
             } else if (m.type === "rope") {
-                // ── ROPE — thick brown dashed line with loop knots ──
-                const rw = Math.max(w, 3);
-                const dashLen = Math.max(8, 10 * sc);
-                const gapLen = Math.max(4, 5 * sc);
-                let t = 0;
-                while (t < len) {
-                    const t1 = t;
-                    const t2 = Math.min(t + dashLen, len);
-                    k.drawLine({
-                        p1: k.vec2(p1.x + (dx / len) * t1, p1.y + (dy / len) * t1),
-                        p2: k.vec2(p1.x + (dx / len) * t2, p1.y + (dy / len) * t2),
-                        width: rw, color: col, opacity,
-                    });
-                    t += dashLen + gapLen;
+                // ── ROPE — twisted hemp look, sags as a catenary when slack ──
+                // Sag amount: rope slack length translated into screen-space drop
+                const curDist = Math.hypot(m.n2.x - m.n1.x, m.n2.y - m.n1.y);
+                const slackWorld = Math.max(0, m.rest - curDist);
+                const sagPx = Math.min(40 * sc, slackWorld * sc * 0.55);
+
+                // Build the rope path as a polyline along the catenary
+                const segs = Math.max(10, Math.floor(len / 7));
+                const pts = new Array(segs + 1);
+                for (let i = 0; i <= segs; i++) {
+                    const tt = i / segs;
+                    const lx = p1.x + (p2.x - p1.x) * tt;
+                    const ly = p1.y + (p2.y - p1.y) * tt;
+                    const drop = sagPx * 4 * tt * (1 - tt);   // parabola, max at midpoint
+                    pts[i] = k.vec2(lx, ly + drop);
                 }
-                // Thinner highlight strand
-                k.drawLine({ p1, p2, width: 1, color: k.Color.fromHex("#c4a040"), opacity: 0.3 * opacity });
-                // Knot loops at endpoints
-                k.drawCircle({ pos: p1, radius: 2.5, color: col, opacity });
-                k.drawCircle({ pos: p2, radius: 2.5, color: col, opacity });
+
+                const rw = Math.max(w, 3);
+                // Dark shadow stroke
+                for (let i = 0; i < segs; i++) {
+                    k.drawLine({ p1: pts[i], p2: pts[i + 1], width: rw + 1.5, color: k.Color.fromHex("#3a2a06"), opacity: 0.45 * opacity });
+                }
+                // Main rope body
+                for (let i = 0; i < segs; i++) {
+                    k.drawLine({ p1: pts[i], p2: pts[i + 1], width: rw, color: col, opacity });
+                }
+                // Braid marks — small diagonal slashes giving the twist texture
+                const braidSp = Math.max(6, 8 * sc);
+                for (let t = braidSp * 0.5; t < len; t += braidSp) {
+                    const tt = Math.min(1, t / len);
+                    const idx = Math.floor(tt * segs);
+                    if (idx >= pts.length - 1) continue;
+                    const a = pts[idx], b = pts[idx + 1];
+                    const segDx = b.x - a.x, segDy = b.y - a.y;
+                    const segLen = Math.hypot(segDx, segDy) || 1;
+                    const sLocal = (t - idx * (len / segs)) / segLen;
+                    const cx = a.x + segDx * sLocal;
+                    const cy = a.y + segDy * sLocal;
+                    const sNx = -segDy / segLen, sNy = segDx / segLen;
+                    const r = rw * 0.5;
+                    k.drawLine({
+                        p1: k.vec2(cx + sNx * r - segDx / segLen * 1.2, cy + sNy * r - segDy / segLen * 1.2),
+                        p2: k.vec2(cx - sNx * r + segDx / segLen * 1.2, cy - sNy * r + segDy / segLen * 1.2),
+                        width: 0.9, color: k.Color.fromHex("#3a2a06"), opacity: 0.45 * opacity,
+                    });
+                }
+                // Endpoint loops — only at actual chain ends (skip interior chain joints)
+                if (!m.n1._chainNode) {
+                    k.drawCircle({ pos: pts[0], radius: rw * 0.7 + 0.5, color: k.Color.fromHex("#3a2a06"), opacity: 0.55 * opacity });
+                    k.drawCircle({ pos: pts[0], radius: rw * 0.55, color: col, opacity });
+                }
+                if (!m.n2._chainNode) {
+                    k.drawCircle({ pos: pts[segs], radius: rw * 0.7 + 0.5, color: k.Color.fromHex("#3a2a06"), opacity: 0.55 * opacity });
+                    k.drawCircle({ pos: pts[segs], radius: rw * 0.55, color: col, opacity });
+                }
 
             } else if (m.type === "cable") {
-                // ── STEEL CABLE — thin dashed line with knots ──
-                const cw = Math.max(w, 2);
-                const dashLen = Math.max(6, 8 * sc);
-                const gapLen = Math.max(3, 4 * sc);
-                let t = 0;
-                while (t < len) {
-                    const t1 = t;
-                    const t2 = Math.min(t + dashLen, len);
-                    k.drawLine({
-                        p1: k.vec2(p1.x + (dx / len) * t1, p1.y + (dy / len) * t1),
-                        p2: k.vec2(p1.x + (dx / len) * t2, p1.y + (dy / len) * t2),
-                        width: cw, color: col, opacity,
-                    });
-                    t += dashLen + gapLen;
+                // ── STEEL CABLE — sleek dark metallic line with sheen ──
+                const curDist = Math.hypot(m.n2.x - m.n1.x, m.n2.y - m.n1.y);
+                const slackWorld = Math.max(0, m.rest - curDist);
+                // Cable is much stiffer than rope visually — small sag only
+                const sagPx = Math.min(20 * sc, slackWorld * sc * 0.35);
+
+                const segs = Math.max(8, Math.floor(len / 8));
+                const pts = new Array(segs + 1);
+                for (let i = 0; i <= segs; i++) {
+                    const tt = i / segs;
+                    const lx = p1.x + (p2.x - p1.x) * tt;
+                    const ly = p1.y + (p2.y - p1.y) * tt;
+                    const drop = sagPx * 4 * tt * (1 - tt);
+                    pts[i] = k.vec2(lx, ly + drop);
                 }
-                // Knot dots at endpoints
-                k.drawRect({ pos: k.vec2(p1.x - 1.5, p1.y - 1.5), width: 3, height: 3, color: col, opacity, anchor: "topleft" });
-                k.drawRect({ pos: k.vec2(p2.x - 1.5, p2.y - 1.5), width: 3, height: 3, color: col, opacity, anchor: "topleft" });
+
+                const cw = Math.max(w, 2);
+                // Dark outline
+                for (let i = 0; i < segs; i++) {
+                    k.drawLine({ p1: pts[i], p2: pts[i + 1], width: cw + 1.2, color: k.Color.fromHex("#1a1a1a"), opacity: 0.45 * opacity });
+                }
+                // Main cable
+                for (let i = 0; i < segs; i++) {
+                    k.drawLine({ p1: pts[i], p2: pts[i + 1], width: cw, color: col, opacity });
+                }
+                // Sheen highlight along the top edge of each segment
+                for (let i = 0; i < segs; i++) {
+                    const segDx = pts[i + 1].x - pts[i].x, segDy = pts[i + 1].y - pts[i].y;
+                    const segLen = Math.hypot(segDx, segDy) || 1;
+                    const offX = -segDy / segLen * (cw * 0.25);
+                    const offY = segDx / segLen * (cw * 0.25);
+                    k.drawLine({
+                        p1: k.vec2(pts[i].x + offX, pts[i].y + offY),
+                        p2: k.vec2(pts[i + 1].x + offX, pts[i + 1].y + offY),
+                        width: 0.8, color: k.Color.fromHex("#9aa0a8"), opacity: 0.55 * opacity,
+                    });
+                }
+                // End clamps — only at actual chain ends (skip interior joints)
+                if (!m.n1._chainNode) {
+                    k.drawRect({ pos: k.vec2(pts[0].x - 2.2, pts[0].y - 2.2), width: 4.4, height: 4.4, color: k.Color.fromHex("#1a1a1a"), opacity: 0.7 * opacity, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(pts[0].x - 1.6, pts[0].y - 1.6), width: 3.2, height: 3.2, color: col, opacity, anchor: "topleft" });
+                }
+                if (!m.n2._chainNode) {
+                    k.drawRect({ pos: k.vec2(pts[segs].x - 2.2, pts[segs].y - 2.2), width: 4.4, height: 4.4, color: k.Color.fromHex("#1a1a1a"), opacity: 0.7 * opacity, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(pts[segs].x - 1.6, pts[segs].y - 1.6), width: 3.2, height: 3.2, color: col, opacity, anchor: "topleft" });
+                }
             }
 
+            // Underwater tint — only for the submerged layer. Overlay a
+            // translucent water-blue stripe along the member, plus a slight
+            // darken pass, matching the rock pier's "seen through water"
+            // vocabulary so fallen pieces read as drowned rather than missing.
+            if (layer === "structural-submerged") {
+                const overlayW = Math.max(w, 3) + 1;
+                k.drawLine({ p1, p2, width: overlayW, color: k.Color.fromHex("#3b6d9e"), opacity: 0.55 });
+                k.drawLine({ p1, p2, width: overlayW, color: k.Color.fromHex("#0a1530"), opacity: 0.20 });
+            }
         }
 
         // ── Draw joint dots at free nodes (build-mode only — they clash with
@@ -1823,6 +3729,7 @@ export function gameScene(k, { levelIdx }) {
                 const r = 2 * sc;
                 for (const n of [m.n1, m.n2]) {
                     if (n.fixed) continue;
+                    if (n._chainNode) continue;  // chain joints don't get the dark dot
                     const p = toScreen(n.x, n.y);
                     k.drawRect({ pos: k.vec2(p.x - r, p.y - r), width: r * 2, height: r * 2, color: k.Color.fromHex("#5a4a30"), anchor: "topleft" });
                 }
@@ -1839,7 +3746,11 @@ export function gameScene(k, { levelIdx }) {
 
         const d = Math.hypot(sn.x - st.x, sn.y - st.y);
         const mat = MATERIALS[state.selectedMat];
-        const ok = d > 5 && (state.lineMode ? d > GRID : d <= mat.maxLength);
+        // In LINE mode, road placements must land on an existing node — mirror
+        // of the commit-time check. Single-segment road placements are free to
+        // extend to a fresh grid point.
+        const roadEndOk = !(mat.isRoad && state.lineMode) || !!state.nodes.find(n => n.x === sn.x && n.y === sn.y);
+        const ok = d > 5 && (state.lineMode ? d > GRID : d <= mat.maxLength) && roadEndOk;
 
         const p1 = toScreen(st.x, st.y);
         const p2 = toScreen(sn.x, sn.y);
@@ -1901,9 +3812,134 @@ export function gameScene(k, { levelIdx }) {
         }
     }
 
+    // ─── Select tool halo — matches the arch tool look. Layered rendering:
+    // call with "roads" before the road draw pass and with "structural" before
+    // the structural pass. The endpoint dots piggyback on the structural pass
+    // so they render on top of everything.
+    //
+    // While a marquee drag is in progress, we also highlight members currently
+    // inside the box as a live preview of what will be selected on release.
+    function drawSelectHalo(sc, layer = "structural") {
+        if (!state.selectMode || state.mode !== "build") return;
+        // Build the set of "visually selected" members for this frame:
+        // committed selection + any members currently inside the marquee box.
+        let visible = state.selectedMembers;
+        if (state.selectBoxing && state.selectBoxStart && state.selectBoxEnd) {
+            const preview = getMembersInBox(state.selectBoxStart, state.selectBoxEnd);
+            visible = new Set(state.selectedMembers);
+            for (const m of preview) visible.add(m);
+        }
+        if (!visible || visible.size === 0) return;
+        const haloCol = k.Color.fromHex(C.accent);
+        for (const m of visible) {
+            if (m.broken) continue;
+            const isRoad = MATERIALS[m.type].isRoad;
+            if (layer === "roads" && !isRoad) continue;
+            if (layer === "structural" && isRoad) continue;
+            const p1 = toScreen(m.n1.x, m.n1.y);
+            const p2 = toScreen(m.n2.x, m.n2.y);
+            const mat = MATERIALS[m.type];
+            const hw = (mat.width * sc) + 5;
+            k.drawLine({ p1, p2, width: hw, color: haloCol, opacity: 0.55 });
+        }
+        // Endpoint rings drawn only on the structural pass so they sit on top.
+        // All joints use hollow outline circles — fixed anchors get a thicker
+        // stroke + small center dot to stay visually distinct.
+        if (layer === "structural") {
+            const endpoints = new Set();
+            for (const m of visible) {
+                if (m.broken) continue;
+                endpoints.add(m.n1);
+                endpoints.add(m.n2);
+            }
+            for (const n of endpoints) {
+                const sp = toScreen(n.x, n.y);
+                const locked = n.fixed || n.builtin;
+                k.drawCircle({
+                    pos: sp, radius: 7,
+                    fill: false,
+                    outline: { width: locked ? 3 : 2.2, color: haloCol },
+                    opacity: 0.95,
+                });
+                if (locked) {
+                    // Small center dot marks this as a fixed anchor (won't move on drag)
+                    k.drawCircle({ pos: sp, radius: 1.8, color: haloCol, opacity: 0.95 });
+                }
+            }
+        }
+    }
+
+    // ─── Select tool: marching-ants marquee rectangle drawn while dragging ──
+    function drawSelectBox(sc) {
+        if (!state.selectMode || !state.selectBoxing) return;
+        if (!state.selectBoxStart || !state.selectBoxEnd) return;
+        const p1 = toScreen(state.selectBoxStart.x, state.selectBoxStart.y);
+        const p2 = toScreen(state.selectBoxEnd.x, state.selectBoxEnd.y);
+        const x = Math.min(p1.x, p2.x), y = Math.min(p1.y, p2.y);
+        const w = Math.abs(p2.x - p1.x), h = Math.abs(p2.y - p1.y);
+
+        // Subtle darker tint inside the box so it reads as a cut-out without
+        // adding any color. Pure low-opacity black sits on top of whatever's
+        // below (grid, terrain, background).
+        k.drawRect({ pos: k.vec2(x, y), width: w, height: h, color: k.Color.fromHex("#000000"), opacity: 0.10, anchor: "topleft" });
+
+        // Marching-ants: dashes slide clockwise around the perimeter using a
+        // time-based phase offset. White stroke with a thin brown shadow.
+        const dash = 7, gap = 5;
+        const cycle = dash + gap;   // 12
+        const phase = (k.time() * 22) % cycle;    // ~22 px/sec drift
+
+        const drawMarchingEdge = (ax, ay, bx, by) => {
+            const dxe = bx - ax, dye = by - ay;
+            const len = Math.hypot(dxe, dye);
+            if (len === 0) return;
+            const ux = dxe / len, uy = dye / len;
+            // Start at -phase so dashes appear to enter from the edge's start
+            for (let t = -phase; t < len; t += cycle) {
+                const t1 = Math.max(0, t);
+                const t2 = Math.min(len, t + dash);
+                if (t2 <= t1) continue;
+                const a = k.vec2(ax + ux * t1, ay + uy * t1);
+                const b = k.vec2(ax + ux * t2, ay + uy * t2);
+                // Brown shadow underneath (wider) for contrast against light backgrounds
+                k.drawLine({ p1: a, p2: b, width: 3, color: k.Color.fromHex("#5a3418"), opacity: 0.75 });
+                // White dash on top
+                k.drawLine({ p1: a, p2: b, width: 1.6, color: k.Color.fromHex("#ffffff"), opacity: 0.95 });
+            }
+        };
+        // Draw edges in clockwise order so the phase offset flows in one direction.
+        drawMarchingEdge(x,     y,     x + w, y);     // top: left → right
+        drawMarchingEdge(x + w, y,     x + w, y + h); // right: top → bottom
+        drawMarchingEdge(x + w, y + h, x,     y + h); // bottom: right → left
+        drawMarchingEdge(x,     y + h, x,     y);     // left: bottom → top
+    }
+
+    // ─── Arch edit halo (drawn BEFORE members so glow is behind beams) ──
+    function drawArchEditHalo(sc) {
+        if (!state.archMode || state.mode !== "build") return;
+        if (state.editingArchId == null) return;
+        const archData = state.arches.find(a => a.id === state.editingArchId);
+        if (!archData?.nodeSequence) return;
+        const interiorSet = new Set(archData.nodeSequence.slice(1, -1));
+        const haloCol = k.Color.fromHex(C.accent);
+        for (const m of state.members) {
+            if (m.broken) continue;
+            const isArchMember = m.archId === state.editingArchId;
+            const isAttached = !isArchMember && (interiorSet.has(m.n1) || interiorSet.has(m.n2));
+            if (!isArchMember && !isAttached) continue;
+            const mp1 = toScreen(m.n1.x, m.n1.y);
+            const mp2 = toScreen(m.n2.x, m.n2.y);
+            const hw = (MATERIALS[m.type].width * sc) + 5;
+            k.drawLine({ p1: mp1, p2: mp2, width: hw, color: haloCol, opacity: isAttached ? 0.3 : 0.55 });
+        }
+    }
+
     // ─── Arch preview ──────────────────────────────
     function drawArchPreview(sc) {
         if (!state.archMode || state.mode !== "build") return;
+        // Pick up material swaps while editing (updates member types even if
+        // the apex handle isn't being dragged this frame).
+        if (state.editingArchId != null) syncArchInPlace();
 
         const previewCol = k.Color.fromHex(C.accent);
 
@@ -1945,25 +3981,31 @@ export function gameScene(k, { levelIdx }) {
             return;
         }
 
-        // Phase C: both endpoints set — render full arch + apex handle
-        const arch = computeArch();
-        if (!arch) return;
+        // Phase C: both endpoints set — chord reference + preview arch + apex handle.
+        // When editing a placed arch, the REAL arch is already rendered by
+        // drawMembers (nodes moved in place via syncArchInPlace), so we skip
+        // drawing the preview overlay and just show the chord + handle.
+        const ep = toScreen(state.archEnd.x, state.archEnd.y);
 
-        const ep = toScreen(arch.end.x, arch.end.y);
-        // Faint chord reference
         k.drawLine({ p1: sp, p2: ep, width: 1, color: previewCol, opacity: 0.25 });
 
-        const wMat = MATERIALS[state.selectedMat];
-        for (let i = 0; i < arch.points.length - 1; i++) {
-            const pp1 = toScreen(arch.points[i].x, arch.points[i].y);
-            const pp2 = toScreen(arch.points[i + 1].x, arch.points[i + 1].y);
-            k.drawLine({ p1: pp1, p2: pp2, width: wMat.width * sc * 0.6, color: previewCol, opacity: 0.7 });
+        if (state.editingArchId == null) {
+            const arch = computeArch();
+            if (arch) {
+                const wMat = MATERIALS[state.selectedMat];
+                for (let i = 0; i < arch.points.length - 1; i++) {
+                    const pp1 = toScreen(arch.points[i].x, arch.points[i].y);
+                    const pp2 = toScreen(arch.points[i + 1].x, arch.points[i + 1].y);
+                    k.drawLine({ p1: pp1, p2: pp2, width: wMat.width * sc * 0.6, color: previewCol, opacity: 0.7 });
+                }
+                for (let i = 1; i < arch.points.length - 1; i++) {
+                    const pp = toScreen(arch.points[i].x, arch.points[i].y);
+                    k.drawCircle({ pos: pp, radius: 4, color: previewCol, opacity: 0.75 });
+                }
+            }
         }
-        for (let i = 1; i < arch.points.length - 1; i++) {
-            const pp = toScreen(arch.points[i].x, arch.points[i].y);
-            k.drawCircle({ pos: pp, radius: 4, color: previewCol, opacity: 0.75 });
-        }
-        // End anchor lock dot
+
+        // End anchor lock dot (always, so the endpoint is obvious)
         k.drawCircle({ pos: ep, radius: 8, color: previewCol, opacity: 0.85 });
 
         // Apex handle — clearly draggable: filled disc + ring + cross-hair
@@ -1980,16 +4022,45 @@ export function gameScene(k, { levelIdx }) {
 
     // ─── Nodes (small joint dots) ──────────────────
     function drawNodes(sc) {
-        // Only show nodes in build mode
+        // Only show node handles in build mode — they vanish during the sim.
         if (state.mode !== "build") return;
+        const mpos = k.mousePos();
         for (const n of state.nodes) {
             if (n.builtin) continue;
             if (n.fixed) continue;
+            if (n._chainNode) continue;  // intermediate rope/cable nodes are invisible
             const p = toScreen(n.x, n.y);
-
-            const r = 1.8;
-            k.drawCircle({ pos: k.vec2(p.x + 0.5, p.y + 0.5), radius: r * sc, color: k.Color.fromHex("#010101"), opacity: 0.12 });
-            k.drawCircle({ pos: p, radius: r * sc, color: k.Color.fromHex(C.glueDot), opacity: 0.85 });
+            // Hover state — handle pops larger when the cursor is over it.
+            const hovered = Math.hypot(mpos.x - p.x, mpos.y - p.y) < 8 * sc;
+            const half = (hovered ? 5.5 : 4.5) * sc;
+            // Drop shadow
+            k.drawRect({
+                pos: k.vec2(p.x - half + 1, p.y - half + 1.5),
+                width: half * 2, height: half * 2,
+                color: k.Color.fromHex("#010101"),
+                anchor: "topleft", opacity: 0.3, radius: 1,
+            });
+            // Yellow handle body
+            k.drawRect({
+                pos: k.vec2(p.x - half, p.y - half),
+                width: half * 2, height: half * 2,
+                color: k.Color.fromHex(hovered ? "#ffe17a" : "#f0c040"),
+                anchor: "topleft", radius: 1,
+            });
+            // Top highlight strip
+            k.drawRect({
+                pos: k.vec2(p.x - half, p.y - half),
+                width: half * 2, height: Math.max(1, sc * 0.7),
+                color: k.Color.fromHex("#fff1a0"),
+                anchor: "topleft",
+            });
+            // Dark outline
+            k.drawRect({
+                pos: k.vec2(p.x - half, p.y - half),
+                width: half * 2, height: half * 2,
+                fill: false, outline: { width: 1, color: k.Color.fromHex("#7a5010") },
+                anchor: "topleft", radius: 1,
+            });
         }
     }
 
@@ -1997,8 +4068,6 @@ export function gameScene(k, { levelIdx }) {
     function drawVehicles(sc) {
         for (const v of state.vehicles) {
             if (!v.active && v.y > 1100) continue;
-            // Hide vehicle once it splashed into water
-            if (v._splashed) continue;
 
             const p = toScreen(v.x, v.y);
             const px = p.x;
@@ -2006,26 +4075,65 @@ export function gameScene(k, { levelIdx }) {
             const hw = v.cfg.w / 2 * sc;
             const hh = v.cfg.h / 2 * sc;
 
+            // Suspension bob — gentle vertical wobble while driving so the
+            // static sprite reads as actually moving over the road. Disabled
+            // when falling/splashed/finished so we don't fight the physics.
+            const driving = state.mode === "sim" && v.active && !v.finished
+                          && !v._falling && !v._splashed;
+            const bobOffset = driving
+                ? Math.sin(k.time() * 13 + v.x * 0.05) * 1.0 * sc
+                : 0;
+            const drawY = py + bobOffset;
+
+            // Wheel-spin marks — short hash marks under each wheel that scroll
+            // backwards based on the vehicle's x position. Reads as "wheels
+            // turning" without animating the sprite itself.
+            if (driving && v.cfg.sprite !== "veh_bicycle") {
+                const wheelCount = Math.max(2, v.cfg.wheels || 2);
+                const wheelSpan = v.cfg.w * 0.6 * sc;
+                const wheelY = drawY + hh * 0.9;
+                for (let wi = 0; wi < wheelCount; wi++) {
+                    const t = wheelCount === 1 ? 0.5 : wi / (wheelCount - 1);
+                    const wxC = px - wheelSpan / 2 + t * wheelSpan;
+                    const phaseBase = ((v.x * 0.45) % 4 + 4) % 4;
+                    for (let s = 0; s < 4; s++) {
+                        const sP = ((phaseBase + s) % 4) - 2;
+                        const fade = 1 - Math.abs(sP) / 2;
+                        if (fade <= 0) continue;
+                        const offX = sP * 2.2 * sc;
+                        k.drawLine({
+                            p1: k.vec2(wxC + offX - 1.4 * sc, wheelY),
+                            p2: k.vec2(wxC + offX + 1.4 * sc, wheelY),
+                            width: 1, color: k.Color.fromHex("#000000"),
+                            opacity: 0.22 * fade,
+                        });
+                    }
+                }
+            }
+
             const spriteKey = v.cfg.sprite;
             const vAngle = v.angle || 0;
             if (spriteKey) {
                 const sprW = hw * 4;
+                const submerged = !!v._splashed;
                 k.drawSprite({
                     sprite: spriteKey,
-                    pos: k.vec2(px, py - hh * 0.3),
+                    pos: k.vec2(px, drawY - hh * 0.3),
                     width: sprW,
                     height: sprW,
                     anchor: "center",
                     flipX: true,
                     angle: k.rad2deg(vAngle),
+                    color: submerged ? k.Color.fromHex("#456b95") : undefined,
+                    opacity: submerged ? 0.85 : 1,
                 });
             }
 
-            // Multi-vehicle label badge
-            if (v.label) {
-                k.drawCircle({ pos: k.vec2(px, py - hh * 1.6), radius: 7 * sc, color: k.Color.fromHex("#010101") });
-                k.drawCircle({ pos: k.vec2(px, py - hh * 1.6), radius: 5 * sc, color: k.Color.fromHex(v.cfg.color) });
-                k.drawText({ text: v.label, pos: k.vec2(px, py - hh * 1.6), size: 6 * sc, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
+            // Multi-vehicle label badge — bobs along with the sprite.
+            if (v.label && !v._splashed) {
+                k.drawCircle({ pos: k.vec2(px, drawY - hh * 1.6), radius: 7 * sc, color: k.Color.fromHex("#010101") });
+                k.drawCircle({ pos: k.vec2(px, drawY - hh * 1.6), radius: 5 * sc, color: k.Color.fromHex(v.cfg.color) });
+                k.drawText({ text: v.label, pos: k.vec2(px, drawY - hh * 1.6), size: 6 * sc, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
             }
         }
     }
@@ -2176,13 +4284,16 @@ export function gameScene(k, { levelIdx }) {
     // ─── Finish flags ───────────────────────────────
     function drawFlags(sc) {
         const FLAG_INLAND = 80;
+        // Flag base sits on the asphalt's top surface, which is 5 world units
+        // above the anchor (ROAD_H / 2) after the road-surface alignment pass.
+        const flagBaseY = rY - ROAD_H / 2;
         if (lvlDef.multiVehicle) {
             lvlDef.multiVehicle.forEach((mv, i) => {
                 const triggered = state.vehicles[i]?.finished;
-                drawOneFlag(rX + FLAG_INLAND + i * 30, rY, mv.color, mv.label, triggered, sc);
+                drawOneFlag(rX + FLAG_INLAND + i * 30, flagBaseY, mv.color, mv.label, triggered, sc);
             });
         } else {
-            drawOneFlag(rX + FLAG_INLAND, rY, "#dc2626", null, state.mode === "end" && state.finished, sc);
+            drawOneFlag(rX + FLAG_INLAND, flagBaseY, "#dc2626", null, state.mode === "end" && state.finished, sc);
         }
     }
 
@@ -2191,8 +4302,10 @@ export function gameScene(k, { levelIdx }) {
         const flagH = sc * 70;      // taller so the flag reads from the ground
         const flagW = flagH;
 
-        // Animated flag sprite — pole base sits exactly on the road surface
-        const flagBottomY = p.y;
+        // Flag sprite has a small empty strip at the bottom of its frame, so
+        // we shift the draw origin down by ~5% of the rendered height. That
+        // makes the yellow pole base actually touch the road surface.
+        const flagBottomY = p.y + flagH * 0.08;
         const frame = Math.floor(state.flagWave * 3) % 5;
         try {
             k.drawSprite({
@@ -2210,18 +4323,48 @@ export function gameScene(k, { levelIdx }) {
             k.drawRect({ pos: k.vec2(p.x + sc * 13, flagBottomY - poleH + sc * 8), width: sc * 26, height: sc * 17, color: k.Color.fromHex(color), anchor: "center" });
         }
 
-        // FINISH label — above the top of the flag, anchored "bot" so the
-        // baseline sits right above the waving flag sprite
-        const labelY = flagBottomY - flagH - 2 * sc;
-        k.drawText({
-            text: label ? `CAR ${label}` : "FINISH",
-            pos: k.vec2(p.x + flagW * 0.5, labelY),
-            size: Math.max(6, 6 * sc),
-            font: "PressStart2P",
-            color: k.Color.fromHex(triggered ? "#4ade80" : "#ffffff"),
-            anchor: "bot",
-            opacity: 0.85,
-        });
+        // FINISH label — animated like the SNAP! popup: each letter gets a
+        // distinct color from the logo palette, a subtle continuous sine bob
+        // (different phase per letter), and a tiny per-letter tilt wiggle.
+        const txt = label ? `CAR ${label}` : "FINISH";
+        const letterSize = Math.max(6, 6 * sc);
+        const letterSpacing = letterSize * 1.1;     // PressStart2P ≈ square glyphs
+        const totalW = (txt.length - 1) * letterSpacing;
+        const labelCx = p.x + flagW * 0.5;
+        const labelY = flagBottomY - flagH - 6 * sc;
+        const now = k.time();
+
+        for (let i = 0; i < txt.length; i++) {
+            const ch = txt[i];
+            const color = triggered ? "#4ade80" : SNAP_COLORS[i % SNAP_COLORS.length];
+            const bob  = Math.sin(now * 3.0 + i * 0.6) * 1.5;
+            const tilt = Math.sin(now * 2.1 + i * 0.9) * 4;     // degrees
+
+            const lx = labelCx - totalW / 2 + i * letterSpacing;
+            const ly = labelY + bob;
+
+            k.pushTransform();
+            k.pushTranslate(lx, ly);
+            k.pushRotate(tilt);
+
+            // Shadow pass for legibility
+            k.drawText({
+                text: ch, pos: k.vec2(1.5, 1.5),
+                size: letterSize, font: "PressStart2P",
+                color: k.Color.fromHex("#1a0e05"),
+                opacity: 0.45,
+                anchor: "center",
+            });
+            // Colored main letter
+            k.drawText({
+                text: ch, pos: k.vec2(0, 0),
+                size: letterSize, font: "PressStart2P",
+                color: k.Color.fromHex(color),
+                anchor: "center",
+            });
+
+            k.popTransform();
+        }
     }
 
     // ═══════════════════════════════════════════════════
@@ -2241,126 +4384,222 @@ export function gameScene(k, { levelIdx }) {
         }
         k.drawRect({ pos: k.vec2(0, tb.h + tb.pad), width: W, height: 2, color: k.Color.fromHex("#010101"), anchor: "topleft", opacity: 0.3 });
 
-        // Budget display
+        // Budget display — glow + shake scales with how over-budget you are
         const cost = calcCost(state.members);
         const overBudget = cost > lvl.budget;
         const budgetPct = cost / lvl.budget;
-        const budgetColor = overBudget ? "#ff4444" : budgetPct > 0.85 ? "#ffaa22" : "#fff8e0";
+        const warn = budgetPct > 0.85;
+        const budgetColor = overBudget ? "#ff4444" : warn ? "#ffaa22" : "#fff8e0";
+        const t = k.time();
+        // Pulse strength: 0..1. Ramps up between 85% and 100%, then pegs at 1 when over.
+        const pulse = overBudget ? 1 : warn ? Math.min(1, (budgetPct - 0.85) / 0.15) : 0;
+        // Shake offset — stronger when red, subtle when yellow
+        const shakeAmp = overBudget ? 2.5 : warn ? 0.8 * pulse : 0;
+        const shakeX = shakeAmp ? (Math.sin(t * 38) + Math.sin(t * 63)) * 0.5 * shakeAmp : 0;
+        const shakeY = shakeAmp ? (Math.cos(t * 47) + Math.sin(t * 71)) * 0.4 * shakeAmp : 0;
+        const budgetText = `$${cost.toLocaleString()} / $${lvl.budget.toLocaleString()}`;
+        const bx = 12 + shakeX;
+        // Budget + level name centered as a pair on the toolbar — the combined
+        // block (~28px tall) sits with its middle on the bar's midline, matching
+        // the vertical center of the icon row on the right side.
+        const by = Math.round((tb.h + tb.pad) / 2 - 13) + shakeY;
+
+        // Glow — pulsing soft rect behind the text, stronger the worse it gets
+        if (pulse > 0) {
+            const glowPulse = 0.5 + 0.5 * Math.sin(t * (overBudget ? 9 : 5));
+            const glowAlpha = (overBudget ? 0.4 : 0.2) * (0.5 + 0.5 * glowPulse);
+            const textW = budgetText.length * 14 * 0.9;   // approx PressStart2P width
+            for (let ring = 3; ring >= 1; ring--) {
+                k.drawRect({
+                    pos: k.vec2(bx - 4 - ring, by - 4 - ring),
+                    width: textW + 8 + ring * 2,
+                    height: 22 + ring * 2,
+                    color: k.Color.fromHex(budgetColor),
+                    opacity: glowAlpha * (0.35 / ring),
+                    anchor: "topleft",
+                    radius: 4 + ring,
+                });
+            }
+        }
+
         k.drawText({
-            text: `$${cost.toLocaleString()} / $${lvl.budget.toLocaleString()}`,
-            pos: k.vec2(12, 6),
+            text: budgetText,
+            pos: k.vec2(bx, by),
             size: 14,
             font: "PressStart2P",
             color: k.Color.fromHex(budgetColor),
         });
 
-        // Level name
+        // Level name — sits right under the budget readout, still inside the
+        // wooden toolbar strip.
         k.drawText({
             text: lvlDef.name,
-            pos: k.vec2(12, 28),
+            pos: k.vec2(12, by + 18),
             size: 8,
             font: "PressStart2P",
             color: k.Color.fromHex("#fff8e0"),
             opacity: 0.5,
         });
 
-        // ─── Material buttons ───
+        // ─── Material icons (no box, no halo — icon IS the button) ───
+        const mposMat = k.mousePos();
+        const dtMat = k.dt() || 1 / 60;
+        // Buttons are all centered on the bar's midline; match the row here.
+        const rowY = tb.simBtn.y;
         for (let i = 0; i < tb.matKeys.length; i++) {
-            const key = tb.matKeys[i];
-            const mat = MATERIALS[key];
-            const bx = tb.matStartX + i * (tb.matBtnW + 4);
-            const isSel = state.selectedMat === key;
+            const baseKey = tb.matKeys[i];
+            const upgradeKey = upgradesUnlocked ? MATERIAL_UPGRADES[baseKey] : null;
+            const isExpanded = state.matExpanded.has(baseKey);
+            const displayKey = isExpanded ? upgradeKey : baseKey;
+            const mat = MATERIALS[displayKey];
+            const bx = tb.matX[i];
+            const by = rowY;
+            const isSel = state.selectedMat === displayKey;
+            const iconCx = bx + tb.matBtnW / 2;
+            const iconCy = by + 16;
 
-            // Button background
-            k.drawRect({
-                pos: k.vec2(bx, tb.pad + 8), width: tb.matBtnW, height: 32,
-                color: k.Color.fromHex(isSel ? "#8e4924" : "#b86830"),
-                anchor: "topleft",
-            });
-            if (isSel) {
-                k.drawRect({ pos: k.vec2(bx, tb.pad + 8), width: tb.matBtnW, height: 32, fill: false, outline: { width: 2, color: k.Color.fromHex("#fff8e0") }, anchor: "topleft" });
+            // Hover easing — 0 when cursor is away, 1 when over the button
+            const hovered = mposMat.x >= bx && mposMat.x <= bx + tb.matBtnW
+                         && mposMat.y >= by && mposMat.y <= by + 32;
+            const prev = state.matHover[baseKey] || 0;
+            state.matHover[baseKey] = hovered
+                ? Math.min(1, prev + dtMat * 10)
+                : Math.max(0, prev - dtMat * 12);
+            const h = state.matHover[baseKey];
+
+            // Swap animation — a quick squish-into-self scale that crosses
+            // through 0 width when the icon swaps mid-animation. Plays in
+            // both directions; clean and snappy with no extra overlay.
+            if (state.matRevealT[baseKey] != null && state.matRevealT[baseKey] < 1) {
+                state.matRevealT[baseKey] = Math.min(1, state.matRevealT[baseKey] + dtMat * 5);
             }
-            // Material icon
-            const matIcon = MAT_ICONS[key];
-            if (matIcon) {
-                const iconPx = 2;
-                const iconCx = bx + 10;
-                const iconCy = tb.pad + 18;
-                drawIcon(matIcon, iconCx, iconCy, isSel ? "#fff8e0" : mat.color, iconPx);
-            } else {
-                k.drawRect({ pos: k.vec2(bx + 6, tb.pad + 14), width: 8, height: 8, color: k.Color.fromHex(mat.color), anchor: "topleft" });
+            const revealT = state.matRevealT[baseKey] != null ? state.matRevealT[baseKey] : 1;
+            // Squish: 1 → 0 → 1 — first half collapses (old icon vanishes),
+            // second half expands (new icon zooms back in). cos(πt) gives that
+            // smooth in-out without the bouncy overshoot.
+            const swap = revealT < 1
+                ? Math.abs(Math.cos(revealT * Math.PI))
+                : 1;
+
+            const baseScale = 2.0;
+            const scale = baseScale * (isSel ? 1.12 : 1) * (1 + h * 0.1) * swap;
+
+            k.pushTransform();
+            k.pushTranslate(iconCx, iconCy);
+            k.pushScale(scale, scale);
+            if (isSel) drawMatIconOutlineFor(displayKey, 0, 0, "#fff8e0", 1.8);
+            drawMatIconFor(displayKey, 0, 0, mat.color);
+            k.popTransform();
+
+            // Small "+" badge in the upper-right corner when this slot has
+            // an upgrade available but isn't currently revealing it. A subtle
+            // hint that double-clicking does something.
+            if (upgradeKey && !isExpanded) {
+                const bX = bx + tb.matBtnW - 10;
+                const bY = by + 4;
+                k.drawCircle({ pos: k.vec2(bX + 0.5, bY + 0.5), radius: 5, color: k.Color.fromHex("#000000"), opacity: 0.3 });
+                k.drawCircle({ pos: k.vec2(bX, bY), radius: 4.5, color: k.Color.fromHex("#5a3418") });
+                k.drawCircle({ pos: k.vec2(bX, bY), radius: 3.5, color: k.Color.fromHex("#d37e3d") });
+                k.drawText({
+                    text: "+",
+                    pos: k.vec2(bX, bY - 1),
+                    size: 9, font: "PressStart2P",
+                    color: k.Color.fromHex("#fff8e0"),
+                    anchor: "center",
+                });
             }
-            // Label
-            k.drawText({
-                text: mat.label.split(" ")[0],
-                pos: k.vec2(bx + 20, tb.pad + 19),
-                size: 7,
-                font: "PressStart2P",
-                color: k.Color.fromHex(isSel ? "#fff8e0" : "#f0d8b0"),
-            });
+            // Tiny "×" in the upper-right when EXPANDED so the player knows
+            // they can double-click again to collapse back to the base tier.
+            if (upgradeKey && isExpanded) {
+                const bX = bx + tb.matBtnW - 10;
+                const bY = by + 4;
+                k.drawCircle({ pos: k.vec2(bX + 0.5, bY + 0.5), radius: 5, color: k.Color.fromHex("#000000"), opacity: 0.3 });
+                k.drawCircle({ pos: k.vec2(bX, bY), radius: 4.5, color: k.Color.fromHex("#5a3418") });
+                k.drawCircle({ pos: k.vec2(bX, bY), radius: 3.5, color: k.Color.fromHex("#8e4924") });
+                k.drawText({
+                    text: "×",
+                    pos: k.vec2(bX, bY - 1),
+                    size: 9, font: "PressStart2P",
+                    color: k.Color.fromHex("#fff8e0"),
+                    anchor: "center",
+                });
+            }
         }
 
-        // ─── Action buttons (icon-based) ───
-        const iPx = 2; // icon pixel size
+        // ─── Vertical divider between materials and tools ───
+        // Sits in the middle of the gap between the last material slot and the
+        // first tool button so the two groups read as distinct sections.
+        if (tb.matKeys.length > 0) {
+            const lastMatX = tb.matX[tb.matKeys.length - 1] + tb.matBtnW;
+            const divX = Math.round((lastMatX + tb.selectBtn.x) / 2);
+            const divY = tb.selectBtn.y + 4;
+            const divH = tb.selectBtn.h - 8;
+            // Dark shadow + cream highlight for a crisp inlay look
+            k.drawRect({ pos: k.vec2(divX + 0.5, divY), width: 1.5, height: divH, color: k.Color.fromHex("#5a3418"), anchor: "topleft", opacity: 0.55 });
+            k.drawRect({ pos: k.vec2(divX - 0.5, divY), width: 1, height: divH, color: k.Color.fromHex("#fff8e0"), anchor: "topleft", opacity: 0.25 });
+        }
 
-        // DEL - X icon
-        drawIconBtn(tb.delBtn, ICON_DELETE, state.delMode ? "#ff4444" : "#fff8e0", state.delMode ? "#8a2020" : null, iPx);
-        // LINE - dashed line icon
-        drawIconBtn(tb.lineBtn, ICON_LINE, state.lineMode ? "#60d0ff" : "#fff8e0", state.lineMode ? "#1a5080" : null, iPx);
-        // CURVE - arc icon
-        drawIconBtn(tb.archBtn, ICON_ARCH, state.archMode ? "#60d0ff" : "#fff8e0", state.archMode ? "#1a5080" : null, iPx);
-        // UNDO - arrow icon
-        drawIconBtn(tb.undoBtn, ICON_UNDO, "#fff8e0", null, iPx);
-        // SPEED - text
-        drawIconBtn(tb.speedBtn, null, "#fff8e0", null, iPx, `${state.simSpeed}x`);
-        // SIM - play/stop icon + label
+        // ─── Action buttons ───
+        // Toggleable tools (line/arch/delete) zoom on hover + get a brown outline
+        // when active — matching the material selection feel.
+        drawToolIconBtn(tb.selectBtn, drawSelectToolIcon, state.selectMode, "select");
+        drawToolIconBtn(tb.lineBtn,   drawLineToolIcon,  state.lineMode,   "line");
+        drawToolIconBtn(tb.archBtn,   drawArchToolIcon,  state.archMode,   "arch");
+        drawToolIconBtn(tb.delBtn,    drawXIcon,         state.delMode,    "del");
+        // Undo/redo always render in cream with the full hover-zoom animation —
+        // no greyed-out state, consistent with the rest of the tool tray.
+        drawToolIconBtn(tb.undoBtn, drawUndoIcon, false, "undo");
+        drawToolIconBtn(tb.redoBtn, drawRedoIcon, false, "redo");
+        // Split speed control — double-chevron buttons flanking a value readout.
+        drawToolIconBtn(tb.speedDownBtn, drawSpeedDownIcon, false, "speedDown");
+        drawToolIconBtn(tb.speedUpBtn,   drawSpeedUpIcon,   false, "speedUp");
+        const speedTextX = (tb.speedDownBtn.x + tb.speedDownBtn.w + tb.speedUpBtn.x) / 2;
+        const speedTextY = tb.speedDownBtn.y + tb.speedDownBtn.h / 2;
+        // Hand-drawn pixel font so the readout fits with the rest of the icons.
+        // 0.5x needs a smaller pixel size so the 4 chars fit in the narrow gap.
+        const speedText = `${state.simSpeed}x`;
+        drawPixelText(speedText, speedTextX, speedTextY, "#fff8e0", speedText.length > 2 ? 2 : 3);
+        drawToolIconBtn(tb.menuBtn, drawMenuIcon, false, "menu");
+
+        // SIM button: play icon idle (no outline), stop icon in sim mode (brown
+        // outline like the other active tools). Toggles with the same feel.
         const isSim = state.mode === "sim";
-        drawIconBtn(tb.simBtn, isSim ? ICON_STOP : ICON_PLAY, isSim ? "#fff8e0" : "#fff8e0", isSim ? "#cc3333" : "#16a34a", iPx, isSim ? " STOP" : " PLAY");
-        // MENU - hamburger icon
-        drawIconBtn(tb.menuBtn, ICON_MENU, "#fff8e0", null, iPx);
+        drawToolIconBtn(tb.simBtn, isSim ? drawStopIcon : drawPlayIcon, isSim, "sim");
 
-        // ─── AI & Hint buttons (below toolbar) ───
-        drawSmallBtn(tb.aiBtn, "AI", state.aiPanelOpen);
-        drawSmallBtn(tb.hintBtn, "?", state.hintOpen);
+        // ─── AI & Hint buttons — hanging wooden sign ───
+        drawHangingAiHintSign(tb);
     }
 
+    // icon can be: a 2D pixel grid, a function (cx, cy, col) => void, or falsy.
     function drawIconBtn(rect, icon, iconColor, bgColor, pxSize, text) {
+        // Drop shadow for a raised-chip look
+        k.drawRect({ pos: k.vec2(rect.x + 1, rect.y + 2), width: rect.w, height: rect.h, color: k.Color.fromHex("#010101"), opacity: 0.25, anchor: "topleft", radius: 3 });
         // Background
-        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: k.Color.fromHex(bgColor || "#8e4924"), anchor: "topleft" });
-        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1, color: k.Color.fromHex("#010101") }, anchor: "topleft", opacity: 0.25 });
-        // Icon and/or text
+        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: k.Color.fromHex(bgColor || "#8e4924"), anchor: "topleft", radius: 3 });
+        // Top highlight
+        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: 1, color: k.Color.fromHex("#ffffff"), opacity: 0.2, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1, color: k.Color.fromHex("#010101") }, anchor: "topleft", opacity: 0.3, radius: 3 });
+
         const cx = rect.x + rect.w / 2;
         const cy = rect.y + rect.h / 2;
-        if (icon && text) {
-            // Side by side: icon left, text right
-            drawIcon(icon, cx - 20, cy, iconColor, pxSize);
-            k.drawText({ text, pos: k.vec2(cx + 8, cy), size: 7, font: "PressStart2P", color: k.Color.fromHex(iconColor), anchor: "center" });
-        } else if (icon) {
-            drawIcon(icon, cx, cy, iconColor, pxSize);
+        const isFn = typeof icon === "function";
+        const hasIcon = !!icon;
+
+        if (hasIcon && text) {
+            const iconW = isFn ? 16 : icon[0].length * pxSize;
+            const textW = text.length * 6;
+            const gap = 4;
+            const totalW = iconW + gap + textW;
+            const leftX = cx - totalW / 2;
+            if (isFn) icon(leftX + iconW / 2, cy, iconColor);
+            else drawIcon(icon, leftX + iconW / 2, cy, iconColor, pxSize);
+            k.drawText({ text, pos: k.vec2(leftX + iconW + gap, cy - 4), size: 7, font: "PressStart2P", color: k.Color.fromHex(iconColor) });
+        } else if (hasIcon) {
+            if (isFn) icon(cx, cy, iconColor);
+            else drawIcon(icon, cx, cy, iconColor, pxSize);
         } else if (text) {
             k.drawText({ text, pos: k.vec2(cx, cy), size: 8, font: "PressStart2P", color: k.Color.fromHex(iconColor), anchor: "center" });
         }
-    }
-
-    function drawSmallBtn(rect, label, active) {
-        k.drawRect({
-            pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h,
-            color: k.Color.fromHex(active ? "#d37e3d" : "#8e4924"),
-            anchor: "topleft",
-        });
-        k.drawRect({
-            pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h,
-            fill: false, outline: { width: 1, color: k.Color.fromHex(active ? "#fff8e0" : "#010101") },
-            anchor: "topleft", opacity: active ? 0.6 : 0.2,
-        });
-        k.drawText({
-            text: label,
-            pos: k.vec2(rect.x + rect.w / 2, rect.y + rect.h / 2),
-            size: 8,
-            font: "PressStart2P",
-            color: k.Color.fromHex(active ? "#fff8e0" : "#e0c8a0"),
-            anchor: "center",
-        });
     }
 
     // ─── Hint panel ─────────────────────────────────
@@ -2369,7 +4608,12 @@ export function gameScene(k, { levelIdx }) {
         const W = k.width();
         const H = k.height();
         const panelW = Math.min(300, W * 0.4);
-        const panelH = 120;
+        // Auto-size the panel based on the wrapped hint text. PatrickHand
+        // averages ~5.8 px per character at size 16, and each line takes
+        // size + lineSpacing = 20px. Header eats ~30px, bottom padding ~8px.
+        const charsPerLine = Math.max(20, (panelW - 20) / 5.8);
+        const estLines = Math.max(2, Math.ceil(lvlDef.hint.length / charsPerLine));
+        const panelH = Math.max(110, 30 + estLines * 20 + 8);
         const px = W - panelW - 14;
         const py = H - panelH - 14;
 
@@ -2380,6 +4624,282 @@ export function gameScene(k, { levelIdx }) {
 
         k.drawText({ text: "HINT", pos: k.vec2(px + 10, py + 10), size: 10, font: "PressStart2P", color: k.Color.fromHex(C.markerBlue) });
         k.drawText({ text: lvlDef.hint, pos: k.vec2(px + 10, py + 30), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - 20, lineSpacing: 4 });
+    }
+
+    // ─── Per-level tutorial ─────────────────────────
+    // Each entry is a sequence of popups; the active sequence is picked by
+    // levelIdx. A step can carry `awaitExpand: <materialKey>` which makes
+    // the popup wait for the player to actually double-click that material
+    // slot before advancing — used to teach the tier-2 reveal on level 2.
+    const TUTORIAL_STEPS_BY_LEVEL = {
+        0: [
+            { key: "budget", title: "BUDGET",  text: "You've got $7,000 to spend. Every piece you place costs money — stay under budget or it won't count." },
+            { key: "road",   title: "ROAD",    text: "Vehicles drive on the ROAD. Drop planks along the top of your bridge, anchor to anchor." },
+            { key: "beam",   title: "SUPPORT", text: "BEAMS hold the road up from below. Cars can't drive on them, but without support the road will sag and snap." },
+            { key: "tools",  title: "TOOLS",   text: "Your tools live up here. Poke around — each one does something useful." },
+            { key: "help",   title: "STUCK?",  text: "Tap the hanging sign for help. The question mark shows a quick hint. The robot opens an AI tutor — learn the engineering alongside it as it aids your build." },
+            { key: "goal",   title: "THE GOAL", text: "The car starts on the left and needs to reach the flag on the right. Get it across the gap safely." },
+            { key: "play",   title: "PLAY",    text: "Ready? Hit the play button to run the simulation. If the car makes it across, you win." },
+        ],
+        1: [
+            { key: "pier",      title: "THE PIER",      text: "A stone rock pokes out of the water in the middle of the gap — use it as a PIER. Splitting one long span into two shorter ones makes each half far easier to hold up." },
+            { key: "vehicle",   title: "HEAVIER LOAD",  text: "This time a JEEP crosses, not a car — heavier than what you've handled before. Wood alone may snap; you'll want stronger materials in key spots." },
+            { key: "betterRoad", title: "STRONGER ROAD", text: "Each material has a stronger TIER 2 version. DOUBLE-CLICK the road slot to reveal the STONE ROAD — heavier, more expensive, but holds up under load.", awaitExpand: "wood_road" },
+            { key: "betterBeam", title: "STRONGER BEAM", text: "Same trick on the beam — DOUBLE-CLICK the beam slot to reveal the STEEL BEAM. Pricier, but it bends a lot less under stress.", awaitExpand: "wood_beam" },
+            { key: "mix",       title: "MIX & MATCH",   text: "Use the upgrades only where the load is heaviest — wood elsewhere. The little + badge on each slot reminds you the upgrade is there." },
+            { key: "play",      title: "BUILD & PLAY",  text: "Build the road across using the rock pier, triangulate underneath with beams, then hit PLAY." },
+        ],
+        2: [
+            { key: "towerAnchor", title: "TOWER ANCHORS",   text: "Those tall steel towers on each cliff have anchor points at the top. This level needs ROPE — a tension-only material that pulls but can never push." },
+            { key: "ropeSlot",    title: "ROPE MATERIAL",   text: "ROPE is the third slot in your toolbar. Hang it from the tower tops down to the road deck so it holds the bridge from above. DOUBLE-CLICK the rope slot to reveal STEEL CABLE — stronger but pricier.", awaitExpand: "rope" },
+            { key: "ropeCount",   title: "4 ROPES MINIMUM", text: "This bridge needs at least 4 rope (or cable) segments before you can simulate. More rope = more load sharing. Spread them evenly along the span." },
+            { key: "play",        title: "BUILD & PLAY",    text: "Lay wood road across, hang it with rope from the towers, brace below with beams — then hit PLAY. A camper van is heavy, so make the ropes count!" },
+        ],
+    };
+    const TUTORIAL_STEPS = TUTORIAL_STEPS_BY_LEVEL[levelIdx] || [];
+
+    function getTutorialTarget(key) {
+        const tb = getToolbar();
+        const W = k.width();
+        const H = k.height();
+        const padH = tb.h + tb.pad;
+        if (key === "budget") {
+            return { x: 0, y: 0, w: 220, h: padH };
+        }
+        if (key === "road") {
+            return { x: tb.matX[0] - 4, y: tb.simBtn.y - 4, w: tb.matBtnW + 8, h: 40 };
+        }
+        if (key === "beam") {
+            return { x: tb.matX[1] - 4, y: tb.simBtn.y - 4, w: tb.matBtnW + 8, h: 40 };
+        }
+        if (key === "tools") {
+            return {
+                x: tb.selectBtn.x - 6,
+                y: tb.selectBtn.y - 6,
+                w: tb.redoBtn.x + tb.redoBtn.w - tb.selectBtn.x + 12,
+                h: tb.selectBtn.h + 12,
+            };
+        }
+        if (key === "help") {
+            // Spotlight covers both buttons AND the ropes connecting them to
+            // the toolbar, with extra padding so the swing of the sign and
+            // both ropes always sit comfortably inside the highlight.
+            const ropeTopY = padH;
+            const signBottomY = tb.aiBtn.y + tb.aiBtn.h;
+            return {
+                x: tb.aiBtn.x - 22,
+                y: ropeTopY - 8,
+                w: (tb.hintBtn.x + tb.hintBtn.w) - tb.aiBtn.x + 44,
+                h: signBottomY - ropeTopY + 20,
+            };
+        }
+        if (key === "goal") {
+            return { x: W * 0.15, y: H * 0.45, w: W * 0.7, h: H * 0.5 };
+        }
+        if (key === "play") {
+            return { x: tb.simBtn.x - 6, y: tb.simBtn.y - 6, w: tb.simBtn.w + 12, h: tb.simBtn.h + 12 };
+        }
+        // ── Level 2 specific targets ────────────────────────
+        if (key === "pier") {
+            // Spotlight the rock pier — find any mid-gap anchor and project to screen
+            const midNode = state.nodes.find(n => n.fixed && !n.builtin && n.x > lX && n.x < rX);
+            if (midNode) {
+                const p = toScreen(midNode.x, midNode.y);
+                return { x: p.x - 80, y: p.y - 60, w: 160, h: 200 };
+            }
+            return { x: W * 0.3, y: H * 0.5, w: W * 0.4, h: H * 0.4 };
+        }
+        if (key === "vehicle") {
+            // Spotlight the vehicle on the left side of the bridge
+            const v = state.vehicles[0];
+            if (v) {
+                const p = toScreen(v.x, v.y);
+                return { x: p.x - 60, y: p.y - 50, w: 120, h: 100 };
+            }
+            return { x: 0, y: H * 0.4, w: 200, h: H * 0.3 };
+        }
+        if (key === "betterRoad") {
+            return { x: tb.matX[0] - 4, y: tb.simBtn.y - 4, w: tb.matBtnW + 8, h: 40 };
+        }
+        if (key === "betterBeam") {
+            return { x: tb.matX[1] - 4, y: tb.simBtn.y - 4, w: tb.matBtnW + 8, h: 40 };
+        }
+        if (key === "mix") {
+            return {
+                x: tb.matX[0] - 6, y: tb.simBtn.y - 6,
+                w: tb.matX[1] + tb.matBtnW - tb.matX[0] + 12,
+                h: 44,
+            };
+        }
+        // ── Level 3 specific targets ────────────────────────
+        if (key === "towerAnchor") {
+            const towerNode = state.nodes.find(n => n.fixed && !n.builtin && n.x === lX && n.y < lY);
+            if (towerNode) {
+                const p = toScreen(towerNode.x, towerNode.y);
+                return { x: p.x - 50, y: p.y - 30, w: 100, h: (toScreen(lX, lY).y - p.y) + 60 };
+            }
+            return { x: 0, y: H * 0.05, w: 160, h: H * 0.6 };
+        }
+        if (key === "ropeSlot") {
+            const ropeIdx = (lvlDef.materials || []).indexOf("rope");
+            if (ropeIdx >= 0) {
+                return { x: tb.matX[ropeIdx] - 4, y: tb.simBtn.y - 4, w: tb.matBtnW + 8, h: 40 };
+            }
+            return { x: tb.matX[0] - 4, y: tb.simBtn.y - 4, w: tb.matBtnW + 8, h: 40 };
+        }
+        if (key === "ropeCount") {
+            return { x: W * 0.1, y: H * 0.05, w: W * 0.8, h: H * 0.8 };
+        }
+        return { x: 0, y: 0, w: W, h: H };
+    }
+
+    function handleTutorialClick() {
+        const step = TUTORIAL_STEPS[state.tutorialStep];
+        if (!step) { state.tutorialActive = false; return; }
+        // First click finishes the typing animation, second click advances.
+        if (state.tutorialTyped < step.text.length) {
+            state.tutorialTyped = step.text.length;
+            return;
+        }
+        // For interactive steps, the player has to actually perform the
+        // action (e.g. double-click the material slot) — no clickthrough.
+        // Auto-advance is handled in drawTutorialOverlay.
+        if (step.awaitExpand) return;
+        state.tutorialStep++;
+        state.tutorialTyped = 0;
+        if (state.tutorialStep >= TUTORIAL_STEPS.length) {
+            state.tutorialActive = false;
+        }
+    }
+
+    function drawTutorialOverlay() {
+        let step = TUTORIAL_STEPS[state.tutorialStep];
+        if (!step) { state.tutorialActive = false; return; }
+        const W = k.width();
+        const H = k.height();
+        const dt = k.dt() || 1 / 60;
+        const t = k.time();
+
+        // Advance the typing reveal — ~42 characters per second feels snappy
+        // without being instant.
+        let typingDone = state.tutorialTyped >= step.text.length;
+        if (!typingDone) {
+            state.tutorialTyped = Math.min(step.text.length, state.tutorialTyped + dt * 42);
+            typingDone = state.tutorialTyped >= step.text.length;
+        }
+
+        // Interactive steps auto-advance the moment the player performs the
+        // gating action (e.g. double-clicks the material slot to reveal the
+        // upgrade). Wait until the typing finishes so they actually read it.
+        // We re-bind `step` to the new step in-place rather than returning —
+        // returning would skip the dim/spotlight draw for one frame, creating
+        // a visible flash.
+        if (typingDone && step.awaitExpand && state.matExpanded.has(step.awaitExpand)) {
+            state.tutorialStep++;
+            state.tutorialTyped = 0;
+            if (state.tutorialStep >= TUTORIAL_STEPS.length) {
+                state.tutorialActive = false;
+                return;
+            }
+            step = TUTORIAL_STEPS[state.tutorialStep];
+            typingDone = false;
+        }
+
+        // ─── Dim backdrop with a cutout around the target rect ───
+        // Four rects around the spotlight leave a clean "hole" instead of
+        // needing a compositing mask.
+        const tgt = getTutorialTarget(step.key);
+        const dim = "#010101";
+        const dimA = 0.55;
+        // Top
+        k.drawRect({ pos: k.vec2(0, 0), width: W, height: Math.max(0, tgt.y), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        // Bottom
+        k.drawRect({ pos: k.vec2(0, tgt.y + tgt.h), width: W, height: Math.max(0, H - (tgt.y + tgt.h)), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        // Left
+        k.drawRect({ pos: k.vec2(0, tgt.y), width: Math.max(0, tgt.x), height: tgt.h, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        // Right
+        k.drawRect({ pos: k.vec2(tgt.x + tgt.w, tgt.y), width: Math.max(0, W - (tgt.x + tgt.w)), height: tgt.h, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+
+        // Pulsing highlight ring around the spotlight so the eye locks onto it.
+        const ringPulse = 0.5 + 0.5 * Math.sin(t * 4);
+        const ringCol = "#ffd479";
+        for (let ring = 3; ring >= 1; ring--) {
+            k.drawRect({
+                pos: k.vec2(tgt.x - ring, tgt.y - ring),
+                width: tgt.w + ring * 2, height: tgt.h + ring * 2,
+                fill: false,
+                outline: { width: 2, color: k.Color.fromHex(ringCol) },
+                opacity: (0.3 + 0.35 * ringPulse) * (ring === 1 ? 1 : 0.35 / ring),
+                anchor: "topleft",
+                radius: 4,
+            });
+        }
+
+        // ─── Text panel — opposite side of the spotlight ───
+        // If the target sits in the top half, drop the panel to the bottom;
+        // otherwise float it near the top. Keeps it out of the way of the arrow.
+        const panelW = Math.min(480, W - 60);
+        const panelH = 140;
+        const panelX = Math.round((W - panelW) / 2);
+        const targetCY = tgt.y + tgt.h / 2;
+        const panelY = targetCY < H / 2 ? H - panelH - 30 : 30;
+
+        // Sticky-note card (matches the hint panel vocabulary)
+        k.drawRect({ pos: k.vec2(panelX + 3, panelY + 4), width: panelW, height: panelH, color: k.Color.fromHex("#000000"), opacity: 0.35, anchor: "topleft", radius: 3 });
+        k.drawRect({ pos: k.vec2(panelX, panelY), width: panelW, height: panelH, color: k.Color.fromHex("#fff9c4"), anchor: "topleft", radius: 2 });
+        k.drawRect({ pos: k.vec2(panelX + panelW / 2 - 28, panelY - 6), width: 56, height: 14, color: k.Color.fromHex(C.tape), anchor: "topleft", opacity: 0.55 });
+
+        // Title
+        k.drawText({
+            text: step.title,
+            pos: k.vec2(panelX + 16, panelY + 14),
+            size: 14,
+            font: "PressStart2P",
+            color: k.Color.fromHex(C.markerBlue),
+        });
+        // Step counter (e.g. "2 / 6") in the top-right corner
+        k.drawText({
+            text: `${state.tutorialStep + 1} / ${TUTORIAL_STEPS.length}`,
+            pos: k.vec2(panelX + panelW - 16, panelY + 14),
+            size: 9,
+            font: "PressStart2P",
+            color: k.Color.fromHex(C.pencil),
+            opacity: 0.55,
+            anchor: "topright",
+        });
+
+        // Typed body text with a blinking caret at the end while typing.
+        const shown = Math.floor(state.tutorialTyped);
+        const body = step.text.slice(0, shown);
+        const caret = (!typingDone && Math.floor(t * 2) % 2 === 0) ? "|" : "";
+        k.drawText({
+            text: body + caret,
+            pos: k.vec2(panelX + 16, panelY + 44),
+            size: 18,
+            font: "PatrickHand",
+            color: k.Color.fromHex(C.pencil),
+            width: panelW - 32,
+            lineSpacing: 4,
+        });
+
+        // Click-to-continue hint — only once the line is fully typed. For
+        // interactive steps, prompt the action instead of "click to continue".
+        if (typingDone) {
+            const pulse = 0.55 + 0.45 * Math.sin(t * 5);
+            const isLast = state.tutorialStep === TUTORIAL_STEPS.length - 1;
+            const prompt = step.awaitExpand
+                ? "DOUBLE-CLICK TO TRY IT"
+                : (isLast ? "CLICK TO START" : "CLICK TO CONTINUE");
+            k.drawText({
+                text: prompt,
+                pos: k.vec2(panelX + panelW - 16, panelY + panelH - 14),
+                size: 9,
+                font: "PressStart2P",
+                color: k.Color.fromHex(step.awaitExpand ? C.markerGreen : C.markerBlue),
+                opacity: pulse,
+                anchor: "botright",
+            });
+        }
     }
 
     // ─── AI panel (Socratic tutor — styled like the hint sticky note) ──
@@ -2394,23 +4914,55 @@ export function gameScene(k, { levelIdx }) {
         const px = 10;
         const py = 110;
 
-        // Compute panel height based on content
+        // Estimate how many wrapped lines of text fit in `width` and the
+        // total pixel height that takes. PatrickHand averages ~5.8 px per
+        // character at the sizes we use; lineHeight = fontSize + lineSpacing.
+        const estLines = (text, width) => {
+            const cpl = Math.max(8, Math.floor((width - 4) / 5.8));
+            return Math.max(1, Math.ceil((text || "").length / cpl));
+        };
+        const estHeight = (text, size, lineSpacing, width) =>
+            estLines(text, width) * (size + lineSpacing);
+
+        // Compute panel height based on actual content length so long AI
+        // questions/options/explanations don't get clipped.
         const lesson = state.aiResult;
         const hasSteps = lesson && Array.isArray(lesson.steps);
         let panelH = 170;
-        const optH = 52;
+        // Per-step layout cache so the draw passes below can reuse the heights
+        // we computed for sizing.
+        let layout = null;
+
         if (hasSteps) {
-            if (state.aiPhase === "question") {
-                const step = lesson.steps[state.aiStepIdx];
-                // header + question (~60) + options
-                panelH = 140 + (optH + 8) * (step?.options?.length || 0);
-            } else if (state.aiPhase === "feedback") {
-                panelH = 250;
+            const step = lesson.steps[state.aiStepIdx];
+            if (state.aiPhase === "question" && step) {
+                const qW = panelW - padX * 2;
+                const qH = estHeight(step.question, 17, 4, qW);
+                const optTextW = panelW - padX * 2 - 48;
+                const optHs = step.options.map(o => Math.max(36, estHeight(o, 16, 3, optTextW) + 18));
+                const optsTotal = optHs.reduce((a, b) => a + b, 0) + Math.max(0, optHs.length - 1) * 8;
+                // header(12) + concept/step row(22) + gap(20) + question + gap + options + bottom pad
+                panelH = 12 + 22 + 20 + qH + 12 + optsTotal + 18;
+                layout = { qH, optHs, optsTotal };
+            } else if (state.aiPhase === "feedback" && step) {
+                const w = panelW - padX * 2;
+                const pickedLabel = `${String.fromCharCode(65 + state.aiChoiceIdx)}: ${step.options[state.aiChoiceIdx] || ""}`;
+                const pickedH = estHeight(pickedLabel, 15, 3, w);
+                const explanation = state.aiChoiceIdx === step.correct ? (step.explainCorrect || "") : (step.explainWrong || "");
+                const explH = estHeight(explanation, 16, 4, w);
+                // header + banner + picked + explanation + button + paddings
+                panelH = 12 + 22 + 22 + 16 + pickedH + 16 + explH + 56;
+                layout = { pickedH, explH };
             } else if (state.aiPhase === "done") {
-                panelH = 170;
+                const w = panelW - padX * 2;
+                const sumH = estHeight(lesson.summary || "", 16, 4, w);
+                panelH = 12 + 22 + 22 + 16 + sumH + 56;
+                layout = { sumH };
             }
-        } else if (state.aiResult?.error || state.aiResult?.explanation) {
-            panelH = 170;
+        } else if (state.aiResult?.error) {
+            panelH = 12 + 24 + estHeight(state.aiResult.error, 16, 3, panelW - padX * 2) + 24;
+        } else if (state.aiResult?.explanation) {
+            panelH = 12 + 24 + 24 + estHeight(state.aiResult.explanation, 16, 4, panelW - padX * 2) + 20;
         }
 
         // Sticky-note background with tape strip (match the HINT panel)
@@ -2462,17 +5014,21 @@ export function gameScene(k, { levelIdx }) {
         });
 
         if (state.aiPhase === "question" && step) {
-            k.drawText({ text: step.question, pos: k.vec2(px + padX, py + 58), size: 17, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            // Question text — top of the body region, just under the header row.
+            const questionY = py + 12 + 22 + 20;
+            k.drawText({ text: step.question, pos: k.vec2(px + padX, questionY), size: 17, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
 
-            const optsY = py + 110;
+            // Options stacked under the question, each sized to its own text.
+            let optY = questionY + layout.qH + 12;
             for (let i = 0; i < step.options.length; i++) {
-                const oy = optsY + i * (optH + 8);
-                const rect = { x: px + padX, y: oy, w: panelW - padX * 2, h: optH };
+                const optHi = layout.optHs[i];
+                const rect = { x: px + padX, y: optY, w: panelW - padX * 2, h: optHi };
                 state.aiOptionRects.push(rect);
                 k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: k.Color.fromHex("#fffdea"), anchor: "topleft", radius: 2 });
                 k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1.5, color: k.Color.fromHex(C.markerBlue) }, anchor: "topleft", radius: 2, opacity: 0.7 });
                 k.drawText({ text: String.fromCharCode(65 + i), pos: k.vec2(rect.x + 12, rect.y + rect.h / 2), size: 14, font: "PressStart2P", color: k.Color.fromHex(C.markerBlue), anchor: "left" });
                 k.drawText({ text: step.options[i], pos: k.vec2(rect.x + 40, rect.y + rect.h / 2), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: rect.w - 50, anchor: "left", lineSpacing: 3 });
+                optY += optHi + 8;
             }
             return;
         }
@@ -2480,13 +5036,17 @@ export function gameScene(k, { levelIdx }) {
         if (state.aiPhase === "feedback" && step) {
             const correct = state.aiChoiceIdx === step.correct;
             const bannerColor = correct ? C.markerGreen : C.markerRed;
-            k.drawText({ text: correct ? "RIGHT!" : "NOT QUITE", pos: k.vec2(px + padX, py + 60), size: 12, font: "PressStart2P", color: k.Color.fromHex(bannerColor) });
+
+            const bannerY = py + 12 + 22 + 22;
+            k.drawText({ text: correct ? "RIGHT!" : "NOT QUITE", pos: k.vec2(px + padX, bannerY), size: 12, font: "PressStart2P", color: k.Color.fromHex(bannerColor) });
 
             const pickedLabel = `${String.fromCharCode(65 + state.aiChoiceIdx)}: ${step.options[state.aiChoiceIdx]}`;
-            k.drawText({ text: pickedLabel, pos: k.vec2(px + padX, py + 84), size: 15, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.7, width: panelW - padX * 2, lineSpacing: 3 });
+            const pickedY = bannerY + 24;
+            k.drawText({ text: pickedLabel, pos: k.vec2(px + padX, pickedY), size: 15, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.7, width: panelW - padX * 2, lineSpacing: 3 });
 
             const explanation = correct ? (step.explainCorrect || "") : (step.explainWrong || "");
-            k.drawText({ text: explanation, pos: k.vec2(px + padX, py + 118), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            const explY = pickedY + layout.pickedH + 12;
+            k.drawText({ text: explanation, pos: k.vec2(px + padX, explY), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
 
             const btnW = 160, btnH = 32;
             const btnX = px + panelW - btnW - padX;
@@ -2499,8 +5059,9 @@ export function gameScene(k, { levelIdx }) {
         }
 
         if (state.aiPhase === "done") {
-            k.drawText({ text: "LESSON COMPLETE!", pos: k.vec2(px + padX, py + 60), size: 12, font: "PressStart2P", color: k.Color.fromHex(C.markerGreen) });
-            k.drawText({ text: lesson.summary || "Great work — hit PLAY to see the bridge in action.", pos: k.vec2(px + padX, py + 88), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            const bannerY = py + 12 + 22 + 22;
+            k.drawText({ text: "LESSON COMPLETE!", pos: k.vec2(px + padX, bannerY), size: 12, font: "PressStart2P", color: k.Color.fromHex(C.markerGreen) });
+            k.drawText({ text: lesson.summary || "Great work — hit PLAY to see the bridge in action.", pos: k.vec2(px + padX, bannerY + 28), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
 
             const btnW = 100, btnH = 30;
             const btnX = px + panelW - btnW - padX;
@@ -2520,27 +5081,52 @@ export function gameScene(k, { levelIdx }) {
     // regardless of how tall the card grows (win vs fail, with/without AI).
     const MODAL_BTN_W = 220;
     const MODAL_BTN_H = 30;
-    const MODAL_BTN_SPACING = 44;              // matches every-other ruled line (22 × 2)
+    const MODAL_ROW = 22;                      // ruled-line spacing — THE grid unit
+    const MODAL_BTN_SPACING = MODAL_ROW * 2;   // buttons on every-other ruled line (44)
     const MODAL_BTN_BOTTOM_MARGIN = 30;        // secondary button sits this far above the bottom
 
-    // Single source of truth for modal layout — both drawModal and the click
-    // handler pull positions from here so hit tests match visuals exactly.
+    // Single source of truth for modal layout. All Y positions are aligned to
+    // the 22px ruled-line grid so text sits on the page lines like handwriting:
+    //   row 2  : title
+    //   row 4-5: description (2 lines at 22px spacing)
+    //   row 6-7: grade / cost line (win modals only)
+    //   row N  : primary button      (N = last-content-row + 2)
+    //   row N+2: AI button           (beaten levels only)
+    //   row N+2 or N+4: secondary button
+    // Buttons are anchored from the top of the modal (off the description
+    // block), not the bottom — otherwise adding more buttons crowds them
+    // against the description instead of growing the card.
     function getModalLayout() {
         if (!state.modal) return null;
         const W = k.width(), H = k.height();
         const beaten = getCompleted().includes(levelIdx);
         const hasGrade = state.modal.grade != null;
-        const mh = 200 + (hasGrade ? 60 : 0) + (beaten ? 40 : 0);
+
+        const R = MODAL_ROW;
+        const TITLE_Y    = R * 2;                                // top padding of 2 rows, then title
+        const DESC_TOP_Y = TITLE_Y + R * 2;                      // blank row, then first desc line
+        const DESC_BOT_Y = DESC_TOP_Y + R;
+        const GRADE_Y    = hasGrade ? DESC_BOT_Y + R * 2 : null; // 1 blank row, then grade line
+        const LAST_CONTENT_Y = GRADE_Y != null ? GRADE_Y : DESC_BOT_Y;
+        const PRIMARY_Y  = LAST_CONTENT_Y + R * 2;               // 1 blank row, then primary button
+        const AI_Y       = PRIMARY_Y + R * 2;
+        const SECONDARY_Y = beaten ? AI_Y + R * 2 : PRIMARY_Y + R * 2;
+
+        const mh = SECONDARY_Y + MODAL_BTN_BOTTOM_MARGIN + MODAL_BTN_H / 2;
         const hh = mh / 2;
-        const secondary = hh - MODAL_BTN_BOTTOM_MARGIN;
-        const ai = beaten ? secondary - MODAL_BTN_SPACING : null;
-        const primary = beaten
-            ? secondary - 2 * MODAL_BTN_SPACING
-            : secondary - MODAL_BTN_SPACING;
+
         return {
             mx: W / 2, my: H / 2, mw: Math.min(420, W * 0.82), mh, hh,
             beaten, hasGrade,
-            btnY: { primary, ai, secondary },
+            // Text positions (center of each visual row)
+            titleY:   TITLE_Y - hh,
+            descY:    (DESC_TOP_Y + DESC_BOT_Y) / 2 - hh,  // midpoint of the 2 desc rows
+            gradeY:   GRADE_Y != null ? GRADE_Y - hh : null,
+            btnY: {
+                primary:   PRIMARY_Y   - hh,
+                ai:        beaten ? AI_Y - hh : null,
+                secondary: SECONDARY_Y - hh,
+            },
         };
     }
 
@@ -2582,11 +5168,12 @@ export function gameScene(k, { levelIdx }) {
             width: 1.5, color: cFn(C.markerRed), opacity: 0.35,
         });
 
-        // Horizontal ruled lines — anchored to the bottom-most button (secondary)
-        // and marching upward every 22px so every ruled line passes through a
-        // potential button baseline. Buttons spaced at every-other line (44) sit
-        // exactly on a line, giving the "written on the page" look.
-        const bottomLineY = my + L.btnY.secondary;
+        // Horizontal ruled lines — anchored to each text row's BASELINE (not
+        // its center), so letters appear to sit on the page lines like real
+        // handwriting. PatrickHand's baseline lands roughly 5px below the
+        // text's vertical center at the sizes we use.
+        const BASELINE_OFFSET = 5;
+        const bottomLineY = my + L.btnY.secondary + BASELINE_OFFSET;
         for (let ly = bottomLineY; ly > my - hh + 50; ly -= 22) {
             k.drawLine({
                 p1: k.vec2(mx - hw + 12, ly), p2: k.vec2(mx + hw - 12, ly),
@@ -2616,7 +5203,7 @@ export function gameScene(k, { levelIdx }) {
 
         // Title — pixel font with shadow + colored marker, plus underline stroke
         const titleColor = m.win ? C.markerGreen : C.markerRed;
-        const titleY = my - hh + 50;
+        const titleY = my + L.titleY;
         const titleSz = 18;
         k.drawText({ text: m.title, pos: k.vec2(mx + 2, titleY + 2), size: titleSz, font: "PressStart2P", color: cFn("#1a0e05"), anchor: "center", opacity: 0.30 });
         k.drawText({ text: m.title, pos: k.vec2(mx, titleY), size: titleSz, font: "PressStart2P", color: cFn(titleColor), anchor: "center" });
@@ -2628,11 +5215,13 @@ export function gameScene(k, { levelIdx }) {
             width: 2.5, color: cFn(titleColor), opacity: 0.55,
         });
 
-        // Description in handwritten font
+        // Description — size 20 with lineSpacing 2 gives exactly 22px per line so
+        // two lines sit on consecutive ruled lines (the "written on paper" feel).
         k.drawText({
-            text: m.desc, pos: k.vec2(mx, titleY + 42),
-            size: 22, font: "PatrickHand", color: cFn(C.pencil),
+            text: m.desc, pos: k.vec2(mx, my + L.descY),
+            size: 20, font: "PatrickHand", color: cFn(C.pencil),
             anchor: "center", width: mw - 70, align: "center",
+            lineSpacing: 2,
         });
 
         // ── Cost text + animated teacher-style GRADE (win only) ──
@@ -2640,7 +5229,7 @@ export function gameScene(k, { levelIdx }) {
         // teacher's mark next to the student's work.
         const elapsed = m.openTime != null ? Math.max(0, k.time() - m.openTime) : 2;
         if (m.grade != null) {
-            const lineY = titleY + 90;
+            const lineY = my + L.gradeY;
             if (m.cost != null) {
                 k.drawText({
                     text: `Cost: $${m.cost.toLocaleString()}`,

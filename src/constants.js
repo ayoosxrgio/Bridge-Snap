@@ -96,7 +96,7 @@ export const MATERIALS = {
         compliance:  0.0005,
         breakForce:  900,
         price:       400,
-        width:       14,
+        width:       11,
         maxLength:   72,
         isRoad:      true,
         tensionOnly: false,
@@ -121,8 +121,8 @@ export const MATERIALS = {
     steel: {
         label:       "Steel Beam",
         key:         "steel",
-        color:       C.wire,
-        colorDark:   "#7a8a96",
+        color:       "#c43838",          // brick-red — the "stronger beam" cue
+        colorDark:   "#7a2020",
         compliance:  0.00002,
         breakForce:  1200,
         price:       450,
@@ -139,7 +139,7 @@ export const MATERIALS = {
         key:         "rope",
         color:       "#8B6914",
         colorDark:   "#5a4010",
-        compliance:  0.001,
+        compliance:  0.004,
         breakForce:  250,
         price:       60,
         width:       3,
@@ -156,12 +156,22 @@ export const MATERIALS = {
         compliance:  0.0003,
         breakForce:  800,
         price:       150,
-        width:       2,
+        width:       4,
         maxLength:   252,
         isRoad:      false,
         tensionOnly: true,
         desc:        "Steel cable — strong tension member, less flex than rope",
     },
+};
+
+// Each base material has a stronger "tier-2" version that the player can
+// reveal by double-clicking the material slot in the toolbar. Costs more,
+// breaks under heavier loads — a lever for the player to spend extra budget
+// on a few critical members instead of the whole bridge.
+export const MATERIAL_UPGRADES = {
+    wood_road: "stone_road",
+    wood_beam: "steel",
+    rope:      "cable",
 };
 
 // ═══════════════════════════════════════════════════════
@@ -257,7 +267,7 @@ export const VEHICLES = {
         name: "CAMPER VAN",
         label: "CAMP",
         mass: 180,
-        w: 50, h: 24,
+        w: 65, h: 24,
         speed: 1.0,
         color: "#5a9a5a",
         wheels: 2,

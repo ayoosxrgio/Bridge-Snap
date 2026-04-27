@@ -692,8 +692,8 @@ export function menuScene(k, params = {}) {
         drawConfetti(W, H, dt, sy);
 
         // Buttons — fallen planks (slide with content)
-        const btnW = Math.min(280, W * 0.40);
-        const btnH = 44;
+        const btnW = Math.min(240, W * 0.34);
+        const btnH = 40;
         const btnGap = 14;
         const btnX = W / 2;
         const btnStartY = H * 0.60 + sy;
@@ -1023,26 +1023,11 @@ export function menuScene(k, params = {}) {
             k.drawText({ text: "Gameplay", pos: k.vec2(leftX, gameY), size: 14, font: "PressStart2P", color: col("#5a3510"), opacity: 0.6 });
             k.drawLine({ p1: k.vec2(leftX, gameY + 20), p2: k.vec2(leftX + sliderW, gameY + 20), width: 1.5, color: col("#5a3510"), opacity: 0.2 });
 
-            const stToggles = [
-                { key: "showGrid", label: "Show Grid" },
-                { key: "showStress", label: "Stress Colors" },
-            ];
-
-            for (let i = 0; i < stToggles.length; i++) {
-                const t = stToggles[i];
-                const tY = gameY + 46 + i * 44;
-                const val = settingsData[t.key];
-                k.drawText({ text: t.label, pos: k.vec2(leftX, tY), size: 22, font: "PatrickHand", color: col("#4a2808") });
-                const tx = leftX + 240, tw = 50, th = 26;
-                k.drawRect({ pos: k.vec2(tx, tY + 10), width: tw, height: th, color: col(val ? "#6a9a50" : "#8a7060"), anchor: "center", radius: 13 });
-                k.drawRect({ pos: k.vec2(tx, tY + 10), width: tw, height: th, fill: false, outline: { width: 2, color: col("#3a2010") }, anchor: "center", radius: 13, opacity: 0.3 });
-                const pegX = val ? tx + tw / 2 - th / 2 : tx - tw / 2 + th / 2;
-                k.drawCircle({ pos: k.vec2(pegX, tY + 10), radius: th / 2 - 2, color: col("#d4b060") });
-                k.drawCircle({ pos: k.vec2(pegX, tY + 10), radius: th / 2 - 2, fill: false, outline: { width: 2, color: col("#5a3510") } });
-            }
+            // (Show Grid + Stress Colors toggles moved out of settings — they
+            // belong in an in-game options sheet, not the global settings.)
 
             // ── FPS Cap segmented control ──
-            const fpsRowY = gameY + 46 + stToggles.length * 44;
+            const fpsRowY = gameY + 46;
             k.drawText({ text: "FPS Cap", pos: k.vec2(leftX, fpsRowY), size: 22, font: "PatrickHand", color: col("#4a2808") });
             const segW = 56, segH = 28, segGap = 4;
             const segTotalW = FPS_OPTIONS.length * segW + (FPS_OPTIONS.length - 1) * segGap;
@@ -1057,7 +1042,7 @@ export function menuScene(k, params = {}) {
             }
 
             // ── Data section ─────────────
-            const dataY = gameY + 46 + stToggles.length * 44 + 44 + 24;
+            const dataY = gameY + 46 + 44 + 24;
             k.drawText({ text: "Data", pos: k.vec2(leftX, dataY), size: 14, font: "PressStart2P", color: col("#5a3510"), opacity: 0.6 });
             k.drawLine({ p1: k.vec2(leftX, dataY + 20), p2: k.vec2(leftX + sliderW, dataY + 20), width: 1.5, color: col("#5a3510"), opacity: 0.2 });
             drawPlankButton(stCx, dataY + 56, 240, 40, "Reset Progress", false, 0);
@@ -1082,8 +1067,8 @@ export function menuScene(k, params = {}) {
         if (currentView !== "menu") { hoverPlay = false; hoverSettings = false; hoverCredits = false; return; }
         const W = k.width();
         const H = k.height();
-        const btnW = Math.min(280, W * 0.40);
-        const btnH = 44;
+        const btnW = Math.min(240, W * 0.34);
+        const btnH = 40;
         const btnGap = 14;
         const btnX = W / 2;
         const btnStartY = H * 0.60 + scrollY;
@@ -1098,8 +1083,8 @@ export function menuScene(k, params = {}) {
         const H = k.height();
         const FW = 38;
         const contentH = H - FW * 2;
-        const btnW = Math.min(280, W * 0.40);
-        const btnH = 44;
+        const btnW = Math.min(240, W * 0.34);
+        const btnH = 40;
         const btnGap = 14;
         const btnX = W / 2;
         const btnStartY = H * 0.60;
@@ -1216,22 +1201,11 @@ export function menuScene(k, params = {}) {
                 }
             }
 
-            // Toggles
+            // (Toggles removed — Show Grid + Stress Colors live in-game now.)
             const gameY = audioY + 60 + (stSliders.length - 1) * sliderSpacing + 48;
-            const stToggles = [{ key: "showGrid" }, { key: "showStress" }];
-            for (let i = 0; i < stToggles.length; i++) {
-                const t = stToggles[i];
-                const tY = gameY + 46 + i * 44;
-                const tx = leftX + 240;
-                if (Math.abs(pos.x - tx) < 30 && Math.abs(pos.y - (tY + 10)) < 16) {
-                    settingsData[t.key] = !settingsData[t.key];
-                    saveSettingsData(); // single click, fine to save immediately
-                    return;
-                }
-            }
 
             // FPS Cap segments
-            const fpsRowY = gameY + 46 + stToggles.length * 44;
+            const fpsRowY = gameY + 46;
             const segW = 56, segH = 28, segGap = 4;
             const segTotalW = FPS_OPTIONS.length * segW + (FPS_OPTIONS.length - 1) * segGap;
             const segStartX = leftX + sliderW - segTotalW;
@@ -1246,7 +1220,7 @@ export function menuScene(k, params = {}) {
             }
 
             // Reset Progress
-            const dataY = gameY + 46 + stToggles.length * 44 + 44 + 24;
+            const dataY = gameY + 46 + 44 + 24;
             if (Math.abs(pos.x - stCx) < 120 && Math.abs(pos.y - (dataY + 56)) < 20) {
                 if (confirm("Reset all progress? This cannot be undone.")) {
                     resetProgress();
