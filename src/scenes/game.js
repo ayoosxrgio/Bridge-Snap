@@ -132,9 +132,9 @@ export function gameScene(k, { levelIdx }) {
     // double-click reveal.
     const upgradesUnlocked = levelIdx > 0;
 
-    // Kick off the tutorial on the first two levels. Suppress the hint sticky
+    // Kick off the tutorial on the first three levels. Suppress the hint sticky
     // note during the walkthrough so it doesn't compete with the popup.
-    if (levelIdx === 0 || levelIdx === 1) {
+    if (levelIdx === 0 || levelIdx === 1 || levelIdx === 2) {
         state.tutorialActive = true;
         state.hintOpen = false;
     }
@@ -1136,10 +1136,11 @@ export function gameScene(k, { levelIdx }) {
         // perform the action the tutorial is asking for.
         if (state.tutorialActive) {
             const tStep = TUTORIAL_STEPS[state.tutorialStep];
-            const tgt = tStep ? getTutorialTarget(tStep.key) : null;
-            const inTarget = tgt &&
-                pos.x >= tgt.x && pos.x <= tgt.x + tgt.w &&
-                pos.y >= tgt.y && pos.y <= tgt.y + tgt.h;
+            const tgtRaw = tStep ? getTutorialTarget(tStep.key) : null;
+            const tgts = Array.isArray(tgtRaw) ? tgtRaw : (tgtRaw ? [tgtRaw] : []);
+            const inTarget = tgts.some(t =>
+                pos.x >= t.x && pos.x <= t.x + t.w &&
+                pos.y >= t.y && pos.y <= t.y + t.h);
             const passthrough = tStep && tStep.awaitExpand &&
                 state.tutorialTyped >= tStep.text.length && inTarget;
             if (!passthrough) {
@@ -4639,27 +4640,28 @@ export function gameScene(k, { levelIdx }) {
     // slot before advancing — used to teach the tier-2 reveal on level 2.
     const TUTORIAL_STEPS_BY_LEVEL = {
         0: [
-            { key: "budget", title: "BUDGET",  text: "You've got $7,000 to spend. Every piece you place costs money — stay under budget or it won't count." },
+            { key: "budget", title: "BUDGET",  text: "You've got $7,000 to spend. Every piece you place costs money. Stay under budget or it won't count." },
             { key: "road",   title: "ROAD",    text: "Vehicles drive on the ROAD. Drop planks along the top of your bridge, anchor to anchor." },
             { key: "beam",   title: "SUPPORT", text: "BEAMS hold the road up from below. Cars can't drive on them, but without support the road will sag and snap." },
-            { key: "tools",  title: "TOOLS",   text: "Your tools live up here. Poke around — each one does something useful." },
-            { key: "help",   title: "STUCK?",  text: "Tap the hanging sign for help. The question mark shows a quick hint. The robot opens an AI tutor — learn the engineering alongside it as it aids your build." },
+            { key: "tools",  title: "TOOLS",   text: "Your tools live up here. Poke around. Each one does something useful." },
+            { key: "help",   title: "STUCK?",  text: "Tap the hanging sign for help. The question mark shows a quick hint. The robot opens an AI tutor that teaches engineering alongside your build." },
             { key: "goal",   title: "THE GOAL", text: "The car starts on the left and needs to reach the flag on the right. Get it across the gap safely." },
             { key: "play",   title: "PLAY",    text: "Ready? Hit the play button to run the simulation. If the car makes it across, you win." },
         ],
         1: [
-            { key: "pier",      title: "THE PIER",      text: "A stone rock pokes out of the water in the middle of the gap — use it as a PIER. Splitting one long span into two shorter ones makes each half far easier to hold up." },
-            { key: "vehicle",   title: "HEAVIER LOAD",  text: "This time a JEEP crosses, not a car — heavier than what you've handled before. Wood alone may snap; you'll want stronger materials in key spots." },
-            { key: "betterRoad", title: "STRONGER ROAD", text: "Each material has a stronger TIER 2 version. DOUBLE-CLICK the road slot to reveal the STONE ROAD — heavier, more expensive, but holds up under load.", awaitExpand: "wood_road" },
-            { key: "betterBeam", title: "STRONGER BEAM", text: "Same trick on the beam — DOUBLE-CLICK the beam slot to reveal the STEEL BEAM. Pricier, but it bends a lot less under stress.", awaitExpand: "wood_beam" },
-            { key: "mix",       title: "MIX & MATCH",   text: "Use the upgrades only where the load is heaviest — wood elsewhere. The little + badge on each slot reminds you the upgrade is there." },
+            { key: "pier",      title: "THE PIER",      text: "A stone rock pokes out of the water in the middle of the gap. Use it as a PIER. Splitting one long span into two shorter ones makes each half far easier to hold up." },
+            { key: "vehicle",   title: "HEAVIER LOAD",  text: "This time a JEEP crosses, not a car. Heavier than what you've handled before, so wood alone may snap. You'll want stronger materials in key spots." },
+            { key: "betterRoad", title: "STRONGER ROAD", text: "Each material has a stronger TIER 2 version. DOUBLE-CLICK the road slot to reveal the STONE ROAD. Heavier, more expensive, but holds up under load.", awaitExpand: "wood_road" },
+            { key: "betterBeam", title: "STRONGER BEAM", text: "Same trick on the beam. DOUBLE-CLICK the beam slot to reveal the STEEL BEAM. Pricier, but it bends a lot less under stress.", awaitExpand: "wood_beam" },
+            { key: "mix",       title: "MIX & MATCH",   text: "Use the upgrades only where the load is heaviest. Wood elsewhere. The little + badge on each slot reminds you the upgrade is there." },
             { key: "play",      title: "BUILD & PLAY",  text: "Build the road across using the rock pier, triangulate underneath with beams, then hit PLAY." },
         ],
         2: [
-            { key: "towerAnchor", title: "TOWER ANCHORS",   text: "Those tall steel towers on each cliff have anchor points at the top. This level needs ROPE — a tension-only material that pulls but can never push." },
-            { key: "ropeSlot",    title: "ROPE MATERIAL",   text: "ROPE is the third slot in your toolbar. Hang it from the tower tops down to the road deck so it holds the bridge from above. DOUBLE-CLICK the rope slot to reveal STEEL CABLE — stronger but pricier.", awaitExpand: "rope" },
-            { key: "ropeCount",   title: "4 ROPES MINIMUM", text: "This bridge needs at least 4 rope (or cable) segments before you can simulate. More rope = more load sharing. Spread them evenly along the span." },
-            { key: "play",        title: "BUILD & PLAY",    text: "Lay wood road across, hang it with rope from the towers, brace below with beams — then hit PLAY. A camper van is heavy, so make the ropes count!" },
+            { key: "towerAnchor", title: "NEW ANCHORS",  text: "Two new anchors up top, one on each tower. Hook into them just like the cliff edges." },
+            { key: "ropeSlot",    title: "ROPE TOOL",    text: "Meet ROPE, your new third slot. It only pulls, never pushes. Drop it from a tower down to the road. Double-click for STEEL CABLE if you want tougher.", awaitExpand: "rope" },
+            { key: "vehicle",     title: "HEAVY RV",     text: "An RV is rolling up. Heaviest thing yet. Wood and beams alone won't cut it. Lean on those towers." },
+            { key: "creative",    title: "GET CREATIVE", text: "No single right answer here. Hang the road from above, brace it from below, mix and match. Go nuts." },
+            { key: "play",        title: "BUILD & PLAY", text: "Towers up top, rope coming down, road across, beams underneath. Once it looks RV-proof, hit PLAY." },
         ],
     };
     const TUTORIAL_STEPS = TUTORIAL_STEPS_BY_LEVEL[levelIdx] || [];
@@ -4687,16 +4689,18 @@ export function gameScene(k, { levelIdx }) {
             };
         }
         if (key === "help") {
-            // Spotlight covers both buttons AND the ropes connecting them to
-            // the toolbar, with extra padding so the swing of the sign and
-            // both ropes always sit comfortably inside the highlight.
-            const ropeTopY = padH;
+            // Spotlight the hanging sign itself + a bit of the rope above so
+            // the player can see what's holding it up. We start the ring a
+            // short way below the toolbar instead of right at it, so the
+            // highlight reads as "look down here at the sign", not "look up
+            // at the toolbar".
+            const signTopY    = tb.aiBtn.y - 14;
             const signBottomY = tb.aiBtn.y + tb.aiBtn.h;
             return {
                 x: tb.aiBtn.x - 22,
-                y: ropeTopY - 8,
+                y: signTopY,
                 w: (tb.hintBtn.x + tb.hintBtn.w) - tb.aiBtn.x + 44,
-                h: signBottomY - ropeTopY + 20,
+                h: (signBottomY - signTopY) + 20,
             };
         }
         if (key === "goal") {
@@ -4739,12 +4743,26 @@ export function gameScene(k, { levelIdx }) {
         }
         // ── Level 3 specific targets ────────────────────────
         if (key === "towerAnchor") {
-            const towerNode = state.nodes.find(n => n.fixed && !n.builtin && n.x === lX && n.y < lY);
-            if (towerNode) {
-                const p = toScreen(towerNode.x, towerNode.y);
-                return { x: p.x - 50, y: p.y - 30, w: 100, h: (toScreen(lX, lY).y - p.y) + 60 };
-            }
-            return { x: 0, y: H * 0.05, w: 160, h: H * 0.6 };
+            // Two narrow spotlights, one per tower beam. The towers don't
+            // sit exactly at lX/rX (the level config offsets them by ±36),
+            // so we just take the tallest fixed non-builtin node on each
+            // side of midX. Each rect hugs the steel mast from its anchor
+            // top down to road level.
+            const above = state.nodes.filter(n => n.fixed && !n.builtin && n.y < Math.min(lY, rY));
+            const left  = above.filter(n => n.x <  midX).sort((a, b) => a.y - b.y)[0];
+            const right = above.filter(n => n.x >= midX).sort((a, b) => a.y - b.y)[0];
+            const beamRect = (top, baseWY) => {
+                const p = toScreen(top.x, top.y);
+                const baseY = toScreen(top.x, baseWY).y;
+                const w = 56;
+                return { x: p.x - w / 2, y: p.y - 18, w, h: (baseY - p.y) + 18 };
+            };
+            const rects = [];
+            if (left)  rects.push(beamRect(left,  lY));
+            if (right) rects.push(beamRect(right, rY));
+            if (rects.length === 2) return rects;
+            if (rects.length === 1) return rects[0];
+            return { x: 0, y: H * 0.05, w: W, h: H * 0.6 };
         }
         if (key === "ropeSlot") {
             const ropeIdx = (lvlDef.materials || []).indexOf("rope");
@@ -4755,6 +4773,29 @@ export function gameScene(k, { levelIdx }) {
         }
         if (key === "ropeCount") {
             return { x: W * 0.1, y: H * 0.05, w: W * 0.8, h: H * 0.8 };
+        }
+        if (key === "creative") {
+            // Spotlight the entire build area: from the tower tops down to
+            // the waterline, framed by the two cliff anchors. Use the
+            // tallest fixed node on each side of midX (towers don't sit
+            // exactly at lX/rX); fall back to a centered region if neither
+            // exists.
+            const above = state.nodes.filter(n => n.fixed && !n.builtin && n.y < Math.min(lY, rY));
+            const lTop  = above.filter(n => n.x <  midX).sort((a, b) => a.y - b.y)[0];
+            const rTop  = above.filter(n => n.x >= midX).sort((a, b) => a.y - b.y)[0];
+            const topY = lTop && rTop
+                ? Math.min(toScreen(lTop.x, lTop.y).y, toScreen(rTop.x, rTop.y).y) - 30
+                : H * 0.15;
+            const botY = toScreen(lX, Math.max(lY, rY)).y + 80;
+            // Extend horizontally past the cliff edges so the RV on the
+            // left approach AND the goal flag on the right approach both
+            // sit inside the highlight. Vehicle starts at lX + vStartX
+            // (default -55, level 3 uses -110); flag is at rX + 80.
+            const leftPad  = Math.abs(lvlDef.vStartXOffset ?? -55) + 60;
+            const rightPad = 80 + 60;
+            const leftX  = toScreen(lX - leftPad,  lY).x;
+            const rightX = toScreen(rX + rightPad, rY).x;
+            return { x: leftX, y: topY, w: rightX - leftX, h: botY - topY };
         }
         return { x: 0, y: 0, w: W, h: H };
     }
@@ -4811,35 +4852,66 @@ export function gameScene(k, { levelIdx }) {
             typingDone = false;
         }
 
-        // ─── Dim backdrop with a cutout around the target rect ───
-        // Four rects around the spotlight leave a clean "hole" instead of
-        // needing a compositing mask.
-        const tgt = getTutorialTarget(step.key);
+        // ─── Dim backdrop with cutouts around the target rect(s) ───
+        // Supports either a single rect or an array of rects (e.g. one per
+        // tower on level 3). We dim the union bounding box's exterior with
+        // four bands, then for multi-rect targets paint dim back over the
+        // gap regions inside the union that aren't covered by any rect.
+        const tgtRaw = getTutorialTarget(step.key);
+        const tgts = Array.isArray(tgtRaw) ? tgtRaw : [tgtRaw];
         const dim = "#010101";
         const dimA = 0.55;
-        // Top
-        k.drawRect({ pos: k.vec2(0, 0), width: W, height: Math.max(0, tgt.y), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
-        // Bottom
-        k.drawRect({ pos: k.vec2(0, tgt.y + tgt.h), width: W, height: Math.max(0, H - (tgt.y + tgt.h)), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
-        // Left
-        k.drawRect({ pos: k.vec2(0, tgt.y), width: Math.max(0, tgt.x), height: tgt.h, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
-        // Right
-        k.drawRect({ pos: k.vec2(tgt.x + tgt.w, tgt.y), width: Math.max(0, W - (tgt.x + tgt.w)), height: tgt.h, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        const minX = Math.min(...tgts.map(r => r.x));
+        const minY = Math.min(...tgts.map(r => r.y));
+        const maxX = Math.max(...tgts.map(r => r.x + r.w));
+        const maxY = Math.max(...tgts.map(r => r.y + r.h));
+        // Outer four bands
+        k.drawRect({ pos: k.vec2(0, 0), width: W, height: Math.max(0, minY), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(0, maxY), width: W, height: Math.max(0, H - maxY), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(0, minY), width: Math.max(0, minX), height: maxY - minY, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(maxX, minY), width: Math.max(0, W - maxX), height: maxY - minY, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        // For multi-rect targets, dim the inside-union gaps too. We sort
+        // the rects left-to-right and dim the horizontal gaps between
+        // each adjacent pair plus any top/bottom slack against the union.
+        if (tgts.length > 1) {
+            const sorted = [...tgts].sort((a, b) => a.x - b.x);
+            for (let i = 0; i < sorted.length; i++) {
+                const r = sorted[i];
+                if (r.y > minY) {
+                    k.drawRect({ pos: k.vec2(r.x, minY), width: r.w, height: r.y - minY, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+                }
+                if (r.y + r.h < maxY) {
+                    k.drawRect({ pos: k.vec2(r.x, r.y + r.h), width: r.w, height: maxY - (r.y + r.h), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+                }
+                if (i < sorted.length - 1) {
+                    const next = sorted[i + 1];
+                    const gapX = r.x + r.w;
+                    const gapW = next.x - gapX;
+                    if (gapW > 0) {
+                        k.drawRect({ pos: k.vec2(gapX, minY), width: gapW, height: maxY - minY, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+                    }
+                }
+            }
+        }
 
-        // Pulsing highlight ring around the spotlight so the eye locks onto it.
+        // Pulsing highlight ring around each spotlight rect.
         const ringPulse = 0.5 + 0.5 * Math.sin(t * 4);
         const ringCol = "#ffd479";
-        for (let ring = 3; ring >= 1; ring--) {
-            k.drawRect({
-                pos: k.vec2(tgt.x - ring, tgt.y - ring),
-                width: tgt.w + ring * 2, height: tgt.h + ring * 2,
-                fill: false,
-                outline: { width: 2, color: k.Color.fromHex(ringCol) },
-                opacity: (0.3 + 0.35 * ringPulse) * (ring === 1 ? 1 : 0.35 / ring),
-                anchor: "topleft",
-                radius: 4,
-            });
+        for (const r of tgts) {
+            for (let ring = 3; ring >= 1; ring--) {
+                k.drawRect({
+                    pos: k.vec2(r.x - ring, r.y - ring),
+                    width: r.w + ring * 2, height: r.h + ring * 2,
+                    fill: false,
+                    outline: { width: 2, color: k.Color.fromHex(ringCol) },
+                    opacity: (0.3 + 0.35 * ringPulse) * (ring === 1 ? 1 : 0.35 / ring),
+                    anchor: "topleft",
+                    radius: 4,
+                });
+            }
         }
+        // Use the union bounding box for panel placement below.
+        const tgt = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 
         // ─── Text panel — opposite side of the spotlight ───
         // If the target sits in the top half, drop the panel to the bottom;

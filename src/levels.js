@@ -71,7 +71,7 @@ export const LEVELS = [
         vStartXOffset: -110,
         multiVehicle: null,
         materials: ["wood_road", "wood_beam", "rope"],
-        hint:     "The gap is too long for beams alone — the tall anchors above each cliff are for ROPE. Hang the road from above using at least 4 rope segments, then brace with wood beams underneath.",
+        hint:     "The gap is too long for beams alone — the tall anchors above each cliff are for rope. Hang the road from the towers, then brace with wood beams underneath.",
         lesson:   "Rope works only in TENSION — it pulls, never pushes. A suspension bridge hangs the deck from ropes or cables anchored high above. Once slack, rope does nothing — keep it taut!",
     },
     {
