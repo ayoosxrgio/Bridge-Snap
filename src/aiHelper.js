@@ -1,13 +1,33 @@
 import { MATERIALS, GRID } from "./constants.js";
 
-let apiKey = import.meta.env.VITE_OPENAI_API_KEY || null;
+let _requestId = 0;
+function portalAIRequest(payload) {
+    return new Promise((resolve, reject) => {
+        const requestId = ++_requestId;
 
-export function setApiKey(key) {
-    apiKey = key;
-}
+        function handler(event) {
+            const d = event.data;
+            if (d?.source === "bridge-snap" && d?.requestId === requestId) {
+                window.removeEventListener("message", handler);
+                if (d.error) reject(new Error(d.error));
+                else resolve(d.payload);
+            }
+        }
 
-export function getApiKey() {
-    return apiKey;
+        window.addEventListener("message", handler);
+        window.parent.postMessage({
+            source: "bridge-snap",
+            type: "PORTAL_AI_REQUEST",
+            requestId,
+            payload,
+        }, "*");
+
+        // GPT-4o on long prompts can take a while; give the portal time to respond.
+        setTimeout(() => {
+            window.removeEventListener("message", handler);
+            reject(new Error("AI request timed out"));
+        }, 60000);
+    });
 }
 
 // Build a Socratic-tutor prompt. The model returns a step-by-step lesson
@@ -324,39 +344,26 @@ function ensureRoadContinuity(result, lvl, lvlDef) {
     }
 }
 
-// Fetch a lesson from OpenAI. Returns `{ concept, steps, summary }` on success,
-// `{ error }` on failure.
+// Fetch a lesson from OpenAI via the portal proxy. Returns
+// `{ concept, steps, summary }` on success, `{ error }` on failure.
 export async function solveBridge(lvl, lvlDef) {
-    if (!apiKey) {
-        return { error: "No API key set. Click the key icon to enter your OpenAI API key." };
+    if (window.parent === window) {
+        return { error: "AI tutor requires the web portal." };
     }
 
     try {
         const prompt = buildPrompt(lvl, lvlDef);
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify({
-                model: "gpt-4o",               // full 4o — spatial reasoning matters here
-                max_tokens: 3500,
-                // Bumped for variety — the spatial-reasoning rules in the
-                // prompt keep geometry stable; this temp lets question angles
-                // and archetype choices vary across runs of the same level.
-                temperature: 0.7,
-                response_format: { type: "json_object" },
-                messages: [{ role: "user", content: prompt }],
-            }),
+        const data = await portalAIRequest({
+            model: "gpt-4o",               // full 4o — spatial reasoning matters here
+            max_tokens: 3500,
+            // Bumped for variety — the spatial-reasoning rules in the
+            // prompt keep geometry stable; this temp lets question angles
+            // and archetype choices vary across runs of the same level.
+            temperature: 0.7,
+            response_format: { type: "json_object" },
+            messages: [{ role: "user", content: prompt }],
         });
 
-        if (!response.ok) {
-            const errText = await response.text();
-            return { error: `API error (${response.status}): ${errText.slice(0, 200)}` };
-        }
-
-        const data = await response.json();
         const text = data.choices?.[0]?.message?.content || "";
 
         // json_object mode returns pure JSON; still handle fenced fallback for robustness

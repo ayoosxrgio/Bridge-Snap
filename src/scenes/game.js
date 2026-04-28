@@ -1,7 +1,7 @@
 import { C, GRID, MATERIALS, MATERIAL_UPGRADES, VEHICLES, WORLD_MID_Y, ANCHOR_L_X, PAD_X } from "../constants.js";
 import { LEVELS } from "../levels.js";
 import { Node, Member, Spark, snapToGrid, distToSegment, isConnectedToAnchor, calcCost, physicsTick, vehicleTick, initPhysicsWorld, destroyPhysicsWorld } from "../physics.js";
-import { solveBridge, setApiKey, getApiKey } from "../aiHelper.js";
+import { solveBridge } from "../aiHelper.js";
 import { completeLevel, getCompleted } from "../progression.js";
 import { onLevelStart, onBridgeFailed, onBridgeSuccess, onLevelComplete, onHintRequest, onRecapRequest } from "../assistantBridge.js";
 
@@ -2393,12 +2393,6 @@ export function gameScene(k, { levelIdx }) {
             };
             onRecapRequest();
             return;
-        }
-
-        if (!getApiKey()) {
-            const key = prompt("Enter your OpenAI API key:");
-            if (key) setApiKey(key.trim());
-            else return;
         }
 
         if (state.aiLoading) return;
