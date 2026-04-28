@@ -2740,12 +2740,14 @@ export function gameScene(k, { levelIdx }) {
     ];
     let bgScroll = 0;
 
+    const BASE = import.meta.env.BASE_URL;
+
     // Load background sprites for this level's set
     try {
-        k.loadSprite(`bg_${levelIdx}_1`, `/assets/backgrounds/${bgSet}/1.png`);
-        k.loadSprite(`bg_${levelIdx}_2`, `/assets/backgrounds/${bgSet}/2.png`);
-        k.loadSprite(`bg_${levelIdx}_3`, `/assets/backgrounds/${bgSet}/3.png`);
-        k.loadSprite(`bg_${levelIdx}_4`, `/assets/backgrounds/${bgSet}/4.png`);
+        k.loadSprite(`bg_${levelIdx}_1`, `${BASE}assets/backgrounds/${bgSet}/1.png`);
+        k.loadSprite(`bg_${levelIdx}_2`, `${BASE}assets/backgrounds/${bgSet}/2.png`);
+        k.loadSprite(`bg_${levelIdx}_3`, `${BASE}assets/backgrounds/${bgSet}/3.png`);
+        k.loadSprite(`bg_${levelIdx}_4`, `${BASE}assets/backgrounds/${bgSet}/4.png`);
     } catch(e) {
         console.warn("Could not load background sprites:", e);
     }
@@ -2753,9 +2755,9 @@ export function gameScene(k, { levelIdx }) {
     // Load water sprites
     let waterLoaded = false;
     try {
-        k.loadSprite("water_tile", "/assets/Water/Full colour/PNGs/Water Tile.png", { sliceX: 32 });
-        k.loadSprite("fish", "/assets/Water/Fish/PNGs/Fish Swimming.png", { sliceX: 10 });
-        k.loadSprite("splash", "/assets/Water/Splash Effect/PNG/Splash Effect.png", { sliceX: 18 });
+        k.loadSprite("water_tile", `${BASE}assets/Water/Full colour/PNGs/Water Tile.png`, { sliceX: 32 });
+        k.loadSprite("fish", `${BASE}assets/Water/Fish/PNGs/Fish Swimming.png`, { sliceX: 10 });
+        k.loadSprite("splash", `${BASE}assets/Water/Splash Effect/PNG/Splash Effect.png`, { sliceX: 18 });
         waterLoaded = true;
     } catch(e) {
         console.warn("Could not load water sprites:", e);
