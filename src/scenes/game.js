@@ -2544,6 +2544,12 @@ export function gameScene(k, { levelIdx }) {
                         }
                     }
 
+                    // Tell vehicleTick where the bottom of the visible canvas
+                    // is in WORLD coords so it can fire fail the moment a
+                    // falling/sinking vehicle leaves the screen, instead of
+                    // waiting for the legacy y > 1100 hard-stop.
+                    lvl._screenBottomY = toWorld(0, k.height()).y;
+
                     const result = vehicleTick(state, lvl, lvlDef);
                     if (result === "win") endGame(true);
                     else if (result === "fail") endGame(false);

@@ -534,7 +534,15 @@ export function vehicleTick(state, lvl, lvlDef) {
             }
         }
 
-        if (v.y > 1100) { v.active = false; return "fail"; }
+        // Fail when the vehicle has dropped past the bottom of the visible
+        // canvas — let the player watch the full fall animation, then pop
+        // the modal as soon as the car is off-screen. We compare in world
+        // coords using the level's bottom-of-screen Y if the caller passed
+        // it via lvl._screenBottomY (game.js refreshes it each tick).
+        const failY = (lvl._screenBottomY ?? 0) + 40;
+        if (failY > 0 && v.y > failY) { v.active = false; return "fail"; }
+        // Legacy hard-stop in case _screenBottomY isn't wired up.
+        if (v.y > 1400) { v.active = false; return "fail"; }
         if (v.x > lvl.rX + 80 && v.y < lvl.rY + 60 && Math.abs(v.vy) < 3) v.finished = true;
     }
 
