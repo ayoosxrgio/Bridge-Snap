@@ -1,12 +1,50 @@
-import { C, GRID, MATERIALS, MATERIAL_UPGRADES, VEHICLES, WORLD_MID_Y, ANCHOR_L_X, PAD_X } from "../constants.js";
+import { C, GRID, MATERIALS, MATERIAL_UPGRADES, VEHICLES, WORLD_MID_Y, ANCHOR_L_X, PAD_X, FLAG_INLAND_R, FLAG_INLAND_L, MULTI_FINISH_PAST_FLAG } from "../constants.js";
 import { LEVELS } from "../levels.js";
-import { Node, Member, Spark, snapToGrid, distToSegment, isConnectedToAnchor, calcCost, physicsTick, vehicleTick, initPhysicsWorld, destroyPhysicsWorld } from "../physics.js";
+import { Node, Member, Spark, snapToGrid, distToSegment, distToSegmentSq, isConnectedToAnchor, calcCost, physicsTick, vehicleTick, initPhysicsWorld, destroyPhysicsWorld } from "../physics.js";
 import { solveBridge } from "../aiHelper.js";
 import { completeLevel, getCompleted } from "../progression.js";
 import { onLevelStart, onBridgeFailed, onBridgeSuccess, onLevelComplete, onHintRequest, onRecapRequest } from "../assistantBridge.js";
+import { submitScore, getLeaderboard } from "../leaderboard.js";
 
 export function gameScene(k, { levelIdx }) {
     const lvlDef = LEVELS[levelIdx];
+
+    // ─── Palette ─────────────────────────────────────
+    // Used by SNAP! popup, FINISH text, and the floating car-label letters.
+    // Hoisted near the top of the scene so initialization-time helpers can
+    // safely read from it before any of the draw fns reference it.
+    const SNAP_COLORS = ["#e05080","#50a0e0","#e0c030","#50c060","#e07030","#a060d0"];
+
+    // ─── Color cache ─────────────────────────────────
+    // k.Color.fromHex allocates a new object on every call. The render path
+    // calls it 200+ times per frame for the same handful of hex strings,
+    // which churns the GC on slower laptops. Cache by hex so repeats reuse
+    // the same Color instance — Kaplay treats Color as immutable internally,
+    // so sharing references is safe.
+    const _colorCache = new Map();
+    const _kColorFromHex = k.Color.fromHex.bind(k.Color);
+    const colorOf = (hex) => {
+        let c = _colorCache.get(hex);
+        if (!c) { c = _kColorFromHex(hex); _colorCache.set(hex, c); }
+        return c;
+    };
+
+    // In-place array compaction: runs the visit fn on every element, drops
+    // the ones for which it returns falsy, and keeps the rest. Avoids the
+    // per-frame allocation of Array.prototype.filter, which churns the GC
+    // when called several times per tick on long-lived effect arrays
+    // (particles, splashes, confetti, popups).
+    const compactInPlace = (arr, visit) => {
+        let w = 0;
+        for (let r = 0; r < arr.length; r++) {
+            const item = arr[r];
+            if (visit(item)) {
+                if (w !== r) arr[w] = item;
+                w++;
+            }
+        }
+        if (w !== arr.length) arr.length = w;
+    };
 
     // ─── Camera / coordinate system ─────────────────
     const lX = ANCHOR_L_X;
@@ -32,9 +70,28 @@ export function gameScene(k, { levelIdx }) {
     }
 
     // ─── Game state ─────────────────────────────────
+    // Persisted UI prefs (sidebar toggles + fpsCap). Read once at scene
+    // construction; individual toggles persist by re-reading and merging
+    // before save so other settings written elsewhere aren't clobbered.
+    const _userPrefs = (() => {
+        try { return JSON.parse(localStorage.getItem("bridgesnap_settings")) || {}; }
+        catch { return {}; }
+    })();
+
     const state = {
         mode: "build",       // build | sim | end
         delMode: false,
+        // ── Sidebar toggles (persisted) ───────────────────
+        // Default true for all three so first-time players see the full
+        // tutorial-friendly layout. Player can opt out via the bottom-left
+        // sidebar; their choice is saved across sessions.
+        showGrid:   _userPrefs.showGrid    !== false,
+        snapGrid:   _userPrefs.snapGrid    !== false,
+        showStress: _userPrefs.showStress  !== false,
+        // Sidebar slide-out animation. Driven entirely by mode now (open
+        // in build, closed in sim/end) — no manual toggle. Initialized to
+        // 1 since we open in build mode by default.
+        sidebarOpenT: 1,
         simSpeed: 1,
         selectedMat: (lvlDef.materials || Object.keys(MATERIALS))[0],
         nodes: [],
@@ -106,7 +163,6 @@ export function gameScene(k, { levelIdx }) {
         snapPopups: [],
         snapConfetti: [],
         // Hover progress [0..1] for modal text buttons — animates the underline
-        modalBtnHover: { primary: 0, ai: 0, secondary: 0 },
         // Hover progress [0..1] per material icon — animates the zoom
         matHover: {},
         // Hover progress [0..1] per tool button — animates the zoom
@@ -159,16 +215,40 @@ export function gameScene(k, { levelIdx }) {
     // starts so the landing drop effect still plays.
     function initVehicles() {
         const ROAD_SURFACE = 5;                        // asphalt top sits above anchor by this much
-        const surfaceLeft = lY - ROAD_SURFACE;
+        const surfaceLeft  = lY - ROAD_SURFACE;
+        const surfaceRight = rY - ROAD_SURFACE;
         if (lvlDef.multiVehicle) {
-            state.vehicles = lvlDef.multiVehicle.map(mv => {
+            state.vehicles = lvlDef.multiVehicle.map((mv, i) => {
                 const base = VEHICLES[mv.vType];
-                const cfg = { ...base, color: mv.color, name: mv.label };
-                return { cfg, x: lX + mv.startXOffset, y: surfaceLeft - base.h * 0.5, active: true, finished: false, vy: 0, vx: base.speed, angle: 0, angVel: 0, wheelAngle: 0, label: mv.label };
+                const cfg = { ...base, color: mv.color || base.color, name: mv.label };
+                const dir = mv.dir || 1;                       // +1 right, −1 left
+                const startSide = mv.startSide || (dir < 0 ? "R" : "L");
+                const goalSide  = mv.goalSide  || (dir < 0 ? "L" : "R");
+                const offset = mv.startXOffset ?? (startSide === "R" ?  55 : -55);
+                const spawnX = startSide === "R" ? rX + offset : lX + offset;
+                const spawnY = (startSide === "R" ? surfaceRight : surfaceLeft) - base.h * 0.5;
+                return {
+                    cfg, x: spawnX, y: spawnY,
+                    active: true, finished: false,
+                    vy: 0, vx: dir * base.speed,
+                    angle: 0, angVel: 0, wheelAngle: 0,
+                    label: mv.label,
+                    _dir: dir,
+                    _goalSide: goalSide,
+                    _waitFor: typeof mv.startAfter === "number" ? mv.startAfter : null,
+                    _passOnly: !!mv.passOnly,    // drives past flag, finishes off-screen
+                    _passedFlag: false,
+                };
             });
         } else {
             const vcfg = VEHICLES[lvl.vType];
-            state.vehicles = [{ cfg: vcfg, x: lX + (lvlDef.vStartXOffset ?? -55), y: surfaceLeft - vcfg.h * 0.5, active: true, finished: false, vy: 0, vx: vcfg.speed, angle: 0, angVel: 0, wheelAngle: 0, label: null }];
+            state.vehicles = [{
+                cfg: vcfg, x: lX + (lvlDef.vStartXOffset ?? -55),
+                y: surfaceLeft - vcfg.h * 0.5,
+                active: true, finished: false,
+                vy: 0, vx: vcfg.speed, angle: 0, angVel: 0, wheelAngle: 0, label: null,
+                _dir: 1, _goalSide: "R", _waitFor: null,
+            }];
         }
     }
 
@@ -188,9 +268,30 @@ export function gameScene(k, { levelIdx }) {
         state.snapPopups = [];
         state.snapConfetti = [];
         initVehicles();
+        rerollLabelColors();
+    }
+
+    // Pick a fresh random color (from the SNAP / FINISH palette) for each
+    // floating car-label letter and for every character of every flag's
+    // FINISH text. Called on scene start AND on every reset so the colors
+    // shuffle each play attempt — the user wanted them random per play
+    // instead of cycling through the palette at runtime. SNAP_COLORS lives
+    // further down the scene file so we read it lazily via the closure.
+    function rerollLabelColors() {
+        const palette = SNAP_COLORS;
+        const pick = () => palette[Math.floor(Math.random() * palette.length)];
+        // Car letter color = the vehicle's own paint color (from VEHICLES).
+        // Floating letter above the car and the matching letter on the flag
+        // both pull from this list, so the pairing reads at a glance.
+        state._carLabelColors = state.vehicles.map(v => v.label ? v.cfg.color : null);
+        // Per-letter colors for the word "FINISH" on each flag — still random
+        // each play, drawn from the SNAP palette.
+        const slots = lvlDef.multiVehicle || [{ label: null }];
+        state._flagTextColors = slots.map(() => Array.from("FINISH", () => pick()));
     }
 
     initVehicles();
+    rerollLabelColors();
 
     // ─── Notify portal assistant of level start ─────
     onLevelStart(
@@ -355,7 +456,7 @@ export function gameScene(k, { levelIdx }) {
         for (let r = 0; r < rows; r++)
             for (let c = 0; c < cols; c++)
                 if (grid[r][c])
-                    k.drawRect({ pos: k.vec2(ox + c * pxSize, oy + r * pxSize), width: pxSize + 0.5, height: pxSize + 0.5, color: k.Color.fromHex(color), anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(ox + c * pxSize, oy + r * pxSize), width: pxSize + 0.5, height: pxSize + 0.5, color: colorOf(color), anchor: "topleft" });
     }
 
     // ─── Procedural icons (material-accurate shapes) ──
@@ -368,21 +469,21 @@ export function gameScene(k, { levelIdx }) {
 
     function drawPlankIcon(cx, cy, col) {
         const w = MAT_ICON_W, h = MAT_ICON_H;
-        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 });
-        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, fill: false, outline: { width: 1, color: k.Color.fromHex("#000000") }, anchor: "topleft", opacity: 0.4, radius: 1 });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: colorOf(col), anchor: "topleft", radius: 1 });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, fill: false, outline: { width: 1, color: colorOf("#000000") }, anchor: "topleft", opacity: 0.4, radius: 1 });
         // Vertical grain notches
         for (let i = 1; i <= 3; i++) {
             const x = cx - w/2 + i * w / 4;
-            k.drawLine({ p1: k.vec2(x, cy - h/2 + 1), p2: k.vec2(x, cy + h/2 - 1), width: 0.8, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+            k.drawLine({ p1: k.vec2(x, cy - h/2 + 1), p2: k.vec2(x, cy + h/2 - 1), width: 0.8, color: colorOf("#000000"), opacity: 0.28 });
         }
         // Top highlight
-        k.drawLine({ p1: k.vec2(cx - w/2 + 1, cy - h/2 + 0.5), p2: k.vec2(cx + w/2 - 1, cy - h/2 + 0.5), width: 0.8, color: k.Color.fromHex("#ffffff"), opacity: 0.25 });
+        k.drawLine({ p1: k.vec2(cx - w/2 + 1, cy - h/2 + 0.5), p2: k.vec2(cx + w/2 - 1, cy - h/2 + 0.5), width: 0.8, color: colorOf("#ffffff"), opacity: 0.25 });
     }
 
     function drawReinforcedPlankIcon(cx, cy, col) {
         drawPlankIcon(cx, cy - 2, col);
         // Red reinforcement stripe below the plank
-        k.drawRect({ pos: k.vec2(cx - MAT_ICON_W/2, cy + MAT_ICON_H/2 - 1), width: MAT_ICON_W, height: 3, color: k.Color.fromHex("#cc3333"), anchor: "topleft", radius: 1 });
+        k.drawRect({ pos: k.vec2(cx - MAT_ICON_W/2, cy + MAT_ICON_H/2 - 1), width: MAT_ICON_W, height: 3, color: colorOf("#cc3333"), anchor: "topleft", radius: 1 });
     }
 
     // Stone road shares the wood plank's exact silhouette — just rendered in
@@ -394,13 +495,13 @@ export function gameScene(k, { levelIdx }) {
     function drawBeamIcon(cx, cy, col) {
         // Horizontal timber with bolt dots at each end
         const w = MAT_ICON_W, h = MAT_ICON_H;
-        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 });
-        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, fill: false, outline: { width: 1, color: k.Color.fromHex("#000000") }, anchor: "topleft", opacity: 0.4, radius: 1 });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: colorOf(col), anchor: "topleft", radius: 1 });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, fill: false, outline: { width: 1, color: colorOf("#000000") }, anchor: "topleft", opacity: 0.4, radius: 1 });
         // Bolt dots at each end
-        k.drawCircle({ pos: k.vec2(cx - w/2 + 3, cy), radius: 1.4, color: k.Color.fromHex("#000000"), opacity: 0.55 });
-        k.drawCircle({ pos: k.vec2(cx + w/2 - 3, cy), radius: 1.4, color: k.Color.fromHex("#000000"), opacity: 0.55 });
+        k.drawCircle({ pos: k.vec2(cx - w/2 + 3, cy), radius: 1.4, color: colorOf("#000000"), opacity: 0.55 });
+        k.drawCircle({ pos: k.vec2(cx + w/2 - 3, cy), radius: 1.4, color: colorOf("#000000"), opacity: 0.55 });
         // Top highlight
-        k.drawLine({ p1: k.vec2(cx - w/2 + 1, cy - h/2 + 0.5), p2: k.vec2(cx + w/2 - 1, cy - h/2 + 0.5), width: 0.8, color: k.Color.fromHex("#ffffff"), opacity: 0.3 });
+        k.drawLine({ p1: k.vec2(cx - w/2 + 1, cy - h/2 + 0.5), p2: k.vec2(cx + w/2 - 1, cy - h/2 + 0.5), width: 0.8, color: colorOf("#ffffff"), opacity: 0.3 });
     }
 
     // Steel beam shares the wood beam's silhouette — just rendered in the
@@ -412,34 +513,34 @@ export function gameScene(k, { levelIdx }) {
     function drawRopeIcon(cx, cy, col) {
         const hw = MAT_ICON_W / 2;
         // Outline (same width ratio as cable)
-        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 4, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 4, color: colorOf("#000000"), opacity: 0.28 });
         // Rope body — one tick thicker than cable
-        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 2.8, color: k.Color.fromHex(col) });
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 2.8, color: colorOf(col) });
         // Tight braid marks — stay inside the line width so nothing sticks out
         for (let i = 1; i <= 6; i++) {
             const xc = cx - hw + MAT_ICON_W * i / 7;
-            k.drawLine({ p1: k.vec2(xc - 1, cy - 1), p2: k.vec2(xc + 1, cy + 1), width: 0.8, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+            k.drawLine({ p1: k.vec2(xc - 1, cy - 1), p2: k.vec2(xc + 1, cy + 1), width: 0.8, color: colorOf("#000000"), opacity: 0.28 });
         }
         // Nubs — same size as cable
-        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 2.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
-        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8, color: k.Color.fromHex(col) });
-        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 2.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
-        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 2.6, color: colorOf("#000000"), opacity: 0.28 });
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8, color: colorOf(col) });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 2.6, color: colorOf("#000000"), opacity: 0.28 });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8, color: colorOf(col) });
     }
 
     function drawCableIcon(cx, cy, col) {
         const hw = MAT_ICON_W / 2;
         // Outline
-        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 3.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 3.6, color: colorOf("#000000"), opacity: 0.28 });
         // Cable body
-        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 2.2, color: k.Color.fromHex(col) });
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: 2.2, color: colorOf(col) });
         // Highlight
-        k.drawLine({ p1: k.vec2(cx - hw + 1, cy - 0.7), p2: k.vec2(cx + hw - 1, cy - 0.7), width: 0.7, color: k.Color.fromHex("#ffffff"), opacity: 0.32 });
+        k.drawLine({ p1: k.vec2(cx - hw + 1, cy - 0.7), p2: k.vec2(cx + hw - 1, cy - 0.7), width: 0.7, color: colorOf("#ffffff"), opacity: 0.32 });
         // Nubs
-        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 2.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
-        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8, color: k.Color.fromHex(col) });
-        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 2.6, color: k.Color.fromHex("#000000"), opacity: 0.28 });
-        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 2.6, color: colorOf("#000000"), opacity: 0.28 });
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8, color: colorOf(col) });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 2.6, color: colorOf("#000000"), opacity: 0.28 });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8, color: colorOf(col) });
     }
 
     // ─── Tool icons (procedural, non-pixelated, generously sized) ──
@@ -448,10 +549,10 @@ export function gameScene(k, { levelIdx }) {
         // Tightened spread so its silhouette matches the other tool icons.
         const positions = [cx - 13, cx, cx + 13];
         const lw = 3;
-        k.drawLine({ p1: k.vec2(positions[0] + 4, cy), p2: k.vec2(positions[1] - 4, cy), width: lw, color: k.Color.fromHex(col) });
-        k.drawLine({ p1: k.vec2(positions[1] + 4, cy), p2: k.vec2(positions[2] - 4, cy), width: lw, color: k.Color.fromHex(col) });
+        k.drawLine({ p1: k.vec2(positions[0] + 4, cy), p2: k.vec2(positions[1] - 4, cy), width: lw, color: colorOf(col) });
+        k.drawLine({ p1: k.vec2(positions[1] + 4, cy), p2: k.vec2(positions[2] - 4, cy), width: lw, color: colorOf(col) });
         for (const px of positions) {
-            k.drawCircle({ pos: k.vec2(px, cy), radius: 3.6, color: k.Color.fromHex(col) });
+            k.drawCircle({ pos: k.vec2(px, cy), radius: 3.6, color: colorOf(col) });
         }
     }
 
@@ -465,18 +566,18 @@ export function gameScene(k, { levelIdx }) {
             const angle = Math.PI - (i / segs) * Math.PI;
             const x = cx + Math.cos(angle) * r;
             const y = baseY - Math.sin(angle) * r;
-            if (prev) k.drawLine({ p1: prev, p2: k.vec2(x, y), width: lw, color: k.Color.fromHex(col) });
+            if (prev) k.drawLine({ p1: prev, p2: k.vec2(x, y), width: lw, color: colorOf(col) });
             // Round cap at each vertex so the curve doesn't show gaps
-            k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: k.Color.fromHex(col) });
+            k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: colorOf(col) });
             prev = k.vec2(x, y);
         }
-        k.drawCircle({ pos: k.vec2(cx - r, baseY), radius: 3.8, color: k.Color.fromHex(col) });
-        k.drawCircle({ pos: k.vec2(cx + r, baseY), radius: 3.8, color: k.Color.fromHex(col) });
+        k.drawCircle({ pos: k.vec2(cx - r, baseY), radius: 3.8, color: colorOf(col) });
+        k.drawCircle({ pos: k.vec2(cx + r, baseY), radius: 3.8, color: colorOf(col) });
     }
 
     // Delete icon — bigger trash can, same line-art style as the other tools.
     function drawXIcon(cx, cy, col) {
-        const c = k.Color.fromHex(col);
+        const c = colorOf(col);
         const lw = 3;
         const w = 18, h = 20;
         const top = cy - h / 2 + 2;
@@ -503,7 +604,7 @@ export function gameScene(k, { levelIdx }) {
     // Vertices trace the outline clockwise from the tip. Kaplay handles the
     // triangulation internally.
     function drawSelectToolIcon(cx, cy, col) {
-        const c = k.Color.fromHex(col);
+        const c = colorOf(col);
         const ox = cx - 10, oy = cy - 12;
         k.drawPolygon({
             pts: [
@@ -532,9 +633,9 @@ export function gameScene(k, { levelIdx }) {
             const a = aStart + t * (aEnd - aStart);
             const x = cx + Math.cos(a) * r;
             const y = cy + ys * Math.sin(a) * r;
-            if (prev) k.drawLine({ p1: prev, p2: k.vec2(x, y), width: lw, color: k.Color.fromHex(col) });
+            if (prev) k.drawLine({ p1: prev, p2: k.vec2(x, y), width: lw, color: colorOf(col) });
             // Round cap at vertex — fills tiny gaps between line segments.
-            k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: k.Color.fromHex(col) });
+            k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: colorOf(col) });
             prev = k.vec2(x, y);
         }
         // Arrowhead at aEnd — tip points along the tangent direction of motion.
@@ -550,7 +651,7 @@ export function gameScene(k, { levelIdx }) {
             p1: k.vec2(ex + ux * headLen, ey + uy * headLen),           // tip
             p2: k.vec2(ex + px * headW,   ey + py * headW),             // left back
             p3: k.vec2(ex - px * headW,   ey - py * headW),             // right back
-            color: k.Color.fromHex(col),
+            color: colorOf(col),
         });
     }
 
@@ -570,7 +671,7 @@ export function gameScene(k, { levelIdx }) {
     // previous open-chevron look the user liked.
     function drawSpeedUpIcon(cx, cy, col) {
         const s = 8, gap = 4, lw = 3;
-        const c = k.Color.fromHex(col);
+        const c = colorOf(col);
         // First (inner) chevron
         const p1tip = k.vec2(cx - gap / 2, cy);
         k.drawLine({ p1: k.vec2(cx - s - gap / 2, cy - s), p2: p1tip, width: lw, color: c });
@@ -584,7 +685,7 @@ export function gameScene(k, { levelIdx }) {
     // Mirror — "<<".
     function drawSpeedDownIcon(cx, cy, col) {
         const s = 8, gap = 4, lw = 3;
-        const c = k.Color.fromHex(col);
+        const c = colorOf(col);
         // First (inner) chevron
         const p1tip = k.vec2(cx + gap / 2, cy);
         k.drawLine({ p1: k.vec2(cx + s + gap / 2, cy - s), p2: p1tip, width: lw, color: c });
@@ -618,7 +719,7 @@ export function gameScene(k, { levelIdx }) {
         const totalW = text.length * charW * pxSize + (text.length - 1) * charGap * pxSize;
         let x = cx - totalW / 2;
         const y = cy - (charH * pxSize) / 2;
-        const c = k.Color.fromHex(col);
+        const c = colorOf(col);
         for (const ch of text) {
             const grid = PIXEL_FONT[ch];
             if (grid) {
@@ -646,8 +747,90 @@ export function gameScene(k, { levelIdx }) {
     function drawMenuIcon(cx, cy, col) {
         const w = 20, lw = 3, rowGap = 7;
         for (let i = -1; i <= 1; i++) {
-            k.drawLine({ p1: k.vec2(cx - w/2, cy + i * rowGap), p2: k.vec2(cx + w/2, cy + i * rowGap), width: lw, color: k.Color.fromHex(col) });
+            k.drawLine({ p1: k.vec2(cx - w/2, cy + i * rowGap), p2: k.vec2(cx + w/2, cy + i * rowGap), width: lw, color: colorOf(col) });
         }
+    }
+
+    // ─── Sidebar toggle icons ─────────────────────────
+    // Drawn in the same line-art language as the toolbar tools (single color
+    // silhouettes so the active outline pass in drawToolIconBtn reads cleanly).
+    // Sized for the larger signpost plates so they read at a glance — bumped
+    // ~1.4× from the toolbar tools' default scale.
+    function drawGridIcon(cx, cy, col) {
+        const c = colorOf(col);
+        const half = 14;
+        const lw = 2.2;
+        // 3×3 grid: 4 horizontals + 4 verticals
+        for (let i = 0; i <= 3; i++) {
+            const t = -half + (i / 3) * (half * 2);
+            k.drawLine({ p1: k.vec2(cx - half, cy + t), p2: k.vec2(cx + half, cy + t), width: lw, color: c });
+            k.drawLine({ p1: k.vec2(cx + t, cy - half), p2: k.vec2(cx + t, cy + half), width: lw, color: c });
+        }
+    }
+
+    // Snap icon: a clean, solid padlock. No grid behind — the lock alone
+    // reads as "snap is locked", and the active outline reinforces state.
+    function drawSnapIcon(cx, cy, col) {
+        const c = colorOf(col);
+        // Body — sized to roughly match the grid icon's footprint so the
+        // three sidebar icons feel visually balanced.
+        const bodyW = 22, bodyH = 17;
+        const bodyTop = cy - 2;
+        k.drawRect({
+            pos: k.vec2(cx - bodyW / 2, bodyTop),
+            width: bodyW, height: bodyH,
+            color: c, anchor: "topleft", radius: 2.4,
+        });
+        // Shackle — thick U arc above the body. Drawn as a chain of segments
+        // with round caps so the curve stays solid at thickness.
+        const shackleR = 7.2;
+        const shackleY = bodyTop;
+        const lw = 3;
+        let prev = null;
+        const segs = 22;
+        for (let i = 0; i <= segs; i++) {
+            const a = Math.PI + (i / segs) * Math.PI;
+            const x = cx + Math.cos(a) * shackleR;
+            const y = shackleY + Math.sin(a) * shackleR;
+            if (prev) k.drawLine({ p1: prev, p2: k.vec2(x, y), width: lw, color: c });
+            k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: c });
+            prev = k.vec2(x, y);
+        }
+        // Keyhole punched into the body — a circle + downward stem in the
+        // outline color, so it reads as a hole regardless of icon state.
+        const khColor = colorOf("#3a2110");
+        k.drawCircle({ pos: k.vec2(cx, bodyTop + 6), radius: 1.9, color: khColor });
+        k.drawRect({ pos: k.vec2(cx - 0.9, bodyTop + 7), width: 1.8, height: 5, color: khColor, anchor: "topleft" });
+    }
+
+    // Stress icon: classic trapezoidal weight with a circular ring loop on
+    // top — same silhouette as the standard "weight" pictogram (no KG text).
+    // Reads as "this is a weight / load." Sized to match the grid icon's
+    // visual weight so the three sidebar icons read at the same scale.
+    function drawStressIcon(cx, cy, col) {
+        const c = colorOf(col);
+        // Trapezoid body — wider at the bottom.
+        const topW = 18;
+        const botW = 28;
+        const bodyTop = cy - 2;
+        const bodyBot = cy + 14;
+        k.drawPolygon({
+            pts: [
+                k.vec2(cx - topW / 2, bodyTop),
+                k.vec2(cx + topW / 2, bodyTop),
+                k.vec2(cx + botW / 2, bodyBot),
+                k.vec2(cx - botW / 2, bodyBot),
+            ],
+            color: c,
+        });
+        // Ring loop on top — outlined circle so the wood shows through the
+        // hole, like the reference image.
+        const loopR = 6.5;
+        const loopCy = bodyTop - loopR + 3;         // overlaps the body slightly
+        k.drawCircle({
+            pos: k.vec2(cx, loopCy), radius: loopR,
+            fill: false, outline: { width: 3, color: c },
+        });
     }
 
     function drawPlayIcon(cx, cy, col) {
@@ -656,13 +839,41 @@ export function gameScene(k, { levelIdx }) {
             p1: k.vec2(cx - s * 0.7, cy - s),
             p2: k.vec2(cx + s,        cy),
             p3: k.vec2(cx - s * 0.7, cy + s),
-            color: k.Color.fromHex(col),
+            color: colorOf(col),
         });
     }
 
     function drawStopIcon(cx, cy, col) {
         const s = 17;
-        k.drawRect({ pos: k.vec2(cx - s/2, cy - s/2), width: s, height: s, color: k.Color.fromHex(col), anchor: "topleft", radius: 1.5 });
+        k.drawRect({ pos: k.vec2(cx - s/2, cy - s/2), width: s, height: s, color: colorOf(col), anchor: "topleft", radius: 1.5 });
+    }
+
+    // Right-pointing arrow — clearer "next level" affordance than the
+    // play-button triangle. Solid shaft + chunky arrowhead with rounded
+    // joints so it reads at icon scale.
+    function drawNextArrow(cx, cy, col) {
+        const c = colorOf(col);
+        const lw = 3.4;
+        // Shaft
+        k.drawLine({
+            p1: k.vec2(cx - 9, cy),
+            p2: k.vec2(cx + 7, cy),
+            width: lw, color: c,
+        });
+        // Arrowhead — two diagonals meeting at the tip.
+        k.drawLine({
+            p1: k.vec2(cx + 1, cy - 7),
+            p2: k.vec2(cx + 9, cy),
+            width: lw, color: c,
+        });
+        k.drawLine({
+            p1: k.vec2(cx + 1, cy + 7),
+            p2: k.vec2(cx + 9, cy),
+            width: lw, color: c,
+        });
+        // Round caps so the joins read clean.
+        k.drawCircle({ pos: k.vec2(cx + 9, cy), radius: lw / 2, color: c });
+        k.drawCircle({ pos: k.vec2(cx - 9, cy), radius: lw / 2, color: c });
     }
 
     // Bare (no-background) icon button — just draws the icon centered in the rect,
@@ -672,11 +883,11 @@ export function gameScene(k, { levelIdx }) {
         const cy = rect.y + rect.h / 2;
         if (drawFn && text) {
             drawFn(cx - 10, cy, color);
-            k.drawText({ text, pos: k.vec2(cx + 6, cy - 4), size: 7, font: "PressStart2P", color: k.Color.fromHex(color) });
+            k.drawText({ text, pos: k.vec2(cx + 6, cy - 4), size: 7, font: "PressStart2P", color: colorOf(color) });
         } else if (drawFn) {
             drawFn(cx, cy, color);
         } else if (text) {
-            k.drawText({ text, pos: k.vec2(cx, cy), size: 8, font: "PressStart2P", color: k.Color.fromHex(color), anchor: "center" });
+            k.drawText({ text, pos: k.vec2(cx, cy), size: 8, font: "PressStart2P", color: colorOf(color), anchor: "center" });
         }
     }
 
@@ -814,8 +1025,8 @@ export function gameScene(k, { levelIdx }) {
 
         // ── Ropes (top static, bottom rotates with the sign) ──
         const drawRopeLine = (top, bot) => {
-            k.drawLine({ p1: k.vec2(top.x, top.y), p2: k.vec2(bot.x, bot.y), width: 3,   color: k.Color.fromHex("#4a2810") });
-            k.drawLine({ p1: k.vec2(top.x, top.y), p2: k.vec2(bot.x, bot.y), width: 1.5, color: k.Color.fromHex("#a87838") });
+            k.drawLine({ p1: k.vec2(top.x, top.y), p2: k.vec2(bot.x, bot.y), width: 3,   color: colorOf("#4a2810") });
+            k.drawLine({ p1: k.vec2(top.x, top.y), p2: k.vec2(bot.x, bot.y), width: 1.5, color: colorOf("#a87838") });
         };
         drawRopeLine(ropeTopL, swungBotL);
         drawRopeLine(ropeTopR, swungBotR);
@@ -827,25 +1038,25 @@ export function gameScene(k, { levelIdx }) {
         k.pushTranslate(-pivotX, -pivotY);
 
         // Drop shadow
-        k.drawRect({ pos: k.vec2(sx + 1, sy + 3), width: sw, height: sh, color: k.Color.fromHex("#010101"), opacity: 0.32, anchor: "topleft", radius: 4 });
+        k.drawRect({ pos: k.vec2(sx + 1, sy + 3), width: sw, height: sh, color: colorOf("#010101"), opacity: 0.32, anchor: "topleft", radius: 4 });
         // Wooden body
-        k.drawRect({ pos: k.vec2(sx, sy), width: sw, height: sh, color: k.Color.fromHex("#d37e3d"), anchor: "topleft", radius: 4 });
+        k.drawRect({ pos: k.vec2(sx, sy), width: sw, height: sh, color: colorOf("#d37e3d"), anchor: "topleft", radius: 4 });
         // Wood grain — horizontal streaks for "sign" feel (vs vertical toolbar grain)
         for (let gy = 4; gy < sh - 4; gy += 5) {
             k.drawLine({
                 p1: k.vec2(sx + 4, sy + gy),
                 p2: k.vec2(sx + sw - 4, sy + gy + 1),
-                width: 0.6, color: k.Color.fromHex("#8e4924"), opacity: 0.18,
+                width: 0.6, color: colorOf("#8e4924"), opacity: 0.18,
             });
         }
         // Top highlight
-        k.drawRect({ pos: k.vec2(sx, sy), width: sw, height: 1, color: k.Color.fromHex("#ffffff"), opacity: 0.22, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(sx, sy), width: sw, height: 1, color: colorOf("#ffffff"), opacity: 0.22, anchor: "topleft" });
         // Bottom edge
-        k.drawRect({ pos: k.vec2(sx, sy + sh - 3), width: sw, height: 3, color: k.Color.fromHex("#8e4924"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(sx, sy + sh - 3), width: sw, height: 3, color: colorOf("#8e4924"), anchor: "topleft" });
         // Outline
         k.drawRect({
             pos: k.vec2(sx, sy), width: sw, height: sh,
-            fill: false, outline: { width: 1, color: k.Color.fromHex("#3a2110") },
+            fill: false, outline: { width: 1, color: colorOf("#3a2110") },
             anchor: "topleft", radius: 4, opacity: 0.45,
         });
         // (No hardware — the rope just terminates at the wood. Cleaner read.)
@@ -879,12 +1090,12 @@ export function gameScene(k, { levelIdx }) {
     function drawPlankOutline(cx, cy, col, inf) {
         const w = MAT_ICON_W + inf * 2;
         const h = MAT_ICON_H + inf * 2;
-        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 + inf });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: colorOf(col), anchor: "topleft", radius: 1 + inf });
     }
     function drawBeamOutline(cx, cy, col, inf) {
         const w = MAT_ICON_W + inf * 2;
         const h = MAT_ICON_H + inf * 2;
-        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 + inf });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: colorOf(col), anchor: "topleft", radius: 1 + inf });
     }
     function drawReinforcedOutline(cx, cy, col, inf) {
         // Plank body + red stripe bundled into one silhouette
@@ -892,32 +1103,32 @@ export function gameScene(k, { levelIdx }) {
         const topY = cy - 2 - MAT_ICON_H/2 - inf;
         const botY = cy + MAT_ICON_H/2 + 2 + inf;   // red stripe base +2 thickness
         const h = botY - topY;
-        k.drawRect({ pos: k.vec2(cx - w/2, topY), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 + inf });
+        k.drawRect({ pos: k.vec2(cx - w/2, topY), width: w, height: h, color: colorOf(col), anchor: "topleft", radius: 1 + inf });
     }
     function drawStoneOutline(cx, cy, col, inf) {
         // Tight rect hugging the whole brick course
         const w = MAT_ICON_W + inf * 2;
         const h = MAT_ICON_H + inf * 2;
-        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: inf });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: colorOf(col), anchor: "topleft", radius: inf });
     }
     function drawSteelOutline(cx, cy, col, inf) {
         // Same silhouette as the wood beam (single rectangle), just inflated.
         const w = MAT_ICON_W + inf * 2;
         const h = MAT_ICON_H + inf * 2;
-        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: k.Color.fromHex(col), anchor: "topleft", radius: 1 + inf });
+        k.drawRect({ pos: k.vec2(cx - w/2, cy - h/2), width: w, height: h, color: colorOf(col), anchor: "topleft", radius: 1 + inf });
     }
     function drawRopeOutline(cx, cy, col, inf) {
         const hw = MAT_ICON_W / 2;
         const lw = 2.8 + inf * 2;
-        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: lw, color: k.Color.fromHex(col) });
-        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8 + inf, color: k.Color.fromHex(col) });
-        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8 + inf, color: k.Color.fromHex(col) });
+        k.drawLine({ p1: k.vec2(cx - hw, cy), p2: k.vec2(cx + hw, cy), width: lw, color: colorOf(col) });
+        k.drawCircle({ pos: k.vec2(cx - hw, cy), radius: 1.8 + inf, color: colorOf(col) });
+        k.drawCircle({ pos: k.vec2(cx + hw, cy), radius: 1.8 + inf, color: colorOf(col) });
     }
     function drawCableOutline(cx, cy, col, inf) {
         const lw = 2.2 + inf * 2;
-        k.drawLine({ p1: k.vec2(cx - MAT_ICON_W/2, cy), p2: k.vec2(cx + MAT_ICON_W/2, cy), width: lw, color: k.Color.fromHex(col) });
-        k.drawCircle({ pos: k.vec2(cx - MAT_ICON_W/2, cy), radius: 1.8 + inf, color: k.Color.fromHex(col) });
-        k.drawCircle({ pos: k.vec2(cx + MAT_ICON_W/2, cy), radius: 1.8 + inf, color: k.Color.fromHex(col) });
+        k.drawLine({ p1: k.vec2(cx - MAT_ICON_W/2, cy), p2: k.vec2(cx + MAT_ICON_W/2, cy), width: lw, color: colorOf(col) });
+        k.drawCircle({ pos: k.vec2(cx - MAT_ICON_W/2, cy), radius: 1.8 + inf, color: colorOf(col) });
+        k.drawCircle({ pos: k.vec2(cx + MAT_ICON_W/2, cy), radius: 1.8 + inf, color: colorOf(col) });
     }
 
     function drawMatIconOutlineFor(key, cx, cy, col, inf) {
@@ -933,7 +1144,7 @@ export function gameScene(k, { levelIdx }) {
     }
 
     function drawRobotIcon(cx, cy, col) {
-        const c = k.Color.fromHex(col);
+        const c = colorOf(col);
         // Antenna — stem + knob on top
         k.drawLine({ p1: k.vec2(cx, cy - 15), p2: k.vec2(cx, cy - 10), width: 2, color: c });
         k.drawCircle({ pos: k.vec2(cx, cy - 16), radius: 2.4, color: c });
@@ -973,7 +1184,7 @@ export function gameScene(k, { levelIdx }) {
     // down to lower-right) → diagonal stem to the center → dot below. All strokes
     // in the passed color so the silhouette-outline pass of drawToolIconBtn works.
     function drawQuestionIcon(cx, cy, col) {
-        const c = k.Color.fromHex(col);
+        const c = colorOf(col);
         const r = 7;
         const lw = 3;
         const topY = cy - 5;
@@ -1106,8 +1317,21 @@ export function gameScene(k, { levelIdx }) {
             const vName = lvlDef.multiVehicle ? "Both vehicles" : VEHICLES[lvl.vType].name;
             onBridgeSuccess({ summary: `${vName} crossed. Cost: $${cost}, Grade: ${grade}, ${memberCount} members` });
             onLevelComplete({ summary: `Level ${lvlDef.name} complete — grade ${grade}` });
+            // Submit + fetch leaderboard. Both are async so we kick them off
+            // here and stash on the modal once it opens — UI handles the
+            // "loading" case if the fetch hasn't completed by show-time.
+            const lbPromise = (async () => {
+                const sub = await submitScore({ levelId: lvlDef.id, budgetUsed: cost, budget: lvl.budget });
+                const lb = await getLeaderboard(lvlDef.id, { budget: lvl.budget, budgetUsed: cost });
+                return { ...lb, isPB: sub.isPB, prevBest: sub.prevBest };
+            })().catch(() => null);
             setTimeout(() => {
-                state.modal = { win: true, title: "MISSION COMPLETE!", desc: `${vName} crossed safely!`, cost, grade, openTime: k.time() };
+                state.modal = {
+                    win: true, title: "MISSION COMPLETE!", desc: `${vName} crossed safely!`,
+                    cost, grade, openTime: k.time(),
+                    leaderboard: null,                  // populated when promise resolves
+                };
+                lbPromise.then(lb => { if (state.modal && state.modal.win) state.modal.leaderboard = lb; });
             }, 600);
         } else {
             const brokenCount = state.members.filter(m => m.broken).length;
@@ -1151,30 +1375,36 @@ export function gameScene(k, { levelIdx }) {
         // Modal button clicks — mirrors the linkBtn positions in drawModal
         if (state.modal) {
             const L = getModalLayout();
-            const halfW = MODAL_BTN_W / 2, halfH = MODAL_BTN_H / 2;
-            const inBtn = (cy) => Math.abs(pos.x - L.mx) < halfW && Math.abs(pos.y - (L.my + cy)) < halfH;
-
-            // Primary — Next Level / Try Again
-            if (inBtn(L.btnY.primary)) {
-                if (state.modal.win) {
-                    const nx = levelIdx + 1;
-                    if (nx < LEVELS.length) k.go("game", { levelIdx: nx });
-                    else k.go("menu", { view: "levelSelect" });
-                } else {
-                    resetToBuild();
-                }
+            // Each icon button has its own rect now. Test all of them; if no
+            // button is hit, the click is swallowed (modal blocks anything
+            // behind it).
+            const inBtn = (b) => {
+                if (!b) return false;
+                const cx = L.mx + b.cx, cy = L.my + b.cy;
+                const half = b.w / 2;
+                return Math.abs(pos.x - cx) < half && Math.abs(pos.y - cy) < half;
+            };
+            // NEXT — advance (win only)
+            if (inBtn(L.buttons.next)) {
+                const nx = levelIdx + 1;
+                if (nx < LEVELS.length) k.go("game", { levelIdx: nx });
+                else k.go("menu", { view: "levelSelect" });
                 return;
             }
-            // AI — only when level has been beaten at least once
-            if (L.beaten && inBtn(L.btnY.ai)) {
+            // REPLAY / TRY AGAIN — reset to build, same level
+            if (inBtn(L.buttons.replay)) {
+                resetToBuild();
+                return;
+            }
+            // AI TUTOR — only when level has been beaten at least once
+            if (L.beaten && inBtn(L.buttons.ai)) {
                 resetToBuild();
                 handleAiClick();
                 return;
             }
-            // Secondary — Replay / Menu
-            if (inBtn(L.btnY.secondary)) {
-                if (state.modal.win) resetToBuild();
-                else k.go("menu", { view: "levelSelect" });
+            // MENU — back to level select
+            if (inBtn(L.buttons.menu)) {
+                k.go("menu", { view: "levelSelect" });
                 return;
             }
             return;
@@ -1184,11 +1414,15 @@ export function gameScene(k, { levelIdx }) {
         if (handleAiPanelClick(pos.x, pos.y)) return;
 
         // ─── Toolbar button clicks (screen-space) ───
+        // Sidebar before toolbar — the toolbar handler ends with a catch-all
+        // that swallows clicks in a ~50px band below the bar, which would
+        // otherwise eat clicks on the wall-mount toggle.
+        if (handleSidebarClick(pos)) return;
         if (handleToolbarClick(pos)) return;
 
         if (state.mode !== "build") return;
         const wp = toWorld(pos.x, pos.y);
-        const sn = snapToGrid(wp.x, wp.y, getAnchors());
+        const sn = snapForBuild(wp.x, wp.y);
 
         // Delete mode
         if (state.delMode) {
@@ -1491,7 +1725,7 @@ export function gameScene(k, { levelIdx }) {
         const pos = k.mousePos();
         if (!state.dragging || state.mode !== "build") { state.dragging = false; return; }
         const wp = toWorld(pos.x, pos.y);
-        const sn = snapToGrid(wp.x, wp.y, getAnchors());
+        const sn = snapForBuild(wp.x, wp.y);
         const st = state.dragStart;
         if (!st) { state.dragging = false; return; }
         if (sn.x === st.x && sn.y === st.y) { state.dragging = false; return; }
@@ -2240,6 +2474,246 @@ export function gameScene(k, { levelIdx }) {
         };
     }
 
+    // ─── Bottom-left sidebar (build-mode toggles) ───
+    // Three icon buttons stacked vertically on a small wood plate. Each
+    // toggles a player preference that's persisted to localStorage so it
+    // survives reloads and level changes.
+    // Sidebar = a hanging shop-style sign attached to the right edge of the
+    // canvas (the "wall"), holding the three icon toggles. It auto-extends
+    // in build mode and tucks back into the wall in sim/end mode. There's
+    // no separate toggle button — the sign is always there when it's
+    // relevant.
+    function getSidebar() {
+        const W = k.width();
+        const tb = getToolbar();
+        const toolbarBot = tb.h + tb.pad;
+
+        // Mounting bar — its right end sits on the wall (the canvas's right
+        // edge). The sign hangs from the bar's LEFT end.
+        const barH = 7;
+        const barRight = W;                       // attaches at the right edge
+        const barY = toolbarBot + 22;             // below the toolbar with a small gap
+
+        // Sign hangs below the bar via two short ropes.
+        const ropeLen = 12;
+        const signW = 168, signH = 56;
+        const signTop = barY + barH + ropeLen;
+
+        // 3 icon buttons in a row inside the sign.
+        const iconBtnW = 46, iconBtnH = 44;
+        const iconGap  = 5;
+        const iconRowW = 3 * iconBtnW + 2 * iconGap;
+
+        // Bar slightly overhangs the sign on the wall side so the chains read
+        // as hanging below the protruding tip of the bar.
+        const barOverhang = 14;
+        const barFullLength = signW + barOverhang;
+
+        // Animation: the entire assembly translates left from a hidden
+        // rest position (right edge tucked behind the wall) to its full
+        // extension. We slide a fixed distance (signW + barOverhang) and
+        // fade in over the slide for a clean reveal.
+        const t = state.sidebarOpenT;
+        const slideDist = barFullLength;
+        const offsetX = (1 - t) * slideDist;      // 0 at open, slideDist at closed
+
+        const barLeft  = barRight - barFullLength + offsetX;
+        const signLeft = barLeft;                 // sign hangs from the LEFT end of the bar
+        const iconRowLeft = signLeft + (signW - iconRowW) / 2;
+        const iconY = signTop + (signH - iconBtnH) / 2 - 1;
+
+        return {
+            // Bar + sign geometry (animation-driven)
+            barLeft, barRight, barY, barH,
+            ropeLen,
+            signLeft, signTop, signW, signH,
+            // Icon hit-areas
+            gridBtn:   { x: iconRowLeft,                                  y: iconY, w: iconBtnW, h: iconBtnH },
+            snapBtn:   { x: iconRowLeft + (iconBtnW + iconGap),           y: iconY, w: iconBtnW, h: iconBtnH },
+            stressBtn: { x: iconRowLeft + 2 * (iconBtnW + iconGap),       y: iconY, w: iconBtnW, h: iconBtnH },
+        };
+    }
+
+    function drawSidebar() {
+        // The sidebar only makes sense while building — its toggles edit
+        // build-mode behavior. Sim/end auto-tucks it into the wall; build
+        // brings it back. No manual toggle button.
+        const inBuild = state.mode === "build";
+        const target = inBuild ? 1 : 0;
+        const dt = k.dt() || 1 / 60;
+        const lerp = 1 - Math.exp(-11 * dt);
+        state.sidebarOpenT += (target - state.sidebarOpenT) * lerp;
+        if (Math.abs(target - state.sidebarOpenT) < 0.001) state.sidebarOpenT = target;
+
+        const sb = getSidebar();
+        const t = state.sidebarOpenT;
+
+        // ── Hanging sign (drawn FIRST so the toggle covers any leak) ──
+        if (t > 0.02) {
+            // Idle sway — barely-there drift, only when fully extended.
+            // Larger amplitudes were translating into a noticeable vertical
+            // bob on the sign (it's far from the pivot, so a tiny rotation
+            // arcs into a visible up/down).
+            const swayDeg = (t > 0.99 && inBuild)
+                ? Math.sin(k.time() * 0.55) * 0.5
+                : 0;
+            // Pivot around the bar's RIGHT end (where it bolts to the wall).
+            const pivotX = sb.barRight;
+            const pivotY = sb.barY + sb.barH / 2;
+            const fade = Math.min(1, Math.max(0, (t - 0.05) / 0.55));
+
+            k.pushTransform();
+            k.pushTranslate(pivotX, pivotY);
+            k.pushRotate(swayDeg);
+            k.pushTranslate(-pivotX, -pivotY);
+
+            // ── Mounting bar ──
+            const barLen = sb.barRight - sb.barLeft;
+            // Bar drop shadow
+            k.drawRect({
+                pos: k.vec2(sb.barLeft + 1, sb.barY + 2),
+                width: barLen, height: sb.barH,
+                color: colorOf("#010101"), opacity: 0.32 * fade,
+                anchor: "topleft", radius: 2,
+            });
+            // Bar body
+            k.drawRect({
+                pos: k.vec2(sb.barLeft, sb.barY),
+                width: barLen, height: sb.barH,
+                color: colorOf("#9c5c2c"), opacity: fade,
+                anchor: "topleft", radius: 2,
+            });
+            // Top highlight + bottom shadow stripes
+            k.drawRect({
+                pos: k.vec2(sb.barLeft, sb.barY),
+                width: barLen, height: 1.2,
+                color: colorOf("#bd7434"), opacity: 0.7 * fade,
+                anchor: "topleft",
+            });
+            k.drawRect({
+                pos: k.vec2(sb.barLeft, sb.barY + sb.barH - 1.4),
+                width: barLen, height: 1.4,
+                color: colorOf("#6e3c1a"), opacity: 0.6 * fade,
+                anchor: "topleft",
+            });
+            // Outline
+            k.drawRect({
+                pos: k.vec2(sb.barLeft, sb.barY),
+                width: barLen, height: sb.barH,
+                fill: false, outline: { width: 1, color: colorOf("#3a2110") },
+                anchor: "topleft", radius: 2, opacity: 0.55 * fade,
+            });
+
+            // ── Two ropes from bar bottom to sign top ──
+            const ropeBotY = sb.barY + sb.barH;
+            const ropeTopY = sb.signTop;
+            const drawRope = (rx) => {
+                k.drawLine({
+                    p1: k.vec2(rx, ropeBotY), p2: k.vec2(rx, ropeTopY),
+                    width: 3, color: colorOf("#4a2810"), opacity: fade,
+                });
+                k.drawLine({
+                    p1: k.vec2(rx, ropeBotY), p2: k.vec2(rx, ropeTopY),
+                    width: 1.4, color: colorOf("#a87838"), opacity: fade,
+                });
+            };
+            drawRope(sb.signLeft + 8);
+            drawRope(sb.signLeft + sb.signW - 8);
+
+            // ── Sign body ──
+            // Drop shadow
+            k.drawRect({
+                pos: k.vec2(sb.signLeft + 2, sb.signTop + 3),
+                width: sb.signW, height: sb.signH,
+                color: colorOf("#010101"), opacity: 0.34 * fade,
+                anchor: "topleft", radius: 4,
+            });
+            // Wood body
+            k.drawRect({
+                pos: k.vec2(sb.signLeft, sb.signTop),
+                width: sb.signW, height: sb.signH,
+                color: colorOf("#d37e3d"), opacity: fade,
+                anchor: "topleft", radius: 4,
+            });
+            // Wood grain — horizontal streaks
+            for (let gy = sb.signTop + 6; gy < sb.signTop + sb.signH - 6; gy += 7) {
+                k.drawLine({
+                    p1: k.vec2(sb.signLeft + 6, gy),
+                    p2: k.vec2(sb.signLeft + sb.signW - 6, gy + 1),
+                    width: 0.7, color: colorOf("#8e4924"), opacity: 0.18 * fade,
+                });
+            }
+            // Top highlight + bottom shadow band
+            k.drawRect({
+                pos: k.vec2(sb.signLeft, sb.signTop), width: sb.signW, height: 1.2,
+                color: colorOf("#ffffff"), opacity: 0.22 * fade, anchor: "topleft",
+            });
+            k.drawRect({
+                pos: k.vec2(sb.signLeft, sb.signTop + sb.signH - 3),
+                width: sb.signW, height: 3,
+                color: colorOf("#8e4924"), opacity: fade, anchor: "topleft",
+            });
+            // Outline
+            k.drawRect({
+                pos: k.vec2(sb.signLeft, sb.signTop),
+                width: sb.signW, height: sb.signH,
+                fill: false, outline: { width: 1, color: colorOf("#3a2110") },
+                anchor: "topleft", radius: 4, opacity: 0.5 * fade,
+            });
+
+            // Three icon buttons. drawToolIconBtn handles hover + active
+            // outline. We don't fade the icon strokes themselves — they're
+            // already gated by the t > 0.02 check, and fading them was
+            // making active outlines look ghostly mid-animation.
+            if (t > 0.45) {
+                drawToolIconBtn(sb.gridBtn,   drawGridIcon,   state.showGrid,   "sb_grid");
+                drawToolIconBtn(sb.snapBtn,   drawSnapIcon,   state.snapGrid,   "sb_snap");
+                drawToolIconBtn(sb.stressBtn, drawStressIcon, state.showStress, "sb_stress");
+            }
+
+            k.popTransform();
+        }
+
+    }
+
+    function handleSidebarClick(pos) {
+        // Sidebar is inert outside of build mode — sim/end auto-close it,
+        // so let those clicks pass through.
+        if (state.mode !== "build") return false;
+        // Sign icon clicks only register once the slide is mostly out, so
+        // a click in empty space mid-animation can't flip a hidden setting.
+        if (state.sidebarOpenT < 0.6) return false;
+        const sb = getSidebar();
+        const inRect = (r) => pos.x >= r.x && pos.x <= r.x + r.w && pos.y >= r.y && pos.y <= r.y + r.h;
+        if (inRect(sb.gridBtn))   { state.showGrid   = !state.showGrid;   saveSidebarPrefs(); return true; }
+        if (inRect(sb.snapBtn))   { state.snapGrid   = !state.snapGrid;   saveSidebarPrefs(); return true; }
+        if (inRect(sb.stressBtn)) { state.showStress = !state.showStress; saveSidebarPrefs(); return true; }
+        return false;
+    }
+
+    function saveSidebarPrefs() {
+        try {
+            const cur = JSON.parse(localStorage.getItem("bridgesnap_settings")) || {};
+            cur.showGrid    = state.showGrid;
+            cur.snapGrid    = state.snapGrid;
+            cur.showStress  = state.showStress;
+            localStorage.setItem("bridgesnap_settings", JSON.stringify(cur));
+        } catch {}
+    }
+
+    // Snap helper that respects the sidebar toggle. Anchors still snap so the
+    // player can attach to fixed mounts even with grid-snap off — the only
+    // thing being relaxed is the round-to-grid behavior for free placement.
+    function snapForBuild(wx, wy) {
+        const anchors = getAnchors();
+        for (const a of anchors) {
+            if (Math.abs(wx - a.x) < GRID * 0.8 && Math.abs(wy - a.y) < GRID * 0.8)
+                return { x: a.x, y: a.y };
+        }
+        if (state.snapGrid) return { x: Math.round(wx / GRID) * GRID, y: Math.round(wy / GRID) * GRID };
+        return { x: wx, y: wy };
+    }
+
     function handleToolbarClick(pos) {
         const tb = getToolbar();
         const y = pos.y;
@@ -2494,11 +2968,20 @@ export function gameScene(k, { levelIdx }) {
     //  fpsCap: 0        → one tick per animation frame (matches
     //                     display refresh — legacy uncapped).
     // ═══════════════════════════════════════════════════
+    // Cached fps cap. Reading localStorage + JSON.parse on every onUpdate
+    // call (60–144 times per second) burned real CPU. Re-read at most once
+    // every 2 seconds, which still picks up settings changes promptly.
+    let _fpsCap = 60;
+    let _fpsCapNextCheck = 0;
     function getFpsCap() {
+        const now = performance.now();
+        if (now < _fpsCapNextCheck) return _fpsCap;
+        _fpsCapNextCheck = now + 2000;
         try {
             const s = JSON.parse(localStorage.getItem("bridgesnap_settings")) || {};
-            return typeof s.fpsCap === "number" ? s.fpsCap : 60;
-        } catch { return 60; }
+            _fpsCap = typeof s.fpsCap === "number" ? s.fpsCap : 60;
+        } catch { _fpsCap = 60; }
+        return _fpsCap;
     }
     let physicsAcc = 0;
 
@@ -2544,6 +3027,17 @@ export function gameScene(k, { levelIdx }) {
                     // falling/sinking vehicle leaves the screen, instead of
                     // waiting for the legacy y > 1100 hard-stop.
                     lvl._screenBottomY = toWorld(0, k.height()).y;
+                    // Screen-edge X (world coords). Used by passOnly vehicles
+                    // to know when they've driven fully off-screen so the
+                    // sequel vehicle can run / level can resolve.
+                    lvl._screenLeftX  = toWorld(0, 0).x;
+                    lvl._screenRightX = toWorld(k.width(), 0).x;
+                    // Finish-X in world coords. Matches the visible flag
+                    // position (anchor + FLAG_INLAND_*) plus a small margin
+                    // so a vehicle has fully passed the flag pole before
+                    // _passedFlag fires.
+                    lvl._finishRightX = rX + FLAG_INLAND_R + 8;
+                    lvl._finishLeftX  = lX - FLAG_INLAND_L - 8;
 
                     const result = vehicleTick(state, lvl, lvlDef);
                     if (result === "win") endGame(true);
@@ -2553,13 +3047,21 @@ export function gameScene(k, { levelIdx }) {
                     // vehicles to make the static sprites feel like they're running.
                     for (const v of state.vehicles) {
                         if (!v.active || v._splashed || v._falling || v.finished) continue;
+                        if (v._waitFor != null) continue;       // parked on its approach — engine off
                         if (v.cfg.sprite === "veh_bicycle") continue;
                         v._smokeTimer = (v._smokeTimer || 0) - 1;
                         if (v._smokeTimer <= 0) {
                             // Heavier vehicles smoke more often
                             const interval = v.cfg.mass > 100 ? 8 : 14;
                             v._smokeTimer = interval + Math.random() * 4;
-                            const dir = v.vx >= 0 ? -1 : 1;       // smoke trails behind motion
+                            // Smoke trails behind motion. Use the vehicle's
+                            // intended travel direction (v._dir), not the
+                            // instantaneous vx — sequential vehicles park with
+                            // vx=0 while waiting, and a brief stall on a slope
+                            // can flip vx, which would spit smoke from the
+                            // front for that frame.
+                            const travel = v._dir || (v.vx < 0 ? -1 : 1);
+                            const dir = travel > 0 ? -1 : 1;     // opposite of motion
                             const sX = v.x + dir * v.cfg.w * 0.42;
                             const sY = v.y + v.cfg.h * 0.18;
                             state.particles.push({
@@ -2620,12 +3122,19 @@ export function gameScene(k, { levelIdx }) {
                 }
             }
 
-            // Splashes, particles, shake — always update for visual polish
-            for (const s of state.splashes) { s.timer += 0.5; s.frame = Math.floor(s.timer) % 18; }
-            state.splashes = state.splashes.filter(s => s.timer < 18);
+            // Splashes, particles, shake — always update for visual polish.
+            // We update + compact in a single in-place pass to skip the
+            // per-frame array reallocation that .filter() does.
+            compactInPlace(state.splashes, (s) => {
+                s.timer += 0.5;
+                s.frame = (s.timer | 0) % 18;
+                return s.timer < 18;
+            });
 
-            state.particles.forEach(p => p.update());
-            state.particles = state.particles.filter(p => p.life > 0);
+            compactInPlace(state.particles, (p) => {
+                p.update();
+                return p.life > 0;
+            });
 
             // Consume snap events from physics → spawn popup + confetti burst
             if (state.snapEvents.length) {
@@ -2633,23 +3142,21 @@ export function gameScene(k, { levelIdx }) {
                 state.snapEvents.length = 0;
             }
 
-            // Snap popups: float up, age out
-            for (const p of state.snapPopups) {
+            compactInPlace(state.snapPopups, (p) => {
                 p.age++;
                 p.y -= 0.35;
-            }
-            state.snapPopups = state.snapPopups.filter(p => p.age < p.life);
+                return p.age < p.life;
+            });
 
-            // Snap confetti: ballistic fall + rotation
-            for (const c of state.snapConfetti) {
+            compactInPlace(state.snapConfetti, (c) => {
                 c.age++;
                 c.x += c.vx;
                 c.y += c.vy;
                 c.vy += 0.18;
                 c.vx *= 0.99;
                 c.rot += c.rotSpd;
-            }
-            state.snapConfetti = state.snapConfetti.filter(c => c.age < c.life);
+                return c.age < c.life;
+            });
 
             if (state.shakeMag > 0.05) state.shakeMag *= 0.80;
             else state.shakeMag = 0;
@@ -2711,14 +3218,15 @@ export function gameScene(k, { levelIdx }) {
 
             // ─── UI overlay (screen space) ──────────────
             drawToolbar();
+            drawSidebar();
             drawHintPanel();
             drawAiPanel();
             if (state.modal) drawModal();
             if (state.tutorialActive) drawTutorialOverlay();
         } catch(e) {
             // Show error on screen so we can debug
-            k.drawRect({ width: k.width(), height: 60, pos: k.vec2(0, 0), color: k.Color.fromHex("#cc0000"), anchor: "topleft" });
-            k.drawText({ text: "ERR: " + e.message, pos: k.vec2(10, 20), size: 14, color: k.Color.fromHex("#ffffff") });
+            k.drawRect({ width: k.width(), height: 60, pos: k.vec2(0, 0), color: colorOf("#cc0000"), anchor: "topleft" });
+            k.drawText({ text: "ERR: " + e.message, pos: k.vec2(10, 20), size: 14, color: colorOf("#ffffff") });
             console.error(e);
         }
     });
@@ -2763,7 +3271,7 @@ export function gameScene(k, { levelIdx }) {
         if (state.mode === "sim" || state.mode === "end") {
             // ─── Sim mode: parallax pixel art backgrounds ───
             // Sky color base
-            k.drawRect({ width: W, height: H, pos: k.vec2(0, 0), color: k.Color.fromHex("#4a90c8"), anchor: "topleft" });
+            k.drawRect({ width: W, height: H, pos: k.vec2(0, 0), color: colorOf("#4a90c8"), anchor: "topleft" });
 
             // Scroll rate scales with sim speed so the parallax matches the
             // pace of the rest of the simulation (flags, water, vehicles).
@@ -2789,14 +3297,17 @@ export function gameScene(k, { levelIdx }) {
         // Renders crisp pixel-aligned lines (integer positions + width 1).
         // Skips minor grid when world-units are too compressed to render
         // cleanly — avoids moiré / aliased appearance at small scales.
-        k.drawRect({ width: W, height: H, pos: k.vec2(0, 0), color: k.Color.fromHex("#d9c9a8"), anchor: "topleft" });
+        k.drawRect({ width: W, height: H, pos: k.vec2(0, 0), color: colorOf("#d9c9a8"), anchor: "topleft" });
+
+        // Player can hide the grid via the sidebar — keep the cream paper.
+        if (!state.showGrid) return;
 
         const wLeft = toWorld(0, 0);
         const wRight = toWorld(W, H);
 
         const step = GRID;       // minor grid (12px world units)
         const major = GRID * 3;  // major grid (36px world units)
-        const lineCol = k.Color.fromHex("#8a7350");
+        const lineCol = colorOf("#8a7350");
 
         // How many screen pixels per minor step? Skip minor lines if too cramped.
         const minorPx = step * sc;
@@ -2874,7 +3385,10 @@ export function gameScene(k, { levelIdx }) {
         {
             const t = k.time();
             const mpos = k.mousePos();
-            state.nodes.filter(n => n.fixed && !n.builtin).forEach(n => {
+            // Direct guarded loop avoids allocating a filtered subarray every
+            // frame just to iterate it once.
+            for (const n of state.nodes) {
+                if (!n.fixed || n.builtin) continue;
                 const p = toScreen(n.x, n.y);
                 const onCliffTop = (n.x === lX && n.y === lY) || (n.x === rX && n.y === rY);
                 const onMidPier  = n.x > lX && n.x < rX;
@@ -2892,7 +3406,7 @@ export function gameScene(k, { levelIdx }) {
                 // underneath — mid-pier anchors sit directly on their rock.
                 if (!isPrimary) {
                     const bw = r * 2.5, bh = r * 0.8;
-                    k.drawRect({ pos: k.vec2(p.x - bw / 2, p.y - bh / 2), width: bw, height: bh, color: k.Color.fromHex("#555555"), anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(p.x - bw / 2, p.y - bh / 2), width: bw, height: bh, color: colorOf("#555555"), anchor: "topleft" });
                 }
 
                 // Outer glow halo — pulses with the breathing, brighter on hover.
@@ -2904,21 +3418,21 @@ export function gameScene(k, { levelIdx }) {
                         k.drawCircle({
                             pos: p,
                             radius: glowR * (0.7 + 0.15 * g),
-                            color: k.Color.fromHex("#ff6464"),
+                            color: colorOf("#ff6464"),
                             opacity: glowOp * (0.4 / g),
                         });
                     }
                 }
 
                 // Drop shadow
-                k.drawCircle({ pos: k.vec2(p.x + 0.5, p.y + 0.5), radius: r + 1, color: k.Color.fromHex("#010101"), opacity: 0.25 });
+                k.drawCircle({ pos: k.vec2(p.x + 0.5, p.y + 0.5), radius: r + 1, color: colorOf("#010101"), opacity: 0.25 });
                 // Main dot
-                k.drawCircle({ pos: p, radius: r, color: k.Color.fromHex(isPrimary ? "#c43030" : "#606878") });
+                k.drawCircle({ pos: p, radius: r, color: colorOf(isPrimary ? "#c43030" : "#606878") });
                 // Highlight pip — subtle shimmer that tracks the breathing
                 k.drawCircle({
                     pos: k.vec2(p.x - r * 0.25, p.y - r * 0.25),
                     radius: r * 0.3,
-                    color: k.Color.fromHex("#ffffff"),
+                    color: colorOf("#ffffff"),
                     opacity: 0.35 + 0.25 * breathe,
                 });
                 // Hover ring — crisp outline that appears only when the cursor
@@ -2928,11 +3442,11 @@ export function gameScene(k, { levelIdx }) {
                         pos: p,
                         radius: r + 2.5,
                         fill: false,
-                        outline: { width: 2, color: k.Color.fromHex("#ffd479") },
+                        outline: { width: 2, color: colorOf("#ffd479") },
                         opacity: 0.8,
                     });
                 }
-            });
+            }
         }
     }
 
@@ -2962,7 +3476,7 @@ export function gameScene(k, { levelIdx }) {
             k.drawRect({
                 pos: k.vec2(screenTop.x - halfW, y),
                 width: halfW * 2, height: sliceH + 0.5,
-                color: k.Color.fromHex(col),
+                color: colorOf(col),
                 anchor: "topleft",
             });
         }
@@ -2974,14 +3488,14 @@ export function gameScene(k, { levelIdx }) {
         k.drawRect({
             pos: k.vec2(screenTop.x - topHalfW, topY),
             width: topHalfW * 2, height: capH,
-            color: k.Color.fromHex("#8a857a"),
+            color: colorOf("#8a857a"),
             anchor: "topleft",
         });
         // Tiny highlight along the very top of the cap
         k.drawRect({
             pos: k.vec2(screenTop.x - topHalfW, topY),
             width: topHalfW * 2, height: Math.max(1, 1.5 * sc),
-            color: k.Color.fromHex("#c0bcb2"),
+            color: colorOf("#c0bcb2"),
             anchor: "topleft", opacity: 0.7,
         });
 
@@ -2994,13 +3508,13 @@ export function gameScene(k, { levelIdx }) {
             k.drawRect({
                 pos: k.vec2(screenTop.x - halfW, y),
                 width: 1, height: (botY - topY) / edgeN + 1,
-                color: k.Color.fromHex("#2a2824"),
+                color: colorOf("#2a2824"),
                 anchor: "topleft", opacity: 0.35,
             });
             k.drawRect({
                 pos: k.vec2(screenTop.x + halfW - 1, y),
                 width: 1, height: (botY - topY) / edgeN + 1,
-                color: k.Color.fromHex("#2a2824"),
+                color: colorOf("#2a2824"),
                 anchor: "topleft", opacity: 0.35,
             });
         }
@@ -3013,17 +3527,21 @@ export function gameScene(k, { levelIdx }) {
             k.drawLine({
                 p1: k.vec2(screenTop.x - halfW + 2, y),
                 p2: k.vec2(screenTop.x + halfW - 2, y),
-                width: 1, color: k.Color.fromHex("#2a2824"), opacity: 0.18,
+                width: 1, color: colorOf("#2a2824"), opacity: 0.18,
             });
         }
+
+        // Waterline → submerged-region calculation is the same regardless
+        // of mode; pull it out of the two branches below so we don't do
+        // the toScreen() conversion twice per pier per frame.
+        const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
+        const waterScreen = toScreen(lX, waterWorldY);
+        const submergedStart = Math.max(topY, waterScreen.y);
 
         // Build-mode underwater dim — subtler than the sim-mode tint, just a
         // soft cool overlay on the submerged portion of the rock so the
         // waterline reads consistently with the screen-wide marker line.
         if (state.mode === "build") {
-            const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
-            const waterScreen = toScreen(lX, waterWorldY);
-            const submergedStart = Math.max(topY, waterScreen.y);
             if (submergedStart < botY) {
                 for (let y = submergedStart; y < botY; y += sliceH) {
                     const t = Math.min(1, (y - topY) / (botY - topY));
@@ -3031,7 +3549,7 @@ export function gameScene(k, { levelIdx }) {
                     k.drawRect({
                         pos: k.vec2(screenTop.x - halfW, y),
                         width: halfW * 2, height: sliceH + 0.5,
-                        color: k.Color.fromHex("#2a4f7a"),
+                        color: colorOf("#2a4f7a"),
                         anchor: "topleft", opacity: 0.18,
                     });
                 }
@@ -3043,9 +3561,6 @@ export function gameScene(k, { levelIdx }) {
         // hue, then a darken pass deepens the lower portion. Together they
         // sell "we're looking at this through several feet of water".
         if (state.mode !== "build") {
-            const waterWorldY = Math.max(lY, rY) + TABLE_DEPTH * 0.36;
-            const waterScreen = toScreen(lX, waterWorldY);
-            const submergedStart = Math.max(topY, waterScreen.y);
             if (submergedStart < botY) {
                 for (let y = submergedStart; y < botY; y += sliceH) {
                     const t  = Math.min(1, (y - topY) / (botY - topY));
@@ -3055,14 +3570,14 @@ export function gameScene(k, { levelIdx }) {
                     k.drawRect({
                         pos: k.vec2(screenTop.x - halfW, y),
                         width: halfW * 2, height: sliceH + 0.5,
-                        color: k.Color.fromHex("#3b6d9e"),
+                        color: colorOf("#3b6d9e"),
                         anchor: "topleft", opacity: 0.55 + 0.15 * depth,
                     });
                     // Darken-with-depth pass — deeper water swallows light
                     k.drawRect({
                         pos: k.vec2(screenTop.x - halfW, y),
                         width: halfW * 2, height: sliceH + 0.5,
-                        color: k.Color.fromHex("#0a1530"),
+                        color: colorOf("#0a1530"),
                         anchor: "topleft", opacity: 0.10 + 0.30 * depth,
                     });
                 }
@@ -3104,18 +3619,18 @@ export function gameScene(k, { levelIdx }) {
         const mW   = 7 * sc;
 
         // Body
-        k.drawRect({ pos: k.vec2(base.x - mW / 2, tip.y), width: mW, height: h, color: k.Color.fromHex("#3a3a3a"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(base.x - mW / 2, tip.y), width: mW, height: h, color: colorOf("#3a3a3a"), anchor: "topleft" });
         // Highlight stripe (left face)
-        k.drawRect({ pos: k.vec2(base.x - mW / 2, tip.y), width: mW * 0.3, height: h, color: k.Color.fromHex("#585858"), opacity: 0.8, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(base.x - mW / 2, tip.y), width: mW * 0.3, height: h, color: colorOf("#585858"), opacity: 0.8, anchor: "topleft" });
         // Cross-bracing marks
         const steps = Math.max(2, Math.floor(h / (18 * sc)));
         for (let i = 1; i < steps; i++) {
             const yy = tip.y + (h * i) / steps;
-            k.drawLine({ p1: k.vec2(base.x - mW * 0.5, yy), p2: k.vec2(base.x + mW * 0.5, yy), width: sc, color: k.Color.fromHex("#606060"), opacity: 0.6 });
+            k.drawLine({ p1: k.vec2(base.x - mW * 0.5, yy), p2: k.vec2(base.x + mW * 0.5, yy), width: sc, color: colorOf("#606060"), opacity: 0.6 });
         }
         // Cap plate at top
         const capW = mW * 2.4, capH = Math.max(3, mW * 0.55);
-        k.drawRect({ pos: k.vec2(tip.x - capW / 2, tip.y - capH / 2), width: capW, height: capH, color: k.Color.fromHex("#282828"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(tip.x - capW / 2, tip.y - capH / 2), width: capW, height: capH, color: colorOf("#282828"), anchor: "topleft" });
     }
 
     function drawGround(wx1, wx2, wy, sc, side) {
@@ -3132,7 +3647,7 @@ export function gameScene(k, { levelIdx }) {
         const cliffH = cliffBot.y - roadBot.y;
 
         // ── Asphalt road surface ──
-        k.drawRect({ pos: roadTop, width: w, height: roadH, color: k.Color.fromHex("#3a3a3a"), anchor: "topleft" });
+        k.drawRect({ pos: roadTop, width: w, height: roadH, color: colorOf("#3a3a3a"), anchor: "topleft" });
         // Dashed yellow line — drawn right at the driving surface (top edge of
         // the asphalt) so the "stand on the yellow line" visual holds.
         const lineY = roadTop.y + Math.max(1, 1.5 * sc);
@@ -3143,40 +3658,40 @@ export function gameScene(k, { levelIdx }) {
             // over the cliff edge when the road length isn't a clean multiple
             // of (dash + gap).
             const segW = Math.min(dashW, w - dx);
-            k.drawRect({ pos: k.vec2(roadTop.x + dx, lineY - 1), width: segW, height: Math.max(2, 1.5 * sc), color: k.Color.fromHex("#e8c840"), anchor: "topleft", opacity: 0.7 });
+            k.drawRect({ pos: k.vec2(roadTop.x + dx, lineY - 1), width: segW, height: Math.max(2, 1.5 * sc), color: colorOf("#e8c840"), anchor: "topleft", opacity: 0.7 });
         }
         // Subtle top highlight
-        k.drawRect({ pos: roadTop, width: w, height: Math.max(1, 1.5 * sc), color: k.Color.fromHex("#ffffff"), anchor: "topleft", opacity: 0.12 });
+        k.drawRect({ pos: roadTop, width: w, height: Math.max(1, 1.5 * sc), color: colorOf("#ffffff"), anchor: "topleft", opacity: 0.12 });
 
         // ── Grass strip (thin green edge between road and dirt) ──
         const grassH = Math.max(3, 6 * sc);
-        k.drawRect({ pos: k.vec2(roadTop.x, roadBot.y), width: w, height: grassH, color: k.Color.fromHex("#4a8c3f"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(roadTop.x, roadBot.y), width: w, height: grassH, color: colorOf("#4a8c3f"), anchor: "topleft" });
         // Lighter grass tuft line on top edge
-        k.drawRect({ pos: k.vec2(roadTop.x, roadBot.y), width: w, height: Math.max(1, 2 * sc), color: k.Color.fromHex("#6ab854"), anchor: "topleft", opacity: 0.7 });
+        k.drawRect({ pos: k.vec2(roadTop.x, roadBot.y), width: w, height: Math.max(1, 2 * sc), color: colorOf("#6ab854"), anchor: "topleft", opacity: 0.7 });
 
         // ── Dark dirt layer ──
         const darkDirtH = cliffH * 0.35;
-        k.drawRect({ pos: k.vec2(roadTop.x, roadBot.y + grassH), width: w, height: darkDirtH, color: k.Color.fromHex("#4a3822"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(roadTop.x, roadBot.y + grassH), width: w, height: darkDirtH, color: colorOf("#4a3822"), anchor: "topleft" });
 
         // ── Light dirt / sandy layer ──
         const lightDirtY = roadBot.y + grassH + darkDirtH;
         const lightDirtH = cliffH - grassH - darkDirtH;
-        k.drawRect({ pos: k.vec2(roadTop.x, lightDirtY), width: w, height: lightDirtH, color: k.Color.fromHex("#8b7355"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(roadTop.x, lightDirtY), width: w, height: lightDirtH, color: colorOf("#8b7355"), anchor: "topleft" });
         // Subtle rock lines
         const rockStep = Math.max(10, 20 * sc);
         for (let py = lightDirtY + rockStep; py < cliffBot.y; py += rockStep)
-            k.drawLine({ p1: k.vec2(roadTop.x, py), p2: k.vec2(roadTop.x + w, py), width: 1, color: k.Color.fromHex("#010101"), opacity: 0.06 });
+            k.drawLine({ p1: k.vec2(roadTop.x, py), p2: k.vec2(roadTop.x + w, py), width: 1, color: colorOf("#010101"), opacity: 0.06 });
 
         // ── Extend dirt to screen bottom ──
         const screenBot = k.height();
         const remainH = screenBot - cliffBot.y;
         if (remainH > 0) {
-            k.drawRect({ pos: k.vec2(roadTop.x, cliffBot.y), width: w, height: remainH, color: k.Color.fromHex("#5a4030"), anchor: "topleft" });
+            k.drawRect({ pos: k.vec2(roadTop.x, cliffBot.y), width: w, height: remainH, color: colorOf("#5a4030"), anchor: "topleft" });
         }
 
         // ── Cliff inner edge shadow ──
         const edgeX = side === "left" ? roadTop.x + w - 2 : roadTop.x;
-        k.drawRect({ pos: k.vec2(edgeX, roadBot.y + grassH), width: 3, height: darkDirtH + lightDirtH + remainH, color: k.Color.fromHex("#010101"), anchor: "topleft", opacity: 0.12 });
+        k.drawRect({ pos: k.vec2(edgeX, roadBot.y + grassH), width: 3, height: darkDirtH + lightDirtH + remainH, color: colorOf("#010101"), anchor: "topleft", opacity: 0.12 });
     }
 
     // ─── Water in the gap (sim/end mode only) ────────
@@ -3191,13 +3706,13 @@ export function gameScene(k, { levelIdx }) {
             k.drawRect({
                 pos: k.vec2(0, waterY),
                 width: W, height: H - waterY,
-                color: k.Color.fromHex("#2a4f7a"),
+                color: colorOf("#2a4f7a"),
                 anchor: "topleft", opacity: 0.12,
             });
             // Thin marker line at the surface.
             k.drawLine({
                 p1: k.vec2(0, waterY), p2: k.vec2(W, waterY),
-                width: 1, color: k.Color.fromHex("#3b6d9e"), opacity: 0.55,
+                width: 1, color: colorOf("#3b6d9e"), opacity: 0.55,
             });
             return;
         }
@@ -3215,7 +3730,7 @@ export function gameScene(k, { levelIdx }) {
         const tileH = 16 * sc * 1.5;
 
         // Solid fill from just below the wave sprite to screen bottom
-        k.drawRect({ pos: k.vec2(0, waterY + tileH * 0.4), width: W, height: H - waterY, color: k.Color.fromHex("#3b6d9e"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(0, waterY + tileH * 0.4), width: W, height: H - waterY, color: colorOf("#3b6d9e"), anchor: "topleft" });
         // (Wave tile strip is drawn separately via drawWaterSurface so it can
         // overlay submerged bridge pieces.)
 
@@ -3223,7 +3738,7 @@ export function gameScene(k, { levelIdx }) {
         const bandStart = waterY + tileH * 0.6;
         for (let wy = bandStart; wy < H; wy += 25) {
             const bandOp = 0.04 + Math.sin(wy * 0.02 + waterFrame * 0.3) * 0.02;
-            k.drawRect({ pos: k.vec2(0, wy), width: W, height: 10, color: k.Color.fromHex("#2a5a8a"), anchor: "topleft", opacity: bandOp });
+            k.drawRect({ pos: k.vec2(0, wy), width: W, height: 10, color: colorOf("#2a5a8a"), anchor: "topleft", opacity: bandOp });
         }
 
         // ── Fish (stateful) ──
@@ -3340,7 +3855,7 @@ export function gameScene(k, { levelIdx }) {
             // Small ripple ring
             if (s.timer < 4) {
                 const t = s.timer;
-                k.drawCircle({ pos: p, radius: t * 8 * sc, fill: false, outline: { width: 1, color: k.Color.fromHex("#ffffff") }, opacity: Math.max(0, 0.4 - t / 5) });
+                k.drawCircle({ pos: p, radius: t * 8 * sc, fill: false, outline: { width: 1, color: colorOf("#ffffff") }, opacity: Math.max(0, 0.4 - t / 5) });
             }
         }
     }
@@ -3400,6 +3915,14 @@ export function gameScene(k, { levelIdx }) {
             return null;
         }
 
+        // Squared threshold for the per-member delete-hover check below.
+        // Computed once per drawMembers call so we never recompute for each
+        // member. Inputs (mouseWorld, sc) are stable for the duration of
+        // this draw pass.
+        const _delThreshSq = (12 / sc) * (12 / sc);
+        const _mwx = state.mouseWorld.x;
+        const _mwy = state.mouseWorld.y;
+
         // Helper: get member color (stress-based in sim, material color in build)
         function getMemberColor(m) {
             const mat = MATERIALS[m.type];
@@ -3407,16 +3930,16 @@ export function gameScene(k, { levelIdx }) {
             // a red stress tint on top is redundant and washes out the look,
             // so keep steel rendered in its material color even in sim mode.
             if (m.type === "steel") {
-                if (state.delMode && distToSegment(state.mouseWorld, m.n1, m.n2) < 12 / sc) return C.danger;
+                if (state.delMode && distToSegmentSq(_mwx, _mwy, m.n1, m.n2) < _delThreshSq) return C.danger;
                 return mat.color;
             }
-            if (state.mode === "sim" || state.mode === "end") {
+            if ((state.mode === "sim" || state.mode === "end") && state.showStress) {
                 const s = Math.min(1, m.stress);
                 if (s < 0.15) return C.stressLow;
                 if (s < 0.50) return C.stressMid;
                 return C.stressHigh;
             }
-            if (state.delMode && distToSegment(state.mouseWorld, m.n1, m.n2) < 12 / sc) return C.danger;
+            if (state.delMode && distToSegmentSq(_mwx, _mwy, m.n1, m.n2) < _delThreshSq) return C.danger;
             return mat.color;
         }
 
@@ -3428,7 +3951,7 @@ export function gameScene(k, { levelIdx }) {
                 if (!MATERIALS[m.type].isRoad || m.broken) continue;
                 const mat = MATERIALS[m.type];
                 const r = mat.width * sc * 0.5;
-                const col = k.Color.fromHex(getMemberColor(m));
+                const col = colorOf(getMemberColor(m));
                 for (const n of [m.n1, m.n2]) {
                     const submerged = n.y >= waterY;
                     if (layer === "roads" && submerged) continue;
@@ -3442,8 +3965,8 @@ export function gameScene(k, { levelIdx }) {
                         k.drawCircle({ pos: p, radius: r, color: col });
                         if (submerged) {
                             // Match the underwater tint applied to submerged members
-                            k.drawCircle({ pos: p, radius: r, color: k.Color.fromHex("#3b6d9e"), opacity: 0.55 });
-                            k.drawCircle({ pos: p, radius: r, color: k.Color.fromHex("#0a1530"), opacity: 0.20 });
+                            k.drawCircle({ pos: p, radius: r, color: colorOf("#3b6d9e"), opacity: 0.55 });
+                            k.drawCircle({ pos: p, radius: r, color: colorOf("#0a1530"), opacity: 0.20 });
                         }
                     }
                 }
@@ -3458,7 +3981,7 @@ export function gameScene(k, { levelIdx }) {
             const mat = MATERIALS[m.type];
             const w = mat.width * sc;
             const dx = p2.x - p1.x, dy = p2.y - p1.y;
-            const len = Math.hypot(dx, dy) || 1;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
             // Normal vector (perpendicular to member, scaled)
             const nx = -dy / len, ny = dx / len;
 
@@ -3466,13 +3989,13 @@ export function gameScene(k, { levelIdx }) {
             if (m.broken) continue;
 
             if (m.builtin) {
-                k.drawLine({ p1, p2, width: w * 1.2, color: k.Color.fromHex("#7a5520") });
+                k.drawLine({ p1, p2, width: w * 1.2, color: colorOf("#7a5520") });
                 continue;
             }
 
             const color = getMemberColor(m);
             const opacity = 1;
-            const col = k.Color.fromHex(color);
+            const col = colorOf(color);
 
             if (m.type === "wood_road") {
                 // ── WOOD ROAD — chunky plank with grain lines ──
@@ -3483,12 +4006,12 @@ export function gameScene(k, { levelIdx }) {
                 k.drawLine({
                     p1: k.vec2(p1.x + nx * edgeOff, p1.y + ny * edgeOff),
                     p2: k.vec2(p2.x + nx * edgeOff, p2.y + ny * edgeOff),
-                    width: 1, color: k.Color.fromHex("#c4943c"), opacity: 0.5 * opacity,
+                    width: 1, color: colorOf("#c4943c"), opacity: 0.5 * opacity,
                 });
                 k.drawLine({
                     p1: k.vec2(p1.x - nx * edgeOff, p1.y - ny * edgeOff),
                     p2: k.vec2(p2.x - nx * edgeOff, p2.y - ny * edgeOff),
-                    width: 1, color: k.Color.fromHex("#7a5520"), opacity: 0.4 * opacity,
+                    width: 1, color: colorOf("#7a5520"), opacity: 0.4 * opacity,
                 });
                 // Wood grain notches along length
                 const grainSpacing = Math.max(8, 12 * sc);
@@ -3499,7 +4022,7 @@ export function gameScene(k, { levelIdx }) {
                     k.drawLine({
                         p1: k.vec2(gx + nx * grainW, gy + ny * grainW),
                         p2: k.vec2(gx - nx * grainW, gy - ny * grainW),
-                        width: 1, color: k.Color.fromHex("#7a5520"), opacity: 0.25 * opacity,
+                        width: 1, color: colorOf("#7a5520"), opacity: 0.25 * opacity,
                     });
                 }
 
@@ -3510,7 +4033,7 @@ export function gameScene(k, { levelIdx }) {
                 k.drawLine({
                     p1: k.vec2(p1.x + nx * w * 0.2, p1.y + ny * w * 0.2),
                     p2: k.vec2(p2.x + nx * w * 0.2, p2.y + ny * w * 0.2),
-                    width: 1, color: k.Color.fromHex("#EDD8B7"), opacity: 0.5 * opacity,
+                    width: 1, color: colorOf("#EDD8B7"), opacity: 0.5 * opacity,
                 });
                 // Cross marks every ~20px
                 const crossSp = Math.max(14, 20 * sc);
@@ -3521,11 +4044,11 @@ export function gameScene(k, { levelIdx }) {
                     // Small X
                     k.drawLine({
                         p1: k.vec2(cx - 1.5, cy - 1.5), p2: k.vec2(cx + 1.5, cy + 1.5),
-                        width: 1, color: k.Color.fromHex("#C49A6C"), opacity: 0.3 * opacity,
+                        width: 1, color: colorOf("#C49A6C"), opacity: 0.3 * opacity,
                     });
                     k.drawLine({
                         p1: k.vec2(cx + 1.5, cy - 1.5), p2: k.vec2(cx - 1.5, cy + 1.5),
-                        width: 1, color: k.Color.fromHex("#C49A6C"), opacity: 0.3 * opacity,
+                        width: 1, color: colorOf("#C49A6C"), opacity: 0.3 * opacity,
                     });
                 }
 
@@ -3539,19 +4062,19 @@ export function gameScene(k, { levelIdx }) {
                 k.drawLine({
                     p1: k.vec2(p1.x + nx * flangeOff, p1.y + ny * flangeOff),
                     p2: k.vec2(p2.x + nx * flangeOff, p2.y + ny * flangeOff),
-                    width: 1.5, color: k.Color.fromHex("#e06060"), opacity: 0.55 * opacity,
+                    width: 1.5, color: colorOf("#e06060"), opacity: 0.55 * opacity,
                 });
                 k.drawLine({
                     p1: k.vec2(p1.x - nx * flangeOff, p1.y - ny * flangeOff),
                     p2: k.vec2(p2.x - nx * flangeOff, p2.y - ny * flangeOff),
-                    width: 1.5, color: k.Color.fromHex("#7a2020"), opacity: 0.6 * opacity,
+                    width: 1.5, color: colorOf("#7a2020"), opacity: 0.6 * opacity,
                 });
                 // Rivet dots — small dark-red squares evenly spaced
                 const rivetSp = Math.max(10, 16 * sc);
                 for (let t = rivetSp * 0.5; t < len; t += rivetSp) {
                     const rx = p1.x + (dx / len) * t;
                     const ry = p1.y + (dy / len) * t;
-                    k.drawRect({ pos: k.vec2(rx - 1, ry - 1), width: 2, height: 2, color: k.Color.fromHex("#5a1010"), opacity: 0.6 * opacity, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(rx - 1, ry - 1), width: 2, height: 2, color: colorOf("#5a1010"), opacity: 0.6 * opacity, anchor: "topleft" });
                 }
 
             } else if (m.type === "reinforced_road") {
@@ -3562,22 +4085,22 @@ export function gameScene(k, { levelIdx }) {
                 k.drawLine({
                     p1: k.vec2(p1.x + nx * edgeOff, p1.y + ny * edgeOff),
                     p2: k.vec2(p2.x + nx * edgeOff, p2.y + ny * edgeOff),
-                    width: 1, color: k.Color.fromHex("#a08050"), opacity: 0.5 * opacity,
+                    width: 1, color: colorOf("#a08050"), opacity: 0.5 * opacity,
                 });
                 k.drawLine({
                     p1: k.vec2(p1.x - nx * edgeOff, p1.y - ny * edgeOff),
                     p2: k.vec2(p2.x - nx * edgeOff, p2.y - ny * edgeOff),
-                    width: 1, color: k.Color.fromHex("#4a3018"), opacity: 0.4 * opacity,
+                    width: 1, color: colorOf("#4a3018"), opacity: 0.4 * opacity,
                 });
                 // Steel rivet dots along length
                 const rivetSp = Math.max(8, 12 * sc);
                 for (let t = rivetSp * 0.5; t < len; t += rivetSp) {
                     const rx = p1.x + (dx / len) * t;
                     const ry = p1.y + (dy / len) * t;
-                    k.drawRect({ pos: k.vec2(rx - 1, ry - 1), width: 2.5, height: 2.5, color: k.Color.fromHex("#b0b0b0"), opacity: 0.6 * opacity, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(rx - 1, ry - 1), width: 2.5, height: 2.5, color: colorOf("#b0b0b0"), opacity: 0.6 * opacity, anchor: "topleft" });
                 }
                 // Steel reinforcement stripe down center
-                k.drawLine({ p1, p2, width: 1.5, color: k.Color.fromHex("#a8b4c0"), opacity: 0.35 * opacity });
+                k.drawLine({ p1, p2, width: 1.5, color: colorOf("#a8b4c0"), opacity: 0.35 * opacity });
 
             } else if (m.type === "stone_road") {
                 // ── STONE ROAD — gray slab with masonry joints ──
@@ -3587,12 +4110,12 @@ export function gameScene(k, { levelIdx }) {
                 k.drawLine({
                     p1: k.vec2(p1.x + nx * edgeOff, p1.y + ny * edgeOff),
                     p2: k.vec2(p2.x + nx * edgeOff, p2.y + ny * edgeOff),
-                    width: 1, color: k.Color.fromHex("#b8b8b8"), opacity: 0.4 * opacity,
+                    width: 1, color: colorOf("#b8b8b8"), opacity: 0.4 * opacity,
                 });
                 k.drawLine({
                     p1: k.vec2(p1.x - nx * edgeOff, p1.y - ny * edgeOff),
                     p2: k.vec2(p2.x - nx * edgeOff, p2.y - ny * edgeOff),
-                    width: 1, color: k.Color.fromHex("#5a5a5a"), opacity: 0.4 * opacity,
+                    width: 1, color: colorOf("#5a5a5a"), opacity: 0.4 * opacity,
                 });
                 // Masonry joint lines (perpendicular hash marks)
                 const jointSp = Math.max(10, 14 * sc);
@@ -3603,14 +4126,15 @@ export function gameScene(k, { levelIdx }) {
                     k.drawLine({
                         p1: k.vec2(jx + nx * jointW, jy + ny * jointW),
                         p2: k.vec2(jx - nx * jointW, jy - ny * jointW),
-                        width: 1, color: k.Color.fromHex("#4a4a4a"), opacity: 0.3 * opacity,
+                        width: 1, color: colorOf("#4a4a4a"), opacity: 0.3 * opacity,
                     });
                 }
 
             } else if (m.type === "rope") {
                 // ── ROPE — twisted hemp look, sags as a catenary when slack ──
                 // Sag amount: rope slack length translated into screen-space drop
-                const curDist = Math.hypot(m.n2.x - m.n1.x, m.n2.y - m.n1.y);
+                const _rdx = m.n2.x - m.n1.x, _rdy = m.n2.y - m.n1.y;
+                const curDist = Math.sqrt(_rdx * _rdx + _rdy * _rdy);
                 const slackWorld = Math.max(0, m.rest - curDist);
                 const sagPx = Math.min(40 * sc, slackWorld * sc * 0.55);
 
@@ -3628,7 +4152,7 @@ export function gameScene(k, { levelIdx }) {
                 const rw = Math.max(w, 3);
                 // Dark shadow stroke
                 for (let i = 0; i < segs; i++) {
-                    k.drawLine({ p1: pts[i], p2: pts[i + 1], width: rw + 1.5, color: k.Color.fromHex("#3a2a06"), opacity: 0.45 * opacity });
+                    k.drawLine({ p1: pts[i], p2: pts[i + 1], width: rw + 1.5, color: colorOf("#3a2a06"), opacity: 0.45 * opacity });
                 }
                 // Main rope body
                 for (let i = 0; i < segs; i++) {
@@ -3642,7 +4166,7 @@ export function gameScene(k, { levelIdx }) {
                     if (idx >= pts.length - 1) continue;
                     const a = pts[idx], b = pts[idx + 1];
                     const segDx = b.x - a.x, segDy = b.y - a.y;
-                    const segLen = Math.hypot(segDx, segDy) || 1;
+                    const segLen = Math.sqrt(segDx * segDx + segDy * segDy) || 1;
                     const sLocal = (t - idx * (len / segs)) / segLen;
                     const cx = a.x + segDx * sLocal;
                     const cy = a.y + segDy * sLocal;
@@ -3651,22 +4175,23 @@ export function gameScene(k, { levelIdx }) {
                     k.drawLine({
                         p1: k.vec2(cx + sNx * r - segDx / segLen * 1.2, cy + sNy * r - segDy / segLen * 1.2),
                         p2: k.vec2(cx - sNx * r + segDx / segLen * 1.2, cy - sNy * r + segDy / segLen * 1.2),
-                        width: 0.9, color: k.Color.fromHex("#3a2a06"), opacity: 0.45 * opacity,
+                        width: 0.9, color: colorOf("#3a2a06"), opacity: 0.45 * opacity,
                     });
                 }
                 // Endpoint loops — only at actual chain ends (skip interior chain joints)
                 if (!m.n1._chainNode) {
-                    k.drawCircle({ pos: pts[0], radius: rw * 0.7 + 0.5, color: k.Color.fromHex("#3a2a06"), opacity: 0.55 * opacity });
+                    k.drawCircle({ pos: pts[0], radius: rw * 0.7 + 0.5, color: colorOf("#3a2a06"), opacity: 0.55 * opacity });
                     k.drawCircle({ pos: pts[0], radius: rw * 0.55, color: col, opacity });
                 }
                 if (!m.n2._chainNode) {
-                    k.drawCircle({ pos: pts[segs], radius: rw * 0.7 + 0.5, color: k.Color.fromHex("#3a2a06"), opacity: 0.55 * opacity });
+                    k.drawCircle({ pos: pts[segs], radius: rw * 0.7 + 0.5, color: colorOf("#3a2a06"), opacity: 0.55 * opacity });
                     k.drawCircle({ pos: pts[segs], radius: rw * 0.55, color: col, opacity });
                 }
 
             } else if (m.type === "cable") {
                 // ── STEEL CABLE — sleek dark metallic line with sheen ──
-                const curDist = Math.hypot(m.n2.x - m.n1.x, m.n2.y - m.n1.y);
+                const _cdx = m.n2.x - m.n1.x, _cdy = m.n2.y - m.n1.y;
+                const curDist = Math.sqrt(_cdx * _cdx + _cdy * _cdy);
                 const slackWorld = Math.max(0, m.rest - curDist);
                 // Cable is much stiffer than rope visually — small sag only
                 const sagPx = Math.min(20 * sc, slackWorld * sc * 0.35);
@@ -3684,7 +4209,7 @@ export function gameScene(k, { levelIdx }) {
                 const cw = Math.max(w, 2);
                 // Dark outline
                 for (let i = 0; i < segs; i++) {
-                    k.drawLine({ p1: pts[i], p2: pts[i + 1], width: cw + 1.2, color: k.Color.fromHex("#1a1a1a"), opacity: 0.45 * opacity });
+                    k.drawLine({ p1: pts[i], p2: pts[i + 1], width: cw + 1.2, color: colorOf("#1a1a1a"), opacity: 0.45 * opacity });
                 }
                 // Main cable
                 for (let i = 0; i < segs; i++) {
@@ -3693,22 +4218,22 @@ export function gameScene(k, { levelIdx }) {
                 // Sheen highlight along the top edge of each segment
                 for (let i = 0; i < segs; i++) {
                     const segDx = pts[i + 1].x - pts[i].x, segDy = pts[i + 1].y - pts[i].y;
-                    const segLen = Math.hypot(segDx, segDy) || 1;
+                    const segLen = Math.sqrt(segDx * segDx + segDy * segDy) || 1;
                     const offX = -segDy / segLen * (cw * 0.25);
                     const offY = segDx / segLen * (cw * 0.25);
                     k.drawLine({
                         p1: k.vec2(pts[i].x + offX, pts[i].y + offY),
                         p2: k.vec2(pts[i + 1].x + offX, pts[i + 1].y + offY),
-                        width: 0.8, color: k.Color.fromHex("#9aa0a8"), opacity: 0.55 * opacity,
+                        width: 0.8, color: colorOf("#9aa0a8"), opacity: 0.55 * opacity,
                     });
                 }
                 // End clamps — only at actual chain ends (skip interior joints)
                 if (!m.n1._chainNode) {
-                    k.drawRect({ pos: k.vec2(pts[0].x - 2.2, pts[0].y - 2.2), width: 4.4, height: 4.4, color: k.Color.fromHex("#1a1a1a"), opacity: 0.7 * opacity, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(pts[0].x - 2.2, pts[0].y - 2.2), width: 4.4, height: 4.4, color: colorOf("#1a1a1a"), opacity: 0.7 * opacity, anchor: "topleft" });
                     k.drawRect({ pos: k.vec2(pts[0].x - 1.6, pts[0].y - 1.6), width: 3.2, height: 3.2, color: col, opacity, anchor: "topleft" });
                 }
                 if (!m.n2._chainNode) {
-                    k.drawRect({ pos: k.vec2(pts[segs].x - 2.2, pts[segs].y - 2.2), width: 4.4, height: 4.4, color: k.Color.fromHex("#1a1a1a"), opacity: 0.7 * opacity, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(pts[segs].x - 2.2, pts[segs].y - 2.2), width: 4.4, height: 4.4, color: colorOf("#1a1a1a"), opacity: 0.7 * opacity, anchor: "topleft" });
                     k.drawRect({ pos: k.vec2(pts[segs].x - 1.6, pts[segs].y - 1.6), width: 3.2, height: 3.2, color: col, opacity, anchor: "topleft" });
                 }
             }
@@ -3719,8 +4244,8 @@ export function gameScene(k, { levelIdx }) {
             // vocabulary so fallen pieces read as drowned rather than missing.
             if (layer === "structural-submerged") {
                 const overlayW = Math.max(w, 3) + 1;
-                k.drawLine({ p1, p2, width: overlayW, color: k.Color.fromHex("#3b6d9e"), opacity: 0.55 });
-                k.drawLine({ p1, p2, width: overlayW, color: k.Color.fromHex("#0a1530"), opacity: 0.20 });
+                k.drawLine({ p1, p2, width: overlayW, color: colorOf("#3b6d9e"), opacity: 0.55 });
+                k.drawLine({ p1, p2, width: overlayW, color: colorOf("#0a1530"), opacity: 0.20 });
             }
         }
 
@@ -3734,7 +4259,7 @@ export function gameScene(k, { levelIdx }) {
                     if (n.fixed) continue;
                     if (n._chainNode) continue;  // chain joints don't get the dark dot
                     const p = toScreen(n.x, n.y);
-                    k.drawRect({ pos: k.vec2(p.x - r, p.y - r), width: r * 2, height: r * 2, color: k.Color.fromHex("#5a4a30"), anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(p.x - r, p.y - r), width: r * 2, height: r * 2, color: colorOf("#5a4a30"), anchor: "topleft" });
                 }
             }
         }
@@ -3743,7 +4268,7 @@ export function gameScene(k, { levelIdx }) {
     // ─── Ghost beam while dragging ──────────────────
     function drawGhostBeam(sc) {
         if (!state.dragging || !state.dragStart || state.mode !== "build") return;
-        const sn = snapToGrid(state.mouseWorld.x, state.mouseWorld.y, getAnchors());
+        const sn = snapForBuild(state.mouseWorld.x, state.mouseWorld.y);
         const st = state.dragStart;
         if (sn.x === st.x && sn.y === st.y) return;
 
@@ -3761,13 +4286,13 @@ export function gameScene(k, { levelIdx }) {
         // Range circle (only for straight mode)
         if (!state.lineMode) {
             const ringR = mat.maxLength * sc;
-            k.drawCircle({ pos: p1, radius: ringR, fill: false, outline: { width: 1, color: k.Color.fromHex(ok ? C.accent : C.danger) }, opacity: 0.15 });
+            k.drawCircle({ pos: p1, radius: ringR, fill: false, outline: { width: 1, color: colorOf(ok ? C.accent : C.danger) }, opacity: 0.15 });
         }
 
         // Ghost beam — line fill preview or single segment
         if (state.lineMode && d > GRID) {
             const linePts = getLinePoints(st.x, st.y, sn.x, sn.y);
-            const ghostCol = k.Color.fromHex(ok ? C.accent : C.danger);
+            const ghostCol = colorOf(ok ? C.accent : C.danger);
             for (let li = 0; li < linePts.length - 1; li++) {
                 const lp1 = toScreen(linePts[li].x, linePts[li].y);
                 const lp2 = toScreen(linePts[li + 1].x, linePts[li + 1].y);
@@ -3782,7 +4307,7 @@ export function gameScene(k, { levelIdx }) {
             k.drawLine({
                 p1, p2,
                 width: mat.width * sc * 0.5,
-                color: k.Color.fromHex(ok ? C.pencil : C.danger),
+                color: colorOf(ok ? C.pencil : C.danger),
                 opacity: ok ? 0.5 : 0.3,
             });
         }
@@ -3804,14 +4329,14 @@ export function gameScene(k, { levelIdx }) {
                 pos: k.vec2(mid.x + 8, mid.y - 10),
                 size: 6,
                 font: "PressStart2P",
-                color: k.Color.fromHex("#ffffff"),
+                color: colorOf("#ffffff"),
                 opacity: 0.8,
             });
         }
 
         // Snap indicator on target node
         if (state.nodes.find(n => n.x === sn.x && n.y === sn.y)) {
-            k.drawCircle({ pos: p2, radius: 8, fill: false, outline: { width: 2, color: k.Color.fromHex(C.accent) }, opacity: 0.6 });
+            k.drawCircle({ pos: p2, radius: 8, fill: false, outline: { width: 2, color: colorOf(C.accent) }, opacity: 0.6 });
         }
     }
 
@@ -3833,7 +4358,7 @@ export function gameScene(k, { levelIdx }) {
             for (const m of preview) visible.add(m);
         }
         if (!visible || visible.size === 0) return;
-        const haloCol = k.Color.fromHex(C.accent);
+        const haloCol = colorOf(C.accent);
         for (const m of visible) {
             if (m.broken) continue;
             const isRoad = MATERIALS[m.type].isRoad;
@@ -3884,7 +4409,7 @@ export function gameScene(k, { levelIdx }) {
         // Subtle darker tint inside the box so it reads as a cut-out without
         // adding any color. Pure low-opacity black sits on top of whatever's
         // below (grid, terrain, background).
-        k.drawRect({ pos: k.vec2(x, y), width: w, height: h, color: k.Color.fromHex("#000000"), opacity: 0.10, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(x, y), width: w, height: h, color: colorOf("#000000"), opacity: 0.10, anchor: "topleft" });
 
         // Marching-ants: dashes slide clockwise around the perimeter using a
         // time-based phase offset. White stroke with a thin brown shadow.
@@ -3905,9 +4430,9 @@ export function gameScene(k, { levelIdx }) {
                 const a = k.vec2(ax + ux * t1, ay + uy * t1);
                 const b = k.vec2(ax + ux * t2, ay + uy * t2);
                 // Brown shadow underneath (wider) for contrast against light backgrounds
-                k.drawLine({ p1: a, p2: b, width: 3, color: k.Color.fromHex("#5a3418"), opacity: 0.75 });
+                k.drawLine({ p1: a, p2: b, width: 3, color: colorOf("#5a3418"), opacity: 0.75 });
                 // White dash on top
-                k.drawLine({ p1: a, p2: b, width: 1.6, color: k.Color.fromHex("#ffffff"), opacity: 0.95 });
+                k.drawLine({ p1: a, p2: b, width: 1.6, color: colorOf("#ffffff"), opacity: 0.95 });
             }
         };
         // Draw edges in clockwise order so the phase offset flows in one direction.
@@ -3924,7 +4449,7 @@ export function gameScene(k, { levelIdx }) {
         const archData = state.arches.find(a => a.id === state.editingArchId);
         if (!archData?.nodeSequence) return;
         const interiorSet = new Set(archData.nodeSequence.slice(1, -1));
-        const haloCol = k.Color.fromHex(C.accent);
+        const haloCol = colorOf(C.accent);
         for (const m of state.members) {
             if (m.broken) continue;
             const isArchMember = m.archId === state.editingArchId;
@@ -3944,7 +4469,7 @@ export function gameScene(k, { levelIdx }) {
         // the apex handle isn't being dragged this frame).
         if (state.editingArchId != null) syncArchInPlace();
 
-        const previewCol = k.Color.fromHex(C.accent);
+        const previewCol = colorOf(C.accent);
 
         // Phase A & B helper: ring every valid candidate node so player sees options
         if (!state.archStart || !state.archEnd) {
@@ -4015,8 +4540,8 @@ export function gameScene(k, { levelIdx }) {
         const apex = getArchApexScreen();
         if (apex) {
             const r = state.archDragging ? 11 : 9;
-            k.drawCircle({ pos: k.vec2(apex.x + 1, apex.y + 1), radius: r + 1, color: k.Color.fromHex("#000000"), opacity: 0.3 });
-            k.drawCircle({ pos: apex, radius: r, color: k.Color.fromHex("#fff8e0") });
+            k.drawCircle({ pos: k.vec2(apex.x + 1, apex.y + 1), radius: r + 1, color: colorOf("#000000"), opacity: 0.3 });
+            k.drawCircle({ pos: apex, radius: r, color: colorOf("#fff8e0") });
             k.drawCircle({ pos: apex, radius: r, fill: false, outline: { width: 2.5, color: previewCol } });
             k.drawLine({ p1: k.vec2(apex.x, apex.y - r * 0.55), p2: k.vec2(apex.x, apex.y + r * 0.55), width: 2, color: previewCol });
             k.drawLine({ p1: k.vec2(apex.x - r * 0.55, apex.y), p2: k.vec2(apex.x + r * 0.55, apex.y), width: 2, color: previewCol });
@@ -4040,28 +4565,28 @@ export function gameScene(k, { levelIdx }) {
             k.drawRect({
                 pos: k.vec2(p.x - half + 1, p.y - half + 1.5),
                 width: half * 2, height: half * 2,
-                color: k.Color.fromHex("#010101"),
+                color: colorOf("#010101"),
                 anchor: "topleft", opacity: 0.3, radius: 1,
             });
             // Yellow handle body
             k.drawRect({
                 pos: k.vec2(p.x - half, p.y - half),
                 width: half * 2, height: half * 2,
-                color: k.Color.fromHex(hovered ? "#ffe17a" : "#f0c040"),
+                color: colorOf(hovered ? "#ffe17a" : "#f0c040"),
                 anchor: "topleft", radius: 1,
             });
             // Top highlight strip
             k.drawRect({
                 pos: k.vec2(p.x - half, p.y - half),
                 width: half * 2, height: Math.max(1, sc * 0.7),
-                color: k.Color.fromHex("#fff1a0"),
+                color: colorOf("#fff1a0"),
                 anchor: "topleft",
             });
             // Dark outline
             k.drawRect({
                 pos: k.vec2(p.x - half, p.y - half),
                 width: half * 2, height: half * 2,
-                fill: false, outline: { width: 1, color: k.Color.fromHex("#7a5010") },
+                fill: false, outline: { width: 1, color: colorOf("#7a5010") },
                 anchor: "topleft", radius: 1,
             });
         }
@@ -4069,7 +4594,8 @@ export function gameScene(k, { levelIdx }) {
 
     // ─── Vehicles (sprite-based) ───────────────────
     function drawVehicles(sc) {
-        for (const v of state.vehicles) {
+        for (let vi = 0; vi < state.vehicles.length; vi++) {
+            const v = state.vehicles[vi];
             if (!v.active && v.y > 1100) continue;
 
             const p = toScreen(v.x, v.y);
@@ -4107,7 +4633,7 @@ export function gameScene(k, { levelIdx }) {
                         k.drawLine({
                             p1: k.vec2(wxC + offX - 1.4 * sc, wheelY),
                             p2: k.vec2(wxC + offX + 1.4 * sc, wheelY),
-                            width: 1, color: k.Color.fromHex("#000000"),
+                            width: 1, color: colorOf("#000000"),
                             opacity: 0.22 * fade,
                         });
                     }
@@ -4119,24 +4645,55 @@ export function gameScene(k, { levelIdx }) {
             if (spriteKey) {
                 const sprW = hw * 4;
                 const submerged = !!v._splashed;
+                // Sprites are drawn facing right by default (flipX: true on
+                // a left-facing source). For left-bound vehicles we want them
+                // facing left, so undo the flip.
+                const dir = v._dir || 1;
                 k.drawSprite({
                     sprite: spriteKey,
                     pos: k.vec2(px, drawY - hh * 0.3),
                     width: sprW,
                     height: sprW,
                     anchor: "center",
-                    flipX: true,
+                    flipX: dir > 0,
                     angle: k.rad2deg(vAngle),
-                    color: submerged ? k.Color.fromHex("#456b95") : undefined,
+                    color: submerged ? colorOf("#456b95") : undefined,
                     opacity: submerged ? 0.85 : 1,
                 });
             }
 
-            // Multi-vehicle label badge — bobs along with the sprite.
+            // Multi-vehicle label — a single letter floating above the car
+            // in a per-session random color from the SNAP palette. Same
+            // gentle bob + tilt vocabulary as the FINISH text so they feel
+            // visually related. Color is rolled once at scene init and on
+            // every reset (via rerollLabelColors), not animated each frame.
             if (v.label && !v._splashed) {
-                k.drawCircle({ pos: k.vec2(px, drawY - hh * 1.6), radius: 7 * sc, color: k.Color.fromHex("#010101") });
-                k.drawCircle({ pos: k.vec2(px, drawY - hh * 1.6), radius: 5 * sc, color: k.Color.fromHex(v.cfg.color) });
-                k.drawText({ text: v.label, pos: k.vec2(px, drawY - hh * 1.6), size: 6 * sc, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
+                const letterY = drawY - hh * 3.2;
+                const now = k.time();
+                const bob  = Math.sin(now * 3.0) * 1.5;
+                const tilt = Math.sin(now * 2.1) * 4;
+                const sz   = 11 * sc;
+                const labelColor = (state._carLabelColors && state._carLabelColors[vi]) || SNAP_COLORS[0];
+
+                k.pushTransform();
+                k.pushTranslate(px, letterY + bob);
+                k.pushRotate(tilt);
+
+                k.drawText({
+                    text: v.label, pos: k.vec2(1.5, 1.5),
+                    size: sz, font: "PressStart2P",
+                    color: colorOf("#1a0e05"),
+                    opacity: 0.5, anchor: "center",
+                });
+                const finishedColor = (v._passedFlag || v.finished) ? "#4ade80" : labelColor;
+                k.drawText({
+                    text: v.label, pos: k.vec2(0, 0),
+                    size: sz, font: "PressStart2P",
+                    color: colorOf(finishedColor),
+                    anchor: "center",
+                });
+
+                k.popTransform();
             }
         }
     }
@@ -4148,15 +4705,14 @@ export function gameScene(k, { levelIdx }) {
             k.drawCircle({
                 pos: cp,
                 radius: p.r * p.life * sc,
-                color: k.Color.fromHex(p.color),
+                color: colorOf(p.color),
                 opacity: p.life,
             });
         }
     }
 
-    // ─── SNAP! popup + confetti burst (on bridge break) ────
-    // Colors echo the logo / main-menu confetti palette for a playful craft vibe
-    const SNAP_COLORS = ["#e05080","#50a0e0","#e0c030","#50c060","#e07030","#a060d0"];
+    // (SNAP_COLORS palette hoisted to the top of the scene so init-time
+    // helpers like rerollLabelColors can read from it.)
 
     function spawnSnapVfx(wx, wy) {
         // Shuffle palette so each letter gets a unique color (Fisher–Yates on a copy)
@@ -4212,7 +4768,7 @@ export function gameScene(k, { levelIdx }) {
                 k.vec2(cp.x + ( hw * cos -   hh  * sin), cp.y + ( hw * sin +   hh  * cos)),
                 k.vec2(cp.x + (-hw * cos -   hh  * sin), cp.y + (-hw * sin +   hh  * cos)),
             ];
-            const fill = k.Color.fromHex(c.color);
+            const fill = colorOf(c.color);
             k.drawTriangle({ p1: pts[0], p2: pts[1], p3: pts[2], color: fill, opacity });
             k.drawTriangle({ p1: pts[0], p2: pts[2], p3: pts[3], color: fill, opacity });
         }
@@ -4264,7 +4820,7 @@ export function gameScene(k, { levelIdx }) {
                     pos: k.vec2(2 * sc, 2 * sc),
                     size: fontSize,
                     font: "PressStart2P",
-                    color: k.Color.fromHex("#1a0e05"),
+                    color: colorOf("#1a0e05"),
                     opacity: opacity * 0.45,
                     anchor: "center",
                 });
@@ -4274,7 +4830,7 @@ export function gameScene(k, { levelIdx }) {
                     pos: k.vec2(0, 0),
                     size: fontSize,
                     font: "PressStart2P",
-                    color: k.Color.fromHex(L.color),
+                    color: colorOf(L.color),
                     opacity,
                     anchor: "center",
                 });
@@ -4285,88 +4841,140 @@ export function gameScene(k, { levelIdx }) {
     }
 
     // ─── Finish flags ───────────────────────────────
+    // Flag variant comes from the level config (mv.flag: "red" | "blue").
+    // The sprite is rendered as-is — no per-vehicle hex tinting, since the
+    // pixel-art shading reads cleanly only in its native palette.
+    const FLAG_SPRITE = { red: "flag", blue: "flagBlue" };
+    const flagSpriteFor = (mv) => FLAG_SPRITE[mv && mv.flag] || "flag";
+
     function drawFlags(sc) {
-        const FLAG_INLAND = 80;
-        // Flag base sits on the asphalt's top surface, which is 5 world units
-        // above the anchor (ROAD_H / 2) after the road-surface alignment pass.
-        const flagBaseY = rY - ROAD_H / 2;
+        // FLAG_INLAND_* imported from constants.js (shared with physics finish thresholds)
+        const baseYR = rY - ROAD_H / 2;
+        const baseYL = lY - ROAD_H / 2;
         if (lvlDef.multiVehicle) {
+            let nextR = 0, nextL = 0;
             lvlDef.multiVehicle.forEach((mv, i) => {
-                const triggered = state.vehicles[i]?.finished;
-                drawOneFlag(rX + FLAG_INLAND + i * 30, flagBaseY, mv.color, mv.label, triggered, sc);
+                const v = state.vehicles[i];
+                // _passedFlag fires the moment the car crosses its flag — for
+                // passOnly cars that's well before .finished (which waits
+                // until they're fully off-screen).
+                const triggered = !!(v && (v._passedFlag || v.finished));
+                const goalSide = v?._goalSide || mv.goalSide || (mv.dir === -1 ? "L" : "R");
+                const sprite = flagSpriteFor(mv);
+                if (goalSide === "L") {
+                    drawOneFlag(lX - FLAG_INLAND_L - nextL * 30, baseYL, mv.label, triggered, sc, "L", i, sprite);
+                    nextL++;
+                } else {
+                    drawOneFlag(rX + FLAG_INLAND_R + nextR * 30, baseYR, mv.label, triggered, sc, "R", i, sprite);
+                    nextR++;
+                }
             });
         } else {
-            drawOneFlag(rX + FLAG_INLAND, flagBaseY, "#dc2626", null, state.mode === "end" && state.finished, sc);
+            drawOneFlag(rX + FLAG_INLAND_R, baseYR, null, state.mode === "end" && state.finished, sc, "R", 0, "flag");
         }
     }
 
-    function drawOneFlag(wx, wy, color, label, triggered, sc) {
+    function drawOneFlag(wx, wy, label, triggered, sc, side = "R", vehicleIdx = 0, sprite = "flag") {
         const p = toScreen(wx, wy);
-        const flagH = sc * 70;      // taller so the flag reads from the ground
+        const flagH = sc * 58;      // slightly smaller than before — easier on the eye
         const flagW = flagH;
 
         // Flag sprite has a small empty strip at the bottom of its frame, so
         // we shift the draw origin down by ~5% of the rendered height. That
-        // makes the yellow pole base actually touch the road surface.
+        // makes the pole base actually touch the road surface.
         const flagBottomY = p.y + flagH * 0.08;
         const frame = Math.floor(state.flagWave * 3) % 5;
         try {
             k.drawSprite({
-                sprite: "flag",
+                sprite,
                 frame: frame,
                 pos: k.vec2(p.x, flagBottomY),
                 width: flagW,
                 height: flagH,
                 anchor: "botleft",
+                flipX: side === "L",
             });
         } catch(e) {
             // Fallback rectangle flag
             const poleH = flagH;
-            k.drawLine({ p1: k.vec2(p.x, flagBottomY), p2: k.vec2(p.x, flagBottomY - poleH), width: 2, color: k.Color.fromHex("#94a3b8") });
-            k.drawRect({ pos: k.vec2(p.x + sc * 13, flagBottomY - poleH + sc * 8), width: sc * 26, height: sc * 17, color: k.Color.fromHex(color), anchor: "center" });
+            k.drawLine({ p1: k.vec2(p.x, flagBottomY), p2: k.vec2(p.x, flagBottomY - poleH), width: 2, color: colorOf("#94a3b8") });
+            k.drawRect({
+                pos: k.vec2(p.x + sc * 13, flagBottomY - poleH + sc * 8),
+                width: sc * 26,
+                height: sc * 17,
+                color: colorOf(sprite === "flagBlue" ? "#3a6ec0" : "#c43030"),
+                anchor: "center",
+            });
         }
 
-        // FINISH label — animated like the SNAP! popup: each letter gets a
-        // distinct color from the logo palette, a subtle continuous sine bob
-        // (different phase per letter), and a tiny per-letter tilt wiggle.
-        const txt = label ? `CAR ${label}` : "FINISH";
-        const letterSize = Math.max(6, 6 * sc);
-        const letterSpacing = letterSize * 1.1;     // PressStart2P ≈ square glyphs
-        const totalW = (txt.length - 1) * letterSpacing;
+        // Label layout — stacked. The car-letter (A / B / …) sits ABOVE the
+        // word FINISH and renders at ~1.6× the FINISH letter size, in the
+        // same color as the floating letter over its matching car (pulled
+        // from _carLabelColors so the pairing is unambiguous). The FINISH
+        // row keeps its per-letter random colors and the soft bob/tilt.
+        const finishSize = Math.max(6, 6 * sc);
+        // Match the size of the floating letter above each car (11 * sc).
+        const carLetterSize = 11 * sc;
         const labelCx = p.x + flagW * 0.5;
-        const labelY = flagBottomY - flagH - 6 * sc;
+        const finishBaseY = flagBottomY - flagH - 6 * sc;
+        const carLetterY = finishBaseY - carLetterSize - 4 * sc;
         const now = k.time();
+        const flagColors = (state._flagTextColors && state._flagTextColors[vehicleIdx]) || [];
+        const carLetterCol = (state._carLabelColors && state._carLabelColors[vehicleIdx]) || SNAP_COLORS[0];
 
-        for (let i = 0; i < txt.length; i++) {
-            const ch = txt[i];
-            const color = triggered ? "#4ade80" : SNAP_COLORS[i % SNAP_COLORS.length];
+        // Top row: just the car letter (skipped on the single-vehicle case).
+        if (label) {
+            const bob  = Math.sin(now * 3.0) * 1.5;
+            const tilt = Math.sin(now * 2.1) * 4;
+            k.pushTransform();
+            k.pushTranslate(labelCx, carLetterY + bob);
+            k.pushRotate(tilt);
+            k.drawText({
+                text: label, pos: k.vec2(2, 2),
+                size: carLetterSize, font: "PressStart2P",
+                color: colorOf("#1a0e05"),
+                opacity: 0.5,
+                anchor: "center",
+            });
+            k.drawText({
+                text: label, pos: k.vec2(0, 0),
+                size: carLetterSize, font: "PressStart2P",
+                color: colorOf(triggered ? "#4ade80" : carLetterCol),
+                anchor: "center",
+            });
+            k.popTransform();
+        }
+
+        // Bottom row: the word "FINISH" with per-letter random colors.
+        const finishTxt = "FINISH";
+        const kernW = finishSize * 1.05;
+        let cursor = labelCx - (finishTxt.length * kernW) / 2 + kernW * 0.5;
+        for (let i = 0; i < finishTxt.length; i++) {
+            const ch = finishTxt[i];
+            const col = triggered ? "#4ade80" : (flagColors[i] || SNAP_COLORS[i % SNAP_COLORS.length]);
             const bob  = Math.sin(now * 3.0 + i * 0.6) * 1.5;
-            const tilt = Math.sin(now * 2.1 + i * 0.9) * 4;     // degrees
-
-            const lx = labelCx - totalW / 2 + i * letterSpacing;
-            const ly = labelY + bob;
+            const tilt = Math.sin(now * 2.1 + i * 0.9) * 4;
 
             k.pushTransform();
-            k.pushTranslate(lx, ly);
+            k.pushTranslate(cursor, finishBaseY + bob);
             k.pushRotate(tilt);
 
-            // Shadow pass for legibility
             k.drawText({
                 text: ch, pos: k.vec2(1.5, 1.5),
-                size: letterSize, font: "PressStart2P",
-                color: k.Color.fromHex("#1a0e05"),
+                size: finishSize, font: "PressStart2P",
+                color: colorOf("#1a0e05"),
                 opacity: 0.45,
                 anchor: "center",
             });
-            // Colored main letter
             k.drawText({
                 text: ch, pos: k.vec2(0, 0),
-                size: letterSize, font: "PressStart2P",
-                color: k.Color.fromHex(color),
+                size: finishSize, font: "PressStart2P",
+                color: colorOf(col),
                 anchor: "center",
             });
 
             k.popTransform();
+            cursor += kernW;
         }
     }
 
@@ -4379,13 +4987,13 @@ export function gameScene(k, { levelIdx }) {
         const tb = getToolbar();
 
         // Wooden toolbar bar
-        k.drawRect({ pos: k.vec2(0, 0), width: W, height: tb.h + tb.pad, color: k.Color.fromHex("#d37e3d"), anchor: "topleft" });
-        k.drawRect({ pos: k.vec2(0, tb.h + tb.pad - 3), width: W, height: 3, color: k.Color.fromHex("#8e4924"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(0, 0), width: W, height: tb.h + tb.pad, color: colorOf("#d37e3d"), anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(0, tb.h + tb.pad - 3), width: W, height: 3, color: colorOf("#8e4924"), anchor: "topleft" });
         // Subtle wood grain
         for (let tx = 0; tx < W; tx += 14) {
-            k.drawLine({ p1: k.vec2(tx, 0), p2: k.vec2(tx + 3, tb.h + tb.pad), width: 0.5, color: k.Color.fromHex("#8e4924"), opacity: 0.12 });
+            k.drawLine({ p1: k.vec2(tx, 0), p2: k.vec2(tx + 3, tb.h + tb.pad), width: 0.5, color: colorOf("#8e4924"), opacity: 0.12 });
         }
-        k.drawRect({ pos: k.vec2(0, tb.h + tb.pad), width: W, height: 2, color: k.Color.fromHex("#010101"), anchor: "topleft", opacity: 0.3 });
+        k.drawRect({ pos: k.vec2(0, tb.h + tb.pad), width: W, height: 2, color: colorOf("#010101"), anchor: "topleft", opacity: 0.3 });
 
         // Budget display — glow + shake scales with how over-budget you are
         const cost = calcCost(state.members);
@@ -4417,7 +5025,7 @@ export function gameScene(k, { levelIdx }) {
                     pos: k.vec2(bx - 4 - ring, by - 4 - ring),
                     width: textW + 8 + ring * 2,
                     height: 22 + ring * 2,
-                    color: k.Color.fromHex(budgetColor),
+                    color: colorOf(budgetColor),
                     opacity: glowAlpha * (0.35 / ring),
                     anchor: "topleft",
                     radius: 4 + ring,
@@ -4430,7 +5038,7 @@ export function gameScene(k, { levelIdx }) {
             pos: k.vec2(bx, by),
             size: 14,
             font: "PressStart2P",
-            color: k.Color.fromHex(budgetColor),
+            color: colorOf(budgetColor),
         });
 
         // Level name — sits right under the budget readout, still inside the
@@ -4440,7 +5048,7 @@ export function gameScene(k, { levelIdx }) {
             pos: k.vec2(12, by + 18),
             size: 8,
             font: "PressStart2P",
-            color: k.Color.fromHex("#fff8e0"),
+            color: colorOf("#fff8e0"),
             opacity: 0.5,
         });
 
@@ -4500,14 +5108,14 @@ export function gameScene(k, { levelIdx }) {
             if (upgradeKey && !isExpanded) {
                 const bX = bx + tb.matBtnW - 10;
                 const bY = by + 4;
-                k.drawCircle({ pos: k.vec2(bX + 0.5, bY + 0.5), radius: 5, color: k.Color.fromHex("#000000"), opacity: 0.3 });
-                k.drawCircle({ pos: k.vec2(bX, bY), radius: 4.5, color: k.Color.fromHex("#5a3418") });
-                k.drawCircle({ pos: k.vec2(bX, bY), radius: 3.5, color: k.Color.fromHex("#d37e3d") });
+                k.drawCircle({ pos: k.vec2(bX + 0.5, bY + 0.5), radius: 5, color: colorOf("#000000"), opacity: 0.3 });
+                k.drawCircle({ pos: k.vec2(bX, bY), radius: 4.5, color: colorOf("#5a3418") });
+                k.drawCircle({ pos: k.vec2(bX, bY), radius: 3.5, color: colorOf("#d37e3d") });
                 k.drawText({
                     text: "+",
                     pos: k.vec2(bX, bY - 1),
                     size: 9, font: "PressStart2P",
-                    color: k.Color.fromHex("#fff8e0"),
+                    color: colorOf("#fff8e0"),
                     anchor: "center",
                 });
             }
@@ -4516,14 +5124,14 @@ export function gameScene(k, { levelIdx }) {
             if (upgradeKey && isExpanded) {
                 const bX = bx + tb.matBtnW - 10;
                 const bY = by + 4;
-                k.drawCircle({ pos: k.vec2(bX + 0.5, bY + 0.5), radius: 5, color: k.Color.fromHex("#000000"), opacity: 0.3 });
-                k.drawCircle({ pos: k.vec2(bX, bY), radius: 4.5, color: k.Color.fromHex("#5a3418") });
-                k.drawCircle({ pos: k.vec2(bX, bY), radius: 3.5, color: k.Color.fromHex("#8e4924") });
+                k.drawCircle({ pos: k.vec2(bX + 0.5, bY + 0.5), radius: 5, color: colorOf("#000000"), opacity: 0.3 });
+                k.drawCircle({ pos: k.vec2(bX, bY), radius: 4.5, color: colorOf("#5a3418") });
+                k.drawCircle({ pos: k.vec2(bX, bY), radius: 3.5, color: colorOf("#8e4924") });
                 k.drawText({
                     text: "×",
                     pos: k.vec2(bX, bY - 1),
                     size: 9, font: "PressStart2P",
-                    color: k.Color.fromHex("#fff8e0"),
+                    color: colorOf("#fff8e0"),
                     anchor: "center",
                 });
             }
@@ -4538,8 +5146,8 @@ export function gameScene(k, { levelIdx }) {
             const divY = tb.selectBtn.y + 4;
             const divH = tb.selectBtn.h - 8;
             // Dark shadow + cream highlight for a crisp inlay look
-            k.drawRect({ pos: k.vec2(divX + 0.5, divY), width: 1.5, height: divH, color: k.Color.fromHex("#5a3418"), anchor: "topleft", opacity: 0.55 });
-            k.drawRect({ pos: k.vec2(divX - 0.5, divY), width: 1, height: divH, color: k.Color.fromHex("#fff8e0"), anchor: "topleft", opacity: 0.25 });
+            k.drawRect({ pos: k.vec2(divX + 0.5, divY), width: 1.5, height: divH, color: colorOf("#5a3418"), anchor: "topleft", opacity: 0.55 });
+            k.drawRect({ pos: k.vec2(divX - 0.5, divY), width: 1, height: divH, color: colorOf("#fff8e0"), anchor: "topleft", opacity: 0.25 });
         }
 
         // ─── Action buttons ───
@@ -4576,12 +5184,12 @@ export function gameScene(k, { levelIdx }) {
     // icon can be: a 2D pixel grid, a function (cx, cy, col) => void, or falsy.
     function drawIconBtn(rect, icon, iconColor, bgColor, pxSize, text) {
         // Drop shadow for a raised-chip look
-        k.drawRect({ pos: k.vec2(rect.x + 1, rect.y + 2), width: rect.w, height: rect.h, color: k.Color.fromHex("#010101"), opacity: 0.25, anchor: "topleft", radius: 3 });
+        k.drawRect({ pos: k.vec2(rect.x + 1, rect.y + 2), width: rect.w, height: rect.h, color: colorOf("#010101"), opacity: 0.25, anchor: "topleft", radius: 3 });
         // Background
-        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: k.Color.fromHex(bgColor || "#8e4924"), anchor: "topleft", radius: 3 });
+        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: colorOf(bgColor || "#8e4924"), anchor: "topleft", radius: 3 });
         // Top highlight
-        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: 1, color: k.Color.fromHex("#ffffff"), opacity: 0.2, anchor: "topleft" });
-        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1, color: k.Color.fromHex("#010101") }, anchor: "topleft", opacity: 0.3, radius: 3 });
+        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: 1, color: colorOf("#ffffff"), opacity: 0.2, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1, color: colorOf("#010101") }, anchor: "topleft", opacity: 0.3, radius: 3 });
 
         const cx = rect.x + rect.w / 2;
         const cy = rect.y + rect.h / 2;
@@ -4596,12 +5204,12 @@ export function gameScene(k, { levelIdx }) {
             const leftX = cx - totalW / 2;
             if (isFn) icon(leftX + iconW / 2, cy, iconColor);
             else drawIcon(icon, leftX + iconW / 2, cy, iconColor, pxSize);
-            k.drawText({ text, pos: k.vec2(leftX + iconW + gap, cy - 4), size: 7, font: "PressStart2P", color: k.Color.fromHex(iconColor) });
+            k.drawText({ text, pos: k.vec2(leftX + iconW + gap, cy - 4), size: 7, font: "PressStart2P", color: colorOf(iconColor) });
         } else if (hasIcon) {
             if (isFn) icon(cx, cy, iconColor);
             else drawIcon(icon, cx, cy, iconColor, pxSize);
         } else if (text) {
-            k.drawText({ text, pos: k.vec2(cx, cy), size: 8, font: "PressStart2P", color: k.Color.fromHex(iconColor), anchor: "center" });
+            k.drawText({ text, pos: k.vec2(cx, cy), size: 8, font: "PressStart2P", color: colorOf(iconColor), anchor: "center" });
         }
     }
 
@@ -4621,12 +5229,12 @@ export function gameScene(k, { levelIdx }) {
         const py = H - panelH - 14;
 
         // Sticky note
-        k.drawRect({ pos: k.vec2(px + 2, py + 2), width: panelW, height: panelH, color: k.Color.fromHex("#000000"), opacity: 0.1, anchor: "topleft", radius: 2 });
-        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: k.Color.fromHex("#fff9c4"), anchor: "topleft", radius: 1 });
-        k.drawRect({ pos: k.vec2(px + panelW / 2 - 20, py - 5), width: 40, height: 12, color: k.Color.fromHex(C.tape), anchor: "topleft", opacity: 0.55 });
+        k.drawRect({ pos: k.vec2(px + 2, py + 2), width: panelW, height: panelH, color: colorOf("#000000"), opacity: 0.1, anchor: "topleft", radius: 2 });
+        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: colorOf("#fff9c4"), anchor: "topleft", radius: 1 });
+        k.drawRect({ pos: k.vec2(px + panelW / 2 - 20, py - 5), width: 40, height: 12, color: colorOf(C.tape), anchor: "topleft", opacity: 0.55 });
 
-        k.drawText({ text: "HINT", pos: k.vec2(px + 10, py + 10), size: 10, font: "PressStart2P", color: k.Color.fromHex(C.markerBlue) });
-        k.drawText({ text: lvlDef.hint, pos: k.vec2(px + 10, py + 30), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - 20, lineSpacing: 4 });
+        k.drawText({ text: "HINT", pos: k.vec2(px + 10, py + 10), size: 10, font: "PressStart2P", color: colorOf(C.markerBlue) });
+        k.drawText({ text: lvlDef.hint, pos: k.vec2(px + 10, py + 30), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - 20, lineSpacing: 4 });
     }
 
     // ─── Per-level tutorial ─────────────────────────
@@ -4815,6 +5423,19 @@ export function gameScene(k, { levelIdx }) {
         }
     }
 
+    // Cache the tutorial spotlight rect by step. Building it can be costly
+    // (filters + sorts over state.nodes, getToolbar(), toScreen, etc.) and
+    // the result is stable for the duration of a step — anchors don't move
+    // and the toolbar layout doesn't change while the tutorial is open.
+    let _tutTgtCache = null;
+    let _tutTgtCacheStep = -1;
+    function tutorialTargetCached(stepObj) {
+        if (state.tutorialStep === _tutTgtCacheStep && _tutTgtCache) return _tutTgtCache;
+        _tutTgtCache = getTutorialTarget(stepObj.key);
+        _tutTgtCacheStep = state.tutorialStep;
+        return _tutTgtCache;
+    }
+
     function drawTutorialOverlay() {
         let step = TUTORIAL_STEPS[state.tutorialStep];
         if (!step) { state.tutorialActive = false; return; }
@@ -4853,19 +5474,27 @@ export function gameScene(k, { levelIdx }) {
         // tower on level 3). We dim the union bounding box's exterior with
         // four bands, then for multi-rect targets paint dim back over the
         // gap regions inside the union that aren't covered by any rect.
-        const tgtRaw = getTutorialTarget(step.key);
+        const tgtRaw = tutorialTargetCached(step);
         const tgts = Array.isArray(tgtRaw) ? tgtRaw : [tgtRaw];
         const dim = "#010101";
         const dimA = 0.55;
-        const minX = Math.min(...tgts.map(r => r.x));
-        const minY = Math.min(...tgts.map(r => r.y));
-        const maxX = Math.max(...tgts.map(r => r.x + r.w));
-        const maxY = Math.max(...tgts.map(r => r.y + r.h));
+        // Compute union bounds with a plain loop — the original `Math.min(...arr.map(...))`
+        // pattern allocates a small array per call (4 calls × every frame).
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let i = 0; i < tgts.length; i++) {
+            const r = tgts[i];
+            if (r.x < minX) minX = r.x;
+            if (r.y < minY) minY = r.y;
+            const rRight = r.x + r.w;
+            const rBot   = r.y + r.h;
+            if (rRight > maxX) maxX = rRight;
+            if (rBot   > maxY) maxY = rBot;
+        }
         // Outer four bands
-        k.drawRect({ pos: k.vec2(0, 0), width: W, height: Math.max(0, minY), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
-        k.drawRect({ pos: k.vec2(0, maxY), width: W, height: Math.max(0, H - maxY), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
-        k.drawRect({ pos: k.vec2(0, minY), width: Math.max(0, minX), height: maxY - minY, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
-        k.drawRect({ pos: k.vec2(maxX, minY), width: Math.max(0, W - maxX), height: maxY - minY, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(0, 0), width: W, height: Math.max(0, minY), color: colorOf(dim), opacity: dimA, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(0, maxY), width: W, height: Math.max(0, H - maxY), color: colorOf(dim), opacity: dimA, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(0, minY), width: Math.max(0, minX), height: maxY - minY, color: colorOf(dim), opacity: dimA, anchor: "topleft" });
+        k.drawRect({ pos: k.vec2(maxX, minY), width: Math.max(0, W - maxX), height: maxY - minY, color: colorOf(dim), opacity: dimA, anchor: "topleft" });
         // For multi-rect targets, dim the inside-union gaps too. We sort
         // the rects left-to-right and dim the horizontal gaps between
         // each adjacent pair plus any top/bottom slack against the union.
@@ -4874,17 +5503,17 @@ export function gameScene(k, { levelIdx }) {
             for (let i = 0; i < sorted.length; i++) {
                 const r = sorted[i];
                 if (r.y > minY) {
-                    k.drawRect({ pos: k.vec2(r.x, minY), width: r.w, height: r.y - minY, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(r.x, minY), width: r.w, height: r.y - minY, color: colorOf(dim), opacity: dimA, anchor: "topleft" });
                 }
                 if (r.y + r.h < maxY) {
-                    k.drawRect({ pos: k.vec2(r.x, r.y + r.h), width: r.w, height: maxY - (r.y + r.h), color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+                    k.drawRect({ pos: k.vec2(r.x, r.y + r.h), width: r.w, height: maxY - (r.y + r.h), color: colorOf(dim), opacity: dimA, anchor: "topleft" });
                 }
                 if (i < sorted.length - 1) {
                     const next = sorted[i + 1];
                     const gapX = r.x + r.w;
                     const gapW = next.x - gapX;
                     if (gapW > 0) {
-                        k.drawRect({ pos: k.vec2(gapX, minY), width: gapW, height: maxY - minY, color: k.Color.fromHex(dim), opacity: dimA, anchor: "topleft" });
+                        k.drawRect({ pos: k.vec2(gapX, minY), width: gapW, height: maxY - minY, color: colorOf(dim), opacity: dimA, anchor: "topleft" });
                     }
                 }
             }
@@ -4899,7 +5528,7 @@ export function gameScene(k, { levelIdx }) {
                     pos: k.vec2(r.x - ring, r.y - ring),
                     width: r.w + ring * 2, height: r.h + ring * 2,
                     fill: false,
-                    outline: { width: 2, color: k.Color.fromHex(ringCol) },
+                    outline: { width: 2, color: colorOf(ringCol) },
                     opacity: (0.3 + 0.35 * ringPulse) * (ring === 1 ? 1 : 0.35 / ring),
                     anchor: "topleft",
                     radius: 4,
@@ -4919,9 +5548,9 @@ export function gameScene(k, { levelIdx }) {
         const panelY = targetCY < H / 2 ? H - panelH - 30 : 30;
 
         // Sticky-note card (matches the hint panel vocabulary)
-        k.drawRect({ pos: k.vec2(panelX + 3, panelY + 4), width: panelW, height: panelH, color: k.Color.fromHex("#000000"), opacity: 0.35, anchor: "topleft", radius: 3 });
-        k.drawRect({ pos: k.vec2(panelX, panelY), width: panelW, height: panelH, color: k.Color.fromHex("#fff9c4"), anchor: "topleft", radius: 2 });
-        k.drawRect({ pos: k.vec2(panelX + panelW / 2 - 28, panelY - 6), width: 56, height: 14, color: k.Color.fromHex(C.tape), anchor: "topleft", opacity: 0.55 });
+        k.drawRect({ pos: k.vec2(panelX + 3, panelY + 4), width: panelW, height: panelH, color: colorOf("#000000"), opacity: 0.35, anchor: "topleft", radius: 3 });
+        k.drawRect({ pos: k.vec2(panelX, panelY), width: panelW, height: panelH, color: colorOf("#fff9c4"), anchor: "topleft", radius: 2 });
+        k.drawRect({ pos: k.vec2(panelX + panelW / 2 - 28, panelY - 6), width: 56, height: 14, color: colorOf(C.tape), anchor: "topleft", opacity: 0.55 });
 
         // Title
         k.drawText({
@@ -4929,7 +5558,7 @@ export function gameScene(k, { levelIdx }) {
             pos: k.vec2(panelX + 16, panelY + 14),
             size: 14,
             font: "PressStart2P",
-            color: k.Color.fromHex(C.markerBlue),
+            color: colorOf(C.markerBlue),
         });
         // Step counter (e.g. "2 / 6") in the top-right corner
         k.drawText({
@@ -4937,7 +5566,7 @@ export function gameScene(k, { levelIdx }) {
             pos: k.vec2(panelX + panelW - 16, panelY + 14),
             size: 9,
             font: "PressStart2P",
-            color: k.Color.fromHex(C.pencil),
+            color: colorOf(C.pencil),
             opacity: 0.55,
             anchor: "topright",
         });
@@ -4951,7 +5580,7 @@ export function gameScene(k, { levelIdx }) {
             pos: k.vec2(panelX + 16, panelY + 44),
             size: 18,
             font: "PatrickHand",
-            color: k.Color.fromHex(C.pencil),
+            color: colorOf(C.pencil),
             width: panelW - 32,
             lineSpacing: 4,
         });
@@ -4969,7 +5598,7 @@ export function gameScene(k, { levelIdx }) {
                 pos: k.vec2(panelX + panelW - 16, panelY + panelH - 14),
                 size: 9,
                 font: "PressStart2P",
-                color: k.Color.fromHex(step.awaitExpand ? C.markerGreen : C.markerBlue),
+                color: colorOf(step.awaitExpand ? C.markerGreen : C.markerBlue),
                 opacity: pulse,
                 anchor: "botright",
             });
@@ -5040,28 +5669,28 @@ export function gameScene(k, { levelIdx }) {
         }
 
         // Sticky-note background with tape strip (match the HINT panel)
-        k.drawRect({ pos: k.vec2(px + 2, py + 2), width: panelW, height: panelH, color: k.Color.fromHex("#000000"), opacity: 0.1, anchor: "topleft", radius: 2 });
-        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: k.Color.fromHex("#fff9c4"), anchor: "topleft", radius: 1 });
-        k.drawRect({ pos: k.vec2(px + panelW / 2 - 20, py - 5), width: 40, height: 12, color: k.Color.fromHex(C.tape), anchor: "topleft", opacity: 0.55 });
+        k.drawRect({ pos: k.vec2(px + 2, py + 2), width: panelW, height: panelH, color: colorOf("#000000"), opacity: 0.1, anchor: "topleft", radius: 2 });
+        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: colorOf("#fff9c4"), anchor: "topleft", radius: 1 });
+        k.drawRect({ pos: k.vec2(px + panelW / 2 - 20, py - 5), width: 40, height: 12, color: colorOf(C.tape), anchor: "topleft", opacity: 0.55 });
 
-        k.drawText({ text: "AI TUTOR", pos: k.vec2(px + padX, py + 12), size: 10, font: "PressStart2P", color: k.Color.fromHex(C.markerBlue) });
+        k.drawText({ text: "AI TUTOR", pos: k.vec2(px + padX, py + 12), size: 10, font: "PressStart2P", color: colorOf(C.markerBlue) });
 
         if (state.aiLoading) {
-            k.drawText({ text: "Thinking...", pos: k.vec2(px + padX, py + 44), size: 18, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.6 });
+            k.drawText({ text: "Thinking...", pos: k.vec2(px + padX, py + 44), size: 18, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.6 });
             return;
         }
 
         if (state.aiResult?.error) {
-            k.drawText({ text: state.aiResult.error, pos: k.vec2(px + padX, py + 44), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.danger), width: panelW - padX * 2, lineSpacing: 3 });
+            k.drawText({ text: state.aiResult.error, pos: k.vec2(px + padX, py + 44), size: 16, font: "PatrickHand", color: colorOf(C.danger), width: panelW - padX * 2, lineSpacing: 3 });
             return;
         }
 
         // Fallback: level-not-beaten tip
         if (!hasSteps && state.aiResult?.explanation) {
             if (state.aiResult.concept) {
-                k.drawText({ text: `Concept: ${state.aiResult.concept}`, pos: k.vec2(px + padX, py + 38), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.markerGreen) });
+                k.drawText({ text: `Concept: ${state.aiResult.concept}`, pos: k.vec2(px + padX, py + 38), size: 16, font: "PatrickHand", color: colorOf(C.markerGreen) });
             }
-            k.drawText({ text: state.aiResult.explanation, pos: k.vec2(px + padX, py + 62), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            k.drawText({ text: state.aiResult.explanation, pos: k.vec2(px + padX, py + 62), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
             return;
         }
 
@@ -5070,7 +5699,7 @@ export function gameScene(k, { levelIdx }) {
             const tip = beaten
                 ? "Click the AI button to start an\ninteractive lesson!"
                 : "Beat this level first to unlock\nthe AI tutor!";
-            k.drawText({ text: tip, pos: k.vec2(px + padX, py + 44), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4, opacity: 0.5 });
+            k.drawText({ text: tip, pos: k.vec2(px + padX, py + 44), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4, opacity: 0.5 });
             return;
         }
 
@@ -5079,18 +5708,18 @@ export function gameScene(k, { levelIdx }) {
         const totalSteps = lesson.steps.length;
 
         if (lesson.concept) {
-            k.drawText({ text: lesson.concept, pos: k.vec2(px + padX, py + 34), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.markerGreen) });
+            k.drawText({ text: lesson.concept, pos: k.vec2(px + padX, py + 34), size: 16, font: "PatrickHand", color: colorOf(C.markerGreen) });
         }
         k.drawText({
             text: `Step ${Math.min(state.aiStepIdx + 1, totalSteps)} / ${totalSteps}`,
             pos: k.vec2(px + panelW - padX, py + 34),
-            size: 14, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.6, anchor: "topright",
+            size: 14, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.6, anchor: "topright",
         });
 
         if (state.aiPhase === "question" && step) {
             // Question text — top of the body region, just under the header row.
             const questionY = py + 12 + 22 + 20;
-            k.drawText({ text: step.question, pos: k.vec2(px + padX, questionY), size: 17, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            k.drawText({ text: step.question, pos: k.vec2(px + padX, questionY), size: 17, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
 
             // Options stacked under the question, each sized to its own text.
             let optY = questionY + layout.qH + 12;
@@ -5098,10 +5727,10 @@ export function gameScene(k, { levelIdx }) {
                 const optHi = layout.optHs[i];
                 const rect = { x: px + padX, y: optY, w: panelW - padX * 2, h: optHi };
                 state.aiOptionRects.push(rect);
-                k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: k.Color.fromHex("#fffdea"), anchor: "topleft", radius: 2 });
-                k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1.5, color: k.Color.fromHex(C.markerBlue) }, anchor: "topleft", radius: 2, opacity: 0.7 });
-                k.drawText({ text: String.fromCharCode(65 + i), pos: k.vec2(rect.x + 12, rect.y + rect.h / 2), size: 14, font: "PressStart2P", color: k.Color.fromHex(C.markerBlue), anchor: "left" });
-                k.drawText({ text: step.options[i], pos: k.vec2(rect.x + 40, rect.y + rect.h / 2), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: rect.w - 50, anchor: "left", lineSpacing: 3 });
+                k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: colorOf("#fffdea"), anchor: "topleft", radius: 2 });
+                k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1.5, color: colorOf(C.markerBlue) }, anchor: "topleft", radius: 2, opacity: 0.7 });
+                k.drawText({ text: String.fromCharCode(65 + i), pos: k.vec2(rect.x + 12, rect.y + rect.h / 2), size: 14, font: "PressStart2P", color: colorOf(C.markerBlue), anchor: "left" });
+                k.drawText({ text: step.options[i], pos: k.vec2(rect.x + 40, rect.y + rect.h / 2), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: rect.w - 50, anchor: "left", lineSpacing: 3 });
                 optY += optHi + 8;
             }
             return;
@@ -5112,37 +5741,37 @@ export function gameScene(k, { levelIdx }) {
             const bannerColor = correct ? C.markerGreen : C.markerRed;
 
             const bannerY = py + 12 + 22 + 22;
-            k.drawText({ text: correct ? "RIGHT!" : "NOT QUITE", pos: k.vec2(px + padX, bannerY), size: 12, font: "PressStart2P", color: k.Color.fromHex(bannerColor) });
+            k.drawText({ text: correct ? "RIGHT!" : "NOT QUITE", pos: k.vec2(px + padX, bannerY), size: 12, font: "PressStart2P", color: colorOf(bannerColor) });
 
             const pickedLabel = `${String.fromCharCode(65 + state.aiChoiceIdx)}: ${step.options[state.aiChoiceIdx]}`;
             const pickedY = bannerY + 24;
-            k.drawText({ text: pickedLabel, pos: k.vec2(px + padX, pickedY), size: 15, font: "PatrickHand", color: k.Color.fromHex(C.pencil), opacity: 0.7, width: panelW - padX * 2, lineSpacing: 3 });
+            k.drawText({ text: pickedLabel, pos: k.vec2(px + padX, pickedY), size: 15, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.7, width: panelW - padX * 2, lineSpacing: 3 });
 
             const explanation = correct ? (step.explainCorrect || "") : (step.explainWrong || "");
             const explY = pickedY + layout.pickedH + 12;
-            k.drawText({ text: explanation, pos: k.vec2(px + padX, explY), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            k.drawText({ text: explanation, pos: k.vec2(px + padX, explY), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
 
             const btnW = 160, btnH = 32;
             const btnX = px + panelW - btnW - padX;
             const btnY = py + panelH - btnH - 12;
             state.aiNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
             const isLast = state.aiStepIdx === lesson.steps.length - 1;
-            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: k.Color.fromHex(C.markerBlue), anchor: "topleft", radius: 3 });
-            k.drawText({ text: isLast ? "Build & Finish!" : "Build & Next", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2), size: 11, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
+            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: colorOf(C.markerBlue), anchor: "topleft", radius: 3 });
+            k.drawText({ text: isLast ? "Build & Finish!" : "Build & Next", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2), size: 11, font: "PressStart2P", color: colorOf("#ffffff"), anchor: "center" });
             return;
         }
 
         if (state.aiPhase === "done") {
             const bannerY = py + 12 + 22 + 22;
-            k.drawText({ text: "LESSON COMPLETE!", pos: k.vec2(px + padX, bannerY), size: 12, font: "PressStart2P", color: k.Color.fromHex(C.markerGreen) });
-            k.drawText({ text: lesson.summary || "Great work — hit PLAY to see the bridge in action.", pos: k.vec2(px + padX, bannerY + 28), size: 16, font: "PatrickHand", color: k.Color.fromHex(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            k.drawText({ text: "LESSON COMPLETE!", pos: k.vec2(px + padX, bannerY), size: 12, font: "PressStart2P", color: colorOf(C.markerGreen) });
+            k.drawText({ text: lesson.summary || "Great work — hit PLAY to see the bridge in action.", pos: k.vec2(px + padX, bannerY + 28), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
 
             const btnW = 100, btnH = 30;
             const btnX = px + panelW - btnW - padX;
             const btnY = py + panelH - btnH - 12;
             state.aiNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
-            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: k.Color.fromHex(C.markerGreen), anchor: "topleft", radius: 3 });
-            k.drawText({ text: "Close", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2), size: 11, font: "PressStart2P", color: k.Color.fromHex("#ffffff"), anchor: "center" });
+            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: colorOf(C.markerGreen), anchor: "topleft", radius: 3 });
+            k.drawText({ text: "Close", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2), size: 11, font: "PressStart2P", color: colorOf("#ffffff"), anchor: "center" });
         }
     }
 
@@ -5153,192 +5782,424 @@ export function gameScene(k, { levelIdx }) {
     // Modal layout constants. Button Y positions are computed relative to the
     // modal BOTTOM so they stay pinned to the notebook's bottom ruled lines
     // regardless of how tall the card grows (win vs fail, with/without AI).
-    const MODAL_BTN_W = 220;
-    const MODAL_BTN_H = 30;
-    const MODAL_ROW = 22;                      // ruled-line spacing — THE grid unit
-    const MODAL_BTN_SPACING = MODAL_ROW * 2;   // buttons on every-other ruled line (44)
-    const MODAL_BTN_BOTTOM_MARGIN = 30;        // secondary button sits this far above the bottom
+    // Modal layout — wooden-board card. Left column: cost + grade up top,
+    // big icon buttons across the bottom. Right column: leaderboard takes
+    // the full right side. No description text, no per-button labels.
+    const MODAL_BTN_SIZE = 62;
+    const MODAL_BTN_GAP  = 10;
 
-    // Single source of truth for modal layout. All Y positions are aligned to
-    // the 22px ruled-line grid so text sits on the page lines like handwriting:
-    //   row 2  : title
-    //   row 4-5: description (2 lines at 22px spacing)
-    //   row 6-7: grade / cost line (win modals only)
-    //   row N  : primary button      (N = last-content-row + 2)
-    //   row N+2: AI button           (beaten levels only)
-    //   row N+2 or N+4: secondary button
-    // Buttons are anchored from the top of the modal (off the description
-    // block), not the bottom — otherwise adding more buttons crowds them
-    // against the description instead of growing the card.
     function getModalLayout() {
         if (!state.modal) return null;
         const W = k.width(), H = k.height();
         const beaten = getCompleted().includes(levelIdx);
         const hasGrade = state.modal.grade != null;
+        const isWin = state.modal.win === true;
+        const hasLeaderboard = isWin;
 
-        const R = MODAL_ROW;
-        const TITLE_Y    = R * 2;                                // top padding of 2 rows, then title
-        const DESC_TOP_Y = TITLE_Y + R * 2;                      // blank row, then first desc line
-        const DESC_BOT_Y = DESC_TOP_Y + R;
-        const GRADE_Y    = hasGrade ? DESC_BOT_Y + R * 2 : null; // 1 blank row, then grade line
-        const LAST_CONTENT_Y = GRADE_Y != null ? GRADE_Y : DESC_BOT_Y;
-        const PRIMARY_Y  = LAST_CONTENT_Y + R * 2;               // 1 blank row, then primary button
-        const AI_Y       = PRIMARY_Y + R * 2;
-        const SECONDARY_Y = beaten ? AI_Y + R * 2 : PRIMARY_Y + R * 2;
-
-        const mh = SECONDARY_Y + MODAL_BTN_BOTTOM_MARGIN + MODAL_BTN_H / 2;
+        // Wider, taller card so the leaderboard has room for top 5 + user.
+        const mw = Math.min(720, W * 0.88);
+        const mh = hasLeaderboard ? 440 : 300;
+        const mx = W / 2, my = H / 2;
         const hh = mh / 2;
 
+        // Inner padding from the card's edge.
+        const padX = 28;
+        const padTop = 22;
+        const padBot = 26;
+
+        // Title centered along the top.
+        const titleY = -hh + padTop + 12;
+
+        // Two columns when win; single centered column otherwise.
+        const colGap = 24;
+        const innerW  = mw - padX * 2;
+        const leftColW  = hasLeaderboard ? Math.round((innerW - colGap) * 0.46) : innerW;
+        const rightColW = hasLeaderboard ? innerW - colGap - leftColW : 0;
+        const colTopY   = titleY + 36;
+        const colBotY   = hh - padBot;
+        const colHeight = colBotY - colTopY;
+        const leftColX  = -mw / 2 + padX;
+        const rightColX = hasLeaderboard ? leftColX + leftColW + colGap : 0;
+
+        // Icon-button row anchored to the BOTTOM of the left column.
+        const actions = ["menu", "replay"];
+        if (beaten) actions.push("ai");
+        if (isWin) actions.push("next");
+        const rowW = actions.length * MODAL_BTN_SIZE + (actions.length - 1) * MODAL_BTN_GAP;
+        // Center the icon row inside the left column (or modal if no leaderboard).
+        const colCx = hasLeaderboard ? leftColX + leftColW / 2 : 0;
+        const rowStartX = colCx - rowW / 2;
+        const rowY = colBotY - MODAL_BTN_SIZE / 2;
+        const buttons = {};
+        actions.forEach((key, i) => {
+            buttons[key] = {
+                key,
+                cx: rowStartX + MODAL_BTN_SIZE / 2 + i * (MODAL_BTN_SIZE + MODAL_BTN_GAP),
+                cy: rowY,
+                w: MODAL_BTN_SIZE,
+                h: MODAL_BTN_SIZE,
+            };
+        });
+
         return {
-            mx: W / 2, my: H / 2, mw: Math.min(420, W * 0.82), mh, hh,
-            beaten, hasGrade,
-            // Text positions (center of each visual row)
-            titleY:   TITLE_Y - hh,
-            descY:    (DESC_TOP_Y + DESC_BOT_Y) / 2 - hh,  // midpoint of the 2 desc rows
-            gradeY:   GRADE_Y != null ? GRADE_Y - hh : null,
-            btnY: {
-                primary:   PRIMARY_Y   - hh,
-                ai:        beaten ? AI_Y - hh : null,
-                secondary: SECONDARY_Y - hh,
-            },
+            mx, my, mw, mh, hh,
+            beaten, hasGrade, hasLeaderboard, isWin,
+            titleY,
+            leftColX, leftColW, leftColCx: colCx,
+            rightColX, rightColW,
+            colTopY, colHeight,
+            buttons, actions,
         };
     }
 
     function drawModal() {
         const m = state.modal;
         const W = k.width(), H = k.height();
-        const cFn = (h) => k.Color.fromHex(h);
+        const cFn = (h) => colorOf(h);
 
         // Dim backdrop
         k.drawRect({ pos: k.vec2(0, 0), width: W, height: H, color: cFn("#1a0e05"), anchor: "topleft", opacity: 0.55 });
 
-        // Pull shared layout (mh, hh, button Y's) — same numbers click handler uses
         const L = getModalLayout();
-        const { mx, my, mw, mh, hh, beaten } = L;
-        const hw = mw / 2;
+        const { mx, my, mw, mh, hh, beaten, isWin, hasLeaderboard } = L;
 
         // Soft layered drop shadow
         for (let s = 1; s <= 4; s++) {
             k.drawRect({
                 pos: k.vec2(mx + s, my + s + 1),
                 width: mw + s, height: mh + s,
-                color: cFn("#000000"), anchor: "center", opacity: 0.07, radius: 4,
+                color: cFn("#000000"), anchor: "center", opacity: 0.07, radius: 6,
             });
         }
 
-        // Paper card — cream background
-        k.drawRect({ pos: k.vec2(mx, my), width: mw, height: mh, color: cFn(C.paper), anchor: "center", radius: 4 });
-        // Subtle warm border
-        k.drawRect({
-            pos: k.vec2(mx, my), width: mw, height: mh,
-            fill: false, outline: { width: 1.5, color: cFn("#c4a060") },
-            anchor: "center", radius: 4, opacity: 0.55,
-        });
+        const cardLeft = mx - mw / 2;
+        const cardRight = mx + mw / 2;
+        const cardTop = my - hh;
+        const cardBot = my + hh;
 
-        // Notebook margin (red vertical line on the left, like ruled paper)
-        const marginX = mx - hw + 32;
-        k.drawLine({
-            p1: k.vec2(marginX, my - hh + 12), p2: k.vec2(marginX, my + hh - 12),
-            width: 1.5, color: cFn(C.markerRed), opacity: 0.35,
-        });
-
-        // Horizontal ruled lines — anchored to each text row's BASELINE (not
-        // its center), so letters appear to sit on the page lines like real
-        // handwriting. PatrickHand's baseline lands roughly 5px below the
-        // text's vertical center at the sizes we use.
-        const BASELINE_OFFSET = 5;
-        const bottomLineY = my + L.btnY.secondary + BASELINE_OFFSET;
-        for (let ly = bottomLineY; ly > my - hh + 50; ly -= 22) {
-            k.drawLine({
-                p1: k.vec2(mx - hw + 12, ly), p2: k.vec2(mx + hw - 12, ly),
-                width: 1, color: cFn("#a8c0d8"), opacity: 0.28,
+        // ── Wooden boards body ──
+        // The modal is composed of horizontal planks stacked vertically with
+        // dark seam lines between them, so it reads as a real wooden sign
+        // rather than a flat painted rectangle. Each plank gets its own
+        // subtle grain pattern, drift offset, and (occasionally) a knot.
+        const boardCount = 5;
+        const boardH = mh / boardCount;
+        // Slight palette variation per board so they don't look identical.
+        const boardTints = ["#d37e3d", "#cf7833", "#d68040", "#cb7531", "#d57e3a"];
+        for (let i = 0; i < boardCount; i++) {
+            const by = cardTop + i * boardH;
+            const tint = boardTints[i % boardTints.length];
+            k.drawRect({
+                pos: k.vec2(cardLeft, by), width: mw, height: boardH,
+                color: cFn(tint), anchor: "topleft",
             });
-        }
-
-        // Two strips of masking tape pinning the page at the top corners
-        function drawTape(cx, cy, tw, th, ang) {
-            const cos = Math.cos(ang), sin = Math.sin(ang);
-            const corner = (dx, dy) => k.vec2(cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
-            const tl = corner(-tw / 2, -th / 2), tr = corner(tw / 2, -th / 2);
-            const br = corner(tw / 2, th / 2),    bl = corner(-tw / 2, th / 2);
-            // Drop shadow
-            const sh = (p) => k.vec2(p.x + 1.5, p.y + 2.5);
-            k.drawTriangle({ p1: sh(tl), p2: sh(tr), p3: sh(br), color: cFn("#000000"), opacity: 0.18 });
-            k.drawTriangle({ p1: sh(tl), p2: sh(br), p3: sh(bl), color: cFn("#000000"), opacity: 0.18 });
-            // Tape body — semi-transparent so the page shows through
-            k.drawTriangle({ p1: tl, p2: tr, p3: br, color: cFn(C.tape), opacity: 0.85 });
-            k.drawTriangle({ p1: tl, p2: br, p3: bl, color: cFn(C.tape), opacity: 0.85 });
-            // Subtle horizontal grain line
-            const il = corner(-tw / 2 + 3, 0), ir = corner(tw / 2 - 3, 0);
-            k.drawLine({ p1: il, p2: ir, width: 1, color: cFn("#bfae7a"), opacity: 0.45 });
-        }
-        drawTape(mx - hw + 42, my - hh - 2, 78, 22, -0.30);
-        drawTape(mx + hw - 42, my - hh - 2, 78, 22,  0.28);
-
-        // Title — pixel font with shadow + colored marker, plus underline stroke
-        const titleColor = m.win ? C.markerGreen : C.markerRed;
-        const titleY = my + L.titleY;
-        const titleSz = 18;
-        k.drawText({ text: m.title, pos: k.vec2(mx + 2, titleY + 2), size: titleSz, font: "PressStart2P", color: cFn("#1a0e05"), anchor: "center", opacity: 0.30 });
-        k.drawText({ text: m.title, pos: k.vec2(mx, titleY), size: titleSz, font: "PressStart2P", color: cFn(titleColor), anchor: "center" });
-        // Marker underline (slight wobble for hand-drawn feel)
-        const underlineW = m.title.length * (titleSz * 0.75);
-        k.drawLine({
-            p1: k.vec2(mx - underlineW / 2, titleY + titleSz),
-            p2: k.vec2(mx + underlineW / 2, titleY + titleSz + 1),
-            width: 2.5, color: cFn(titleColor), opacity: 0.55,
-        });
-
-        // Description — size 20 with lineSpacing 2 gives exactly 22px per line so
-        // two lines sit on consecutive ruled lines (the "written on paper" feel).
-        k.drawText({
-            text: m.desc, pos: k.vec2(mx, my + L.descY),
-            size: 20, font: "PatrickHand", color: cFn(C.pencil),
-            anchor: "center", width: mw - 70, align: "center",
-            lineSpacing: 2,
-        });
-
-        // ── Cost text + animated teacher-style GRADE (win only) ──
-        // Laid out side-by-side on the same line so the grade reads as a
-        // teacher's mark next to the student's work.
-        const elapsed = m.openTime != null ? Math.max(0, k.time() - m.openTime) : 2;
-        if (m.grade != null) {
-            const lineY = my + L.gradeY;
-            if (m.cost != null) {
-                k.drawText({
-                    text: `Cost: $${m.cost.toLocaleString()}`,
-                    pos: k.vec2(mx - 40, lineY),
-                    size: 20, font: "PatrickHand",
-                    color: cFn(C.pencil),
-                    anchor: "center",
+            // Top highlight stripe (catches light)
+            k.drawRect({
+                pos: k.vec2(cardLeft, by), width: mw, height: 1.6,
+                color: cFn("#e89c4a"), opacity: 0.55, anchor: "topleft",
+            });
+            // Bottom shadow stripe (the seam to the next plank)
+            if (i < boardCount - 1) {
+                k.drawRect({
+                    pos: k.vec2(cardLeft, by + boardH - 2.4),
+                    width: mw, height: 2.4,
+                    color: cFn("#3a2110"), opacity: 0.55, anchor: "topleft",
                 });
             }
-            // Grade sits to the right of the cost text
-            drawGrade(mx + 70, lineY, m.grade, elapsed);
+            // Wood grain — horizontal streaks at offset rows so adjacent
+            // boards have visibly different grain patterns.
+            const grainOff = (i * 5) % 11;
+            for (let g = 0; g < 4; g++) {
+                const gy = by + 8 + g * 16 + grainOff;
+                if (gy > by + boardH - 6) break;
+                k.drawLine({
+                    p1: k.vec2(cardLeft + 12, gy),
+                    p2: k.vec2(cardRight - 12, gy + 1),
+                    width: 0.6, color: cFn("#8e4924"), opacity: 0.16,
+                });
+            }
+            // A knot every other plank, alternating sides.
+            if (i === 1 || i === 3) {
+                const knotX = i === 1 ? cardLeft + mw * 0.18 : cardRight - mw * 0.22;
+                const knotY = by + boardH * 0.5;
+                k.drawCircle({ pos: k.vec2(knotX, knotY), radius: 5.5, color: cFn("#7d4519"), opacity: 0.55 });
+                k.drawCircle({ pos: k.vec2(knotX, knotY), radius: 3.5, color: cFn("#5e351a"), opacity: 0.6 });
+                k.drawCircle({
+                    pos: k.vec2(knotX, knotY), radius: 5.5,
+                    fill: false, outline: { width: 0.8, color: cFn("#3a2110") },
+                    opacity: 0.5,
+                });
+            }
+        }
+        // Outer outline that wraps the whole card (planks share this).
+        k.drawRect({
+            pos: k.vec2(mx, my), width: mw, height: mh,
+            fill: false, outline: { width: 1.6, color: cFn("#3a2110") },
+            anchor: "center", radius: 6, opacity: 0.7,
+        });
+
+        // ── Title — pixel font, marker-style coloring ──
+        // openTime drives a bounce-in scale + a left-to-right underline draw.
+        const elapsed0 = m.openTime != null ? Math.max(0, k.time() - m.openTime) : 2;
+        const titleColor = isWin ? C.markerGreen : C.markerRed;
+        const titleY = my + L.titleY;
+        const titleSz = 18;
+        // easeOutBack — overshoots slightly for a satisfying pop.
+        const easeBack = (x) => {
+            if (x >= 1) return 1;
+            const c1 = 1.7, c3 = c1 + 1;
+            return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+        };
+        const titleAnimDur = 0.35;
+        const titleT = Math.min(1, elapsed0 / titleAnimDur);
+        const titleScale = Math.max(0, easeBack(titleT));
+        // Idle hover: gentle vertical bob once settled.
+        const titleBob = titleT >= 1 ? Math.sin(k.time() * 1.4) * 0.6 : 0;
+        k.pushTransform();
+        k.pushTranslate(mx, titleY + titleBob);
+        k.pushScale(titleScale, titleScale);
+        k.drawText({ text: m.title, pos: k.vec2(2, 2), size: titleSz, font: "PressStart2P", color: cFn("#1a0e05"), anchor: "center", opacity: 0.40 });
+        k.drawText({ text: m.title, pos: k.vec2(0, 0), size: titleSz, font: "PressStart2P", color: cFn(titleColor), anchor: "center" });
+        k.popTransform();
+        // Underline — strokes in left-to-right after the title settles.
+        const underlineW = m.title.length * (titleSz * 0.75);
+        const underlineT = Math.max(0, Math.min(1, (elapsed0 - 0.25) / 0.35));
+        if (underlineT > 0) {
+            k.drawLine({
+                p1: k.vec2(mx - underlineW / 2, titleY + titleSz + titleBob),
+                p2: k.vec2(mx - underlineW / 2 + underlineW * underlineT, titleY + titleSz + 1 + titleBob),
+                width: 2.5, color: cFn(titleColor), opacity: 0.85,
+            });
         }
 
-        // ── Teacher-grading animation ─────────────────────────────
-        // Phase 1 (0 → 0.4s): letter strokes in (fade + scale with slight wobble).
-        // Phase 2 (0.4 → 1.0s): red/gold marker circles around the letter.
-        // Phase 3 (1.0s+):    idle — S shimmers and spawns orbiting sparkles.
+        // ── LEFT COLUMN: cost + grade (no description; dropped) ──
+        const colTopY = my + L.colTopY;
+        const leftCx = mx + (L.leftColCx || (L.leftColX + L.leftColW / 2));
+
+        // Cost — big readable number stacked above the grade medallion.
+        const elapsed = m.openTime != null ? Math.max(0, k.time() - m.openTime) : 2;
+        if (m.cost != null) {
+            // Faint "COST" header in pixel font, then the value in a bigger
+            // PressStart2P below it for a "stamped" look that matches the
+            // wood theme.
+            k.drawText({
+                text: "COST",
+                pos: k.vec2(leftCx, colTopY + 12),
+                size: 9, font: "PressStart2P",
+                color: cFn("#fff8e0"), opacity: 0.65,
+                anchor: "center",
+            });
+            k.drawText({
+                text: `$${m.cost.toLocaleString()}`,
+                pos: k.vec2(leftCx + 2, colTopY + 36),
+                size: 16, font: "PressStart2P",
+                color: cFn("#1a0e05"), opacity: 0.40,
+                anchor: "center",
+            });
+            k.drawText({
+                text: `$${m.cost.toLocaleString()}`,
+                pos: k.vec2(leftCx, colTopY + 34),
+                size: 16, font: "PressStart2P",
+                color: cFn("#fffce6"),
+                anchor: "center",
+            });
+        }
+        if (m.grade != null) {
+            // Grade medallion sits below the cost line, centered in the column.
+            drawGrade(leftCx, colTopY + 88, m.grade, elapsed);
+        }
+
+        // ── RIGHT COLUMN: leaderboard panel (recessed inset) ──
+        if (hasLeaderboard) {
+            const lb = m.leaderboard;
+            const panelX = mx + L.rightColX;
+            const panelY = colTopY;
+            const panelW = L.rightColW;
+            const panelH = L.colHeight - 6;       // slim margin off the bottom edge
+            // Recessed inset — darker wood with inner shadow at the top.
+            k.drawRect({
+                pos: k.vec2(panelX, panelY),
+                width: panelW, height: panelH,
+                color: cFn("#a35e22"), anchor: "topleft", radius: 4,
+            });
+            // Inner top shadow (depth)
+            k.drawRect({
+                pos: k.vec2(panelX, panelY),
+                width: panelW, height: 2,
+                color: cFn("#3a2110"), anchor: "topleft", opacity: 0.45,
+            });
+            // Inner bottom highlight (rebound light)
+            k.drawRect({
+                pos: k.vec2(panelX, panelY + panelH - 1),
+                width: panelW, height: 1,
+                color: cFn("#e89c4a"), anchor: "topleft", opacity: 0.55,
+            });
+            // Outline
+            k.drawRect({
+                pos: k.vec2(panelX, panelY),
+                width: panelW, height: panelH,
+                fill: false, outline: { width: 1, color: cFn("#3a2110") },
+                anchor: "topleft", radius: 4, opacity: 0.6,
+            });
+
+            // Header — "RANK X / N · TOP P%" or loading
+            const headerY = panelY + 18;
+            const headerText = lb && lb.userRank
+                ? `RANK ${lb.userRank}/${lb.totalPlayers}`
+                : (lb ? "LEADERBOARD" : "LOADING…");
+            k.drawText({
+                text: headerText, pos: k.vec2(panelX + panelW / 2, headerY),
+                size: 11, font: "PressStart2P",
+                color: cFn("#fff8e0"), anchor: "center",
+            });
+            // Subheader — top percentile in a smaller, accent color
+            if (lb && lb.userPercentile != null) {
+                k.drawText({
+                    text: `TOP ${100 - lb.userPercentile + 1}%`,
+                    pos: k.vec2(panelX + panelW / 2, headerY + 14),
+                    size: 8, font: "PressStart2P",
+                    color: cFn("#ffd479"), anchor: "center",
+                });
+            }
+            // PB badge
+            if (lb && lb.isPB) {
+                k.drawText({
+                    text: "★ NEW BEST",
+                    pos: k.vec2(panelX + panelW / 2, headerY + 28),
+                    size: 8, font: "PressStart2P",
+                    color: cFn("#ffe17a"), anchor: "center",
+                });
+            }
+
+            // Entry rows — staggered fade-in starting after the header lands.
+            if (lb) {
+                const top5 = lb.top.slice(0, 5);
+                const userInTop5 = top5.some(e => e.isYou);
+                const rows = top5.slice();
+                if (!userInTop5 && lb.userEntry && lb.userRank) {
+                    rows.push({ ...lb.userEntry, _rank: lb.userRank, _separated: true });
+                }
+                const rowsStartY = headerY + (lb.isPB ? 52 : 40);
+                const rowH = 30;
+                const rowL = panelX + 14;
+                const rowR = panelX + panelW - 14;
+                const rowMidName = panelX + 44;
+                const rowFontSize = 17;
+                // Stagger animation: first row appears at 0.35s, then 0.10s
+                // apart. Each row eases over 0.35s (slide up + fade).
+                const rowEntryDelay = 0.35;
+                const rowStaggerGap = 0.10;
+                const rowAnimDur    = 0.35;
+                for (let i = 0; i < rows.length; i++) {
+                    const e = rows[i];
+                    const startAt = rowEntryDelay + i * rowStaggerGap;
+                    const rowT = Math.max(0, Math.min(1, (elapsed - startAt) / rowAnimDur));
+                    if (rowT <= 0) continue;
+                    const rowEase = 1 - Math.pow(1 - rowT, 3);
+                    const slideY  = (1 - rowEase) * 8;          // slide up 8 px
+                    const rowAlpha = rowEase;
+                    const rowY = rowsStartY + i * rowH + slideY;
+
+                    if (e._separated) {
+                        k.drawText({
+                            text: "·  ·  ·", pos: k.vec2(panelX + panelW / 2, rowY - 14),
+                            size: 14, font: "PatrickHand",
+                            color: cFn("#fff8e0"), opacity: 0.5 * rowAlpha,
+                            anchor: "center",
+                        });
+                    }
+
+                    const isYou = !!e.isYou;
+                    const rank = e._rank != null ? e._rank : (lb.top.indexOf(e) + 1);
+                    const rankStr = `${rank}.`;
+                    const nameStr = e.playerName.length > 14 ? e.playerName.slice(0, 13) + "…" : e.playerName;
+                    const costStr = `$${e.budgetUsed.toLocaleString()}`;
+
+                    // Alternating row stripe — faint, helps the eye scan rows.
+                    if (i % 2 === 0 && !isYou) {
+                        k.drawRect({
+                            pos: k.vec2(panelX + 4, rowY - 13),
+                            width: panelW - 8, height: 26,
+                            color: cFn("#7d4519"), opacity: 0.35 * rowAlpha,
+                            anchor: "topleft", radius: 3,
+                        });
+                    }
+
+                    // Highlight the player's row with a brighter glow band
+                    // and a left accent bar — pulses gently to draw the eye.
+                    if (isYou) {
+                        const pulse = 0.55 + 0.20 * Math.sin(k.time() * 3);
+                        k.drawRect({
+                            pos: k.vec2(panelX + 4, rowY - 13),
+                            width: panelW - 8, height: 26,
+                            color: cFn("#ffe17a"), opacity: 0.20 * pulse * rowAlpha,
+                            anchor: "topleft", radius: 3,
+                        });
+                        k.drawRect({
+                            pos: k.vec2(panelX + 4, rowY - 12),
+                            width: 3, height: 24,
+                            color: cFn("#fbbf24"), opacity: 0.95 * rowAlpha,
+                            anchor: "topleft", radius: 2,
+                        });
+                    }
+
+                    // Medal colors for the top 3 rank numbers — adds a bit
+                    // of personality without making the row hard to scan.
+                    const medalColors = ["#fbbf24", "#e5e7eb", "#d6803a"];   // gold, silver, bronze
+                    const isMedal = !isYou && rank >= 1 && rank <= 3;
+                    const rankColor = isYou ? "#fffce6" : (isMedal ? medalColors[rank - 1] : "#fff8e0");
+                    const rowColor  = isYou ? "#fffce6" : "#fff8e0";
+                    const rowOp = (isYou ? 1 : 0.92) * rowAlpha;
+
+                    // Rank — rendered in PressStart2P for crisp numerals
+                    k.drawText({
+                        text: rankStr, pos: k.vec2(rowL, rowY),
+                        size: 11, font: "PressStart2P", color: cFn(rankColor),
+                        opacity: rowOp, anchor: "left",
+                    });
+                    // Name (PatrickHand still — its slight slant reads as
+                    // signed names rather than data table entries)
+                    k.drawText({
+                        text: nameStr, pos: k.vec2(rowMidName, rowY),
+                        size: rowFontSize, font: "PatrickHand", color: cFn(rowColor),
+                        opacity: rowOp, anchor: "left",
+                    });
+                    // Cost — PressStart2P for crisp digit alignment
+                    k.drawText({
+                        text: costStr, pos: k.vec2(rowR, rowY),
+                        size: 10, font: "PressStart2P", color: cFn(rowColor),
+                        opacity: rowOp, anchor: "right",
+                    });
+                }
+            }
+        }
+
+        // ── Grade medallion ───────────────────────────────────────
+        // Wood-stamped grade plaque: a circular wooden medallion scales-in
+        // with a bouncy spring, the letter pops into place on top, and a
+        // colored marker arc strokes around it like a teacher's circle.
+        // S grade adds a pulsing gold halo + orbiting sparkles for that
+        // "you nailed it" punch.
         function drawGrade(cx, cy, letter, t) {
             const gradeColors = {
-                S: "#d4a017",   // shiny gold
-                A: "#16a34a",   // marker green
-                B: "#2563eb",   // marker blue
-                C: "#d4823c",   // marker orange
-                F: "#dc2626",   // marker red
+                S: "#fbbf24",   // bright gold
+                A: "#22c55e",   // vibrant green
+                B: "#60a5fa",   // sky blue
+                C: "#f97316",   // orange
+                F: "#ef4444",   // red
             };
-            const color = gradeColors[letter] || "#dc2626";
-            const writeDur = 0.9, circleDur = 1.1;
+            const color = gradeColors[letter] || "#ef4444";
+            const writeDur = 0.5, circleDur = 0.7;
             const writeT  = Math.min(1, t / writeDur);
             const circleT = Math.max(0, Math.min(1, (t - writeDur) / circleDur));
             const idleT   = Math.max(0, t - writeDur - circleDur);
 
-            // Ease-out cubic for letter scale / fade
-            const eased = 1 - Math.pow(1 - writeT, 3);
-            // Slight rotational wobble that decays as the letter is "written"
-            const wobbleDeg = (1 - writeT) * Math.sin(t * 30) * 10;
+            // Spring-out scale (overshoots a bit, settles at 1)
+            const easeOutBack = (x) => {
+                const c1 = 1.70158, c3 = c1 + 1;
+                return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+            };
+            const scale = writeT < 1 ? Math.max(0, easeOutBack(writeT)) : 1 + Math.sin(idleT * 2.4) * 0.025;
 
             // Shimmer for S — lerps between deep gold and a brighter highlight
             let drawColor = color;
@@ -5346,66 +6207,61 @@ export function gameScene(k, { levelIdx }) {
                 const phase = idleT * 1.6;
                 const v = (Math.sin(phase) + 1) / 2;
                 const lerp = (a, b) => Math.round(a + (b - a) * v);
-                const r = lerp(0xd4, 0xff), g = lerp(0xa0, 0xe4), b = lerp(0x17, 0x5a);
+                const r = lerp(0xfb, 0xff), g = lerp(0xbf, 0xe4), b = lerp(0x24, 0x5a);
                 drawColor = "#" + [r, g, b].map(c => c.toString(16).padStart(2, "0")).join("");
             }
 
-            // Letter (shadow + fill, rotated via transform stack) — drawn at
-            // full size right away; the writing illusion comes from a
-            // paper-colored mask that sweeps across the letter, revealing it
-            // left-to-right, plus a tiny pen-tip dot at the current write edge.
-            const letterSize = 32;
+            // S — pulsing gold halo behind the medallion (only after circle settles)
+            if (letter === "S" && idleT > 0) {
+                const haloR = 32 + Math.sin(idleT * 2) * 2;
+                k.drawCircle({
+                    pos: k.vec2(cx, cy), radius: haloR,
+                    color: cFn("#ffe17a"),
+                    opacity: 0.18 + 0.10 * Math.sin(idleT * 3),
+                });
+            }
+
+            const medR = 22;
+
             k.pushTransform();
             k.pushTranslate(cx, cy);
-            k.pushRotate(wobbleDeg);
+            k.pushScale(scale, scale);
+
+            // Wooden medallion — darker wood than the card so the letter pops.
+            k.drawCircle({ pos: k.vec2(0, 1.5), radius: medR, color: cFn("#1a0e05"), opacity: 0.4 });   // shadow
+            k.drawCircle({ pos: k.vec2(0, 0), radius: medR, color: cFn("#a35e22") });                  // body
+            k.drawCircle({                                                                              // inner highlight
+                pos: k.vec2(0, -1), radius: medR - 1.5,
+                fill: false, outline: { width: 1, color: cFn("#e89c4a") },
+                opacity: 0.45,
+            });
+            k.drawCircle({                                                                              // outline
+                pos: k.vec2(0, 0), radius: medR,
+                fill: false, outline: { width: 1.5, color: cFn("#3a2110") },
+                opacity: 0.7,
+            });
+
+            // Letter — shadow + fill in the grade color. PressStart2P for
+            // a chunky "stamped" feel that matches the wood theme.
+            const letterSize = 24;
             k.drawText({
-                text: letter, pos: k.vec2(2, 2),
-                size: letterSize, font: "PatrickHand",
-                color: cFn("#1a0e05"), opacity: 0.3,
+                text: letter, pos: k.vec2(1.5, 2),
+                size: letterSize, font: "PressStart2P",
+                color: cFn("#1a0e05"), opacity: 0.45,
                 anchor: "center",
             });
             k.drawText({
                 text: letter, pos: k.vec2(0, 0),
-                size: letterSize, font: "PatrickHand",
-                color: cFn(drawColor), opacity: 1,
+                size: letterSize, font: "PressStart2P",
+                color: cFn(drawColor),
                 anchor: "center",
             });
+
             k.popTransform();
 
-            // Sweep-reveal mask: paper-colored rect covers the unwritten right
-            // portion of the letter. Shrinks to zero as writeT hits 1.
-            if (writeT < 1) {
-                const letterBoxW = letterSize * 0.9;
-                const maskLeft = cx - letterBoxW / 2 + letterBoxW * writeT;
-                const maskW = letterBoxW * (1 - writeT) + 2;
-                k.drawRect({
-                    pos: k.vec2(maskLeft, cy - letterSize / 2 - 2),
-                    width: maskW,
-                    height: letterSize + 4,
-                    color: cFn(C.paper),
-                    anchor: "topleft",
-                });
-
-                // Pen-tip dot at the current write edge — the scribble
-                // oscillation is tied to absolute time so it stays lively even
-                // though the sweep itself is slower now.
-                const scribble = Math.sin(t * 22) * letterSize * 0.3;
-                const penX = maskLeft;
-                const penY = cy + scribble;
-                k.drawCircle({ pos: k.vec2(penX, penY), radius: 2.2, color: cFn("#1a0e05") });
-                // Tiny trail of short ink strokes behind the pen
-                for (let i = 1; i <= 3; i++) {
-                    const trailT = writeT - i * 0.04;
-                    if (trailT < 0) break;
-                    const trailX = cx - letterBoxW / 2 + letterBoxW * trailT;
-                    const trailY = cy + Math.sin((t - i * 0.04) * 22) * letterSize * 0.3;
-                    k.drawCircle({ pos: k.vec2(trailX, trailY), radius: 1.2, color: cFn("#1a0e05"), opacity: 0.4 - i * 0.1 });
-                }
-            }
-
-            // Marker circle — arc strokes in clockwise from the top
+            // Marker circle — strokes around the medallion clockwise.
             if (circleT > 0) {
-                const r = 22;
+                const r = medR + 5;
                 const segs = 40;
                 const maxA = -Math.PI / 2 + circleT * Math.PI * 2;
                 for (let i = 0; i < segs; i++) {
@@ -5424,84 +6280,105 @@ export function gameScene(k, { levelIdx }) {
             if (letter === "S" && idleT > 0) {
                 for (let i = 0; i < 4; i++) {
                     const angle = idleT * 0.8 + i * (Math.PI / 2);
-                    const dist = 30 + Math.sin(idleT * 1.8 + i) * 2;
+                    const dist = 34 + Math.sin(idleT * 1.8 + i) * 2;
                     const sx = cx + Math.cos(angle) * dist;
                     const sy = cy + Math.sin(angle) * dist;
                     const spk = 2.5 + Math.sin(idleT * 3 + i * 0.7) * 1;
-                    k.drawCircle({ pos: k.vec2(sx, sy), radius: spk, color: cFn("#ffe17a"), opacity: 0.85 });
+                    k.drawCircle({ pos: k.vec2(sx, sy), radius: spk, color: cFn("#ffe17a"), opacity: 0.9 });
                     k.drawLine({ p1: k.vec2(sx - spk - 2, sy), p2: k.vec2(sx + spk + 2, sy), width: 1, color: cFn("#fff7c4"), opacity: 0.9 });
                     k.drawLine({ p1: k.vec2(sx, sy - spk - 2), p2: k.vec2(sx, sy + spk + 2), width: 1, color: cFn("#fff7c4"), opacity: 0.9 });
                 }
             }
         }
 
-        // ── Text-link buttons — pixel text on the page with an underline that
-        //    animates in on hover. Matches the notebook aesthetic: the text just
-        //    sits on the paper like a written-down option, and the underline is
-        //    drawn under the word like you're marking a choice.
-        // Hit test each button against current cursor
+        // ── Bottom icon-button row ──
+        // Each action gets a wooden plate with an icon centered + a label
+        // below. Hover scales them up; the primary action (next-level / try
+        // again) draws with a green tint to anchor the eye.
         const mpos = k.mousePos();
-        const halfW = MODAL_BTN_W / 2, halfH = MODAL_BTN_H / 2;
-        const hoverTarget = {
-            primary:   Math.abs(mpos.x - mx) < halfW && Math.abs(mpos.y - (my + L.btnY.primary)) < halfH,
-            ai:        beaten && Math.abs(mpos.x - mx) < halfW && Math.abs(mpos.y - (my + L.btnY.ai)) < halfH,
-            secondary: Math.abs(mpos.x - mx) < halfW && Math.abs(mpos.y - (my + L.btnY.secondary)) < halfH,
-        };
-
-        // Ease hover progress toward target (fade in quick, fade out a touch quicker).
-        // Branch on whether the button IS hovered — not on a `>` comparison against
-        // the current value, which would flicker around the target when cur === tgt.
         const dt = k.dt() || 1 / 60;
-        for (const key of ["primary", "ai", "secondary"]) {
-            const cur = state.modalBtnHover[key];
-            state.modalBtnHover[key] = hoverTarget[key]
-                ? Math.min(1, cur + dt * 6)
-                : Math.max(0, cur - dt * 8);
-        }
+        const ICONS = {
+            menu:   { fn: drawMenuIcon,    label: "MENU"      },
+            replay: { fn: (cx, cy, col) => drawCurvedArrow(cx, cy + 1, 11, Math.PI * 0.85, Math.PI * 2.85, col, 2.6), label: m.win ? "REPLAY" : "TRY AGAIN" },
+            ai:     { fn: drawRobotIcon,   label: "AI TUTOR"  },
+            next:   { fn: drawNextArrow,   label: "NEXT"      },
+        };
+        const PRIMARY_KEY = isWin ? "next" : "replay";
 
-        function linkBtn(cy, label, color, size, hoverKey, phase) {
-            const t = state.modalBtnHover[hoverKey] || 0;
-            // PatrickHand is variable-width; average glyph ≈ size * 0.5 wide
-            const textW = label.length * size * 0.5;
-            // Idle vertical bob — subtle breathing so the text doesn't feel
-            // frozen. Different phase per button so they drift independently.
-            const bob = Math.sin(k.time() * 1.3 + phase) * 0.8;
-            const lineY = cy + bob;
+        for (const action of L.actions) {
+            const btn = L.buttons[action];
+            if (!btn) continue;
+            const meta = ICONS[action];
+            if (!meta) continue;
 
-            k.drawText({
-                text: label,
-                pos: k.vec2(mx, lineY),
-                size, font: "PatrickHand",
-                color: cFn(color),
-                anchor: "center",
+            const bx = mx + btn.cx, by = my + btn.cy;
+            const half = btn.w / 2;
+            const hovered = mpos.x >= bx - half && mpos.x <= bx + half
+                         && mpos.y >= by - half && mpos.y <= by + half;
+            const hoverKey = `modal_${action}`;
+            const prev = state.toolHover[hoverKey] || 0;
+            state.toolHover[hoverKey] = hovered
+                ? Math.min(1, prev + dt * 10)
+                : Math.max(0, prev - dt * 12);
+            const h = state.toolHover[hoverKey];
+            const isPrimary = action === PRIMARY_KEY;
+
+            // Plate — primary uses a brighter wood + gold rim; others use
+            // toolbar-toned wood with a brown rim.
+            const plateColor = isPrimary ? "#e89c4a" : "#b86a2c";
+            const rimColor   = isPrimary ? "#3a2110" : "#3a2110";
+            const scale = (isPrimary ? 1.08 : 1) + h * 0.12;
+
+            k.pushTransform();
+            k.pushTranslate(bx, by);
+            k.pushScale(scale, scale);
+
+            // Drop shadow
+            k.drawRect({
+                pos: k.vec2(1, 2), width: btn.w, height: btn.h,
+                color: cFn("#000000"), opacity: 0.32,
+                anchor: "center", radius: 6,
             });
-
-            // Marker strike-through through the middle of the text, draws left
-            // to right as hover progresses — like scribbling across the option
-            if (t > 0.01) {
-                const leftX = mx - textW / 2;
-                k.drawLine({
-                    p1: k.vec2(leftX, lineY),
-                    p2: k.vec2(leftX + textW * t, lineY),
-                    width: 2.5,
-                    color: cFn(color),
-                    opacity: 0.8,
+            // Body
+            k.drawRect({
+                pos: k.vec2(0, 0), width: btn.w, height: btn.h,
+                color: cFn(plateColor), anchor: "center", radius: 6,
+            });
+            // Top highlight + bottom shadow
+            k.drawRect({
+                pos: k.vec2(-btn.w / 2, -btn.h / 2),
+                width: btn.w, height: 1.4,
+                color: cFn("#ffffff"), opacity: 0.28, anchor: "topleft",
+            });
+            k.drawRect({
+                pos: k.vec2(-btn.w / 2, btn.h / 2 - 3),
+                width: btn.w, height: 3,
+                color: cFn("#8e4924"), anchor: "topleft", opacity: 0.85,
+            });
+            // Outline
+            k.drawRect({
+                pos: k.vec2(0, 0), width: btn.w, height: btn.h,
+                fill: false, outline: { width: 1.4, color: cFn(rimColor) },
+                anchor: "center", radius: 6, opacity: 0.6,
+            });
+            // Gold rim for primary
+            if (isPrimary) {
+                k.drawRect({
+                    pos: k.vec2(0, 0), width: btn.w + 2, height: btn.h + 2,
+                    fill: false, outline: { width: 1.6, color: cFn("#ffd479") },
+                    anchor: "center", radius: 7, opacity: 0.55 + h * 0.45,
                 });
             }
+            // Icon — centered, drawn in cream. No label; the icon is the
+            // button (Poly Bridge style), and the bigger plate makes the
+            // affordance unmissable on its own. Nested scale bumps the
+            // icon drawing up ~28% so it fills the larger plate.
+            k.pushTransform();
+            k.pushScale(1.28, 1.28);
+            meta.fn(0, 0, "#fff8e0");
+            k.popTransform();
+
+            k.popTransform();
         }
-
-        // Primary — bold marker green (win) or bold marker red-orange (retry)
-        linkBtn(my + L.btnY.primary,
-                m.win ? "NEXT LEVEL" : "TRY AGAIN",
-                m.win ? C.markerGreen : "#c4622a",
-                26, "primary", 0);
-
-        // AI — muted indigo highlighter, only offered when level has been beaten
-        if (beaten) {
-            linkBtn(my + L.btnY.ai, "TRY WITH AI", "#6b7db5", 22, "ai", 1.5);
-        }
-
-        // Secondary — plain pencil gray, smaller
-        linkBtn(my + L.btnY.secondary, m.win ? "REPLAY" : "MENU", C.pencil, 22, "secondary", 3.0);
     }
 }
