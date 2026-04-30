@@ -4,6 +4,12 @@ export const WORLD_MID_Y = 396;
 export const ANCHOR_L_X = 180;
 export const PAD_X = 300;
 
+/** Inland offset (world units past cliff anchor) where finish flags sit — keep in sync with game scene drawFlags */
+export const FLAG_INLAND_R = 130;
+export const FLAG_INLAND_L = 180;
+/** Past the flag + this margin before a multi-vehicle car counts as finished (lets it drive off-screen). */
+export const MULTI_FINISH_PAST_FLAG = 72;
+
 // Color palette
 export const C = {
     // Background & UI base
@@ -205,7 +211,7 @@ export const VEHICLES = {
         mass: 65,
         w: 36, h: 16,
         speed: 1.8,
-        color: "#8a6a3a",
+        color: "#c46a2a",
         wheels: 2,
         sprite: "veh_datsun",
     },

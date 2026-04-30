@@ -77,19 +77,27 @@ export const LEVELS = [
     {
         id:       "ramp",
         name:     "THE RAMP",
-        concept:  "SLOPES",
+        concept:  "TWO-WAY",
         gimmick:  "slope",
-        difficulty: 2,
-        vType:    "datsun",
+        difficulty: 3,
+        vType:    "datsun",         // primary vehicle (used by helpers / AI hints)
         gap:      396,
         hDiff:    108,
-        budget:   9000,
+        budget:   13000,             // wider unlock list + two passes → bumped budget
         terrain:  "cliff",
         extraAnchors: [],
-        multiVehicle: null,
-        materials: ["wood_road", "wood_beam"],
-        hint:     "Sloped bridges feel a sideways push. Brace diagonally to resist this THRUST — don't just build straight down.",
-        lesson:   "Sloped bridges experience THRUST — gravity pulls down, but the slope redirects force sideways. Diagonal bracing transfers thrust safely into the anchors.",
+        // CAR A drives left → right to the red flag, then once it has cleared
+        // the screen CAR B starts on the right cliff and crosses LEFT to the
+        // blue flag. Bridge has to survive both passes.
+        multiVehicle: [
+            // Datsun A drives off-screen past its flag — that release is what
+            // lets corolla B start (immersive "swap-on-the-road" handoff).
+            { vType: "datsun",  label: "A", flag: "red",  dir:  1, startSide: "L", startXOffset: -55, goalSide: "R", passOnly: true },
+            { vType: "corolla", label: "B", flag: "blue", dir: -1, startSide: "R", startXOffset:  55, goalSide: "L", startAfter: 0 },
+        ],
+        materials: ["wood_road", "wood_beam", "rope"],
+        hint:     "Two cars, opposite directions. Datsun A heads right to the red flag, then corolla B starts on the right and crosses left to the blue flag. Brace the slope so both passes hold. (Steel beam is unlocked — double-click the wood beam to switch.)",
+        lesson:   "Sloped bridges experience THRUST — gravity pulls down, but the slope redirects force sideways. Diagonal bracing transfers thrust safely into the anchors. A bridge that survives one pass can still fail the next as fatigue builds.",
     },
 
     // ═══ CHAPTER 2: INTRODUCING STEEL ═══════════════
@@ -106,7 +114,7 @@ export const LEVELS = [
         terrain:  "canyon",
         extraAnchors: [],
         multiVehicle: null,
-        materials: ["wood_road", "wood_beam", "steel"],
+        materials: ["wood_road", "wood_beam", "steel", "rope"],
         hint:     "You now have STEEL beams. They're expensive but far stronger. Try using steel only where stress is highest — the center and bottom of your truss.",
         lesson:   "Steel is 4× stronger than wood but costs more. Smart engineers use the strongest material only where STRESS peaks, not everywhere. This is called MATERIAL OPTIMIZATION.",
     },
@@ -123,7 +131,7 @@ export const LEVELS = [
         terrain:  "cliff",
         extraAnchors: [],
         multiVehicle: null,
-        materials: ["wood_road", "wood_beam", "steel"],
+        materials: ["wood_road", "wood_beam", "steel", "rope"],
         hint:     "This steep slope creates massive thrust. Steel at the key stress points will prevent buckling where wood would snap.",
         lesson:   "Steep slopes multiply THRUST forces. When wood isn't strong enough, steel reinforcement at critical joints prevents BUCKLING — when a beam crumples under compression.",
     },
@@ -189,7 +197,7 @@ export const LEVELS = [
             { side: "R", dx: 0, dy: 216 },
         ],
         multiVehicle: null,
-        materials: ["wood_road", "reinforced_road", "wood_beam", "steel"],
+        materials: ["wood_road", "reinforced_road", "wood_beam", "steel", "rope"],
         hint:     "Use the wall anchors BELOW to build vertical piers up to road level. A delivery van is crossing — use reinforced road for the heaviest spans!",
         lesson:   "PIERS are vertical supports built from below. They break a long span into shorter sections, each easier to bridge. This is how most real highway bridges work!",
     },
@@ -206,7 +214,7 @@ export const LEVELS = [
         terrain:  "canyon",
         extraAnchors: [],
         multiVehicle: null,
-        materials: ["wood_road", "reinforced_road", "wood_beam", "steel", "cable"],
+        materials: ["wood_road", "reinforced_road", "wood_beam", "steel", "rope", "cable"],
         hint:     "No piers this time — span the full gap for a heavy camper van. Reinforced road + steel beams at critical spots.",
         lesson:   "When you can't build piers, the structure itself must be stronger. REINFORCEMENT means adding material where forces concentrate — usually at the center and supports.",
     },
@@ -225,8 +233,8 @@ export const LEVELS = [
         terrain:  "canyon",
         extraAnchors: [],
         multiVehicle: null,
-        materials: ["wood_road", "wood_beam"],
-        hint:     "Tiny budget, wood only. Every beam costs money. Find the absolute minimum structure that still holds a car.",
+        materials: ["wood_road", "wood_beam", "rope"],
+        hint:     "Tiny budget, but the full upgrade tree is unlocked. Steel and cable are pricey here — every beam costs money. Find the absolute minimum structure that still holds a car.",
         lesson:   "The best engineering isn't the strongest bridge — it's the one that's JUST strong enough. Efficiency means using the minimum material for the required load.",
     },
     {
@@ -267,7 +275,7 @@ export const LEVELS = [
             { vType: "jeep",       startXOffset: -72,  label: "A", color: "#e890a0" },
             { vType: "sports_car", startXOffset: -144, label: "B", color: "#d4b020" },
         ],
-        materials: ["wood_road", "reinforced_road", "wood_beam", "steel", "cable"],
+        materials: ["wood_road", "reinforced_road", "wood_beam", "steel", "rope", "cable"],
         hint:     "Two vehicles cross at the same time! Your bridge must hold both simultaneously.",
         lesson:   "Real bridges carry MANY vehicles at once. When multiple loads are present, forces ADD UP. Your structure needs enough redundancy that no single member is a weak link.",
     },

@@ -89,11 +89,33 @@ export function snapToGrid(wx, wy, anchorNodes) {
 
 // ─── Point-to-segment distance ────────────────────────
 export function distToSegment(p, v, w) {
-    const l2 = (v.x - w.x) ** 2 + (v.y - w.y) ** 2;
-    if (l2 === 0) return Math.hypot(p.x - v.x, p.y - v.y);
-    let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2;
-    t = Math.max(0, Math.min(1, t));
-    return Math.hypot(p.x - (v.x + t * (w.x - v.x)), p.y - (v.y + t * (w.y - v.y)));
+    const dxw = w.x - v.x, dyw = w.y - v.y;
+    const l2 = dxw * dxw + dyw * dyw;
+    if (l2 === 0) {
+        const dx = p.x - v.x, dy = p.y - v.y;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+    let t = ((p.x - v.x) * dxw + (p.y - v.y) * dyw) / l2;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const cx = v.x + t * dxw, cy = v.y + t * dyw;
+    const ex = p.x - cx, ey = p.y - cy;
+    return Math.sqrt(ex * ex + ey * ey);
+}
+
+// Squared-distance variant — for callers that just compare against a
+// threshold and don't need the actual distance value (avoids the sqrt).
+export function distToSegmentSq(px, py, v, w) {
+    const dxw = w.x - v.x, dyw = w.y - v.y;
+    const l2 = dxw * dxw + dyw * dyw;
+    if (l2 === 0) {
+        const dx = px - v.x, dy = py - v.y;
+        return dx * dx + dy * dy;
+    }
+    let t = ((px - v.x) * dxw + (py - v.y) * dyw) / l2;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const cx = v.x + t * dxw, cy = v.y + t * dyw;
+    const ex = px - cx, ey = py - cy;
+    return ex * ex + ey * ey;
 }
 
 // ─── BFS: is node connected to an anchor? ─────────────
@@ -297,12 +319,12 @@ export function physicsTick(state) {
 
         const mat = MATERIALS[m.type];
 
-        // Tension-only: check if slack
+        // Tension-only: check if slack. Compare squared lengths to skip a
+        // sqrt — the dist value isn't used elsewhere, only compared to rest.
         if (mat.tensionOnly) {
             const dx = m.n2.x - m.n1.x;
             const dy = m.n2.y - m.n1.y;
-            const dist = Math.hypot(dx, dy);
-            if (dist <= m.rest) {
+            if (dx * dx + dy * dy <= m.rest * m.rest) {
                 m.stress *= 0.9;
                 continue;
             }
@@ -408,6 +430,29 @@ export function vehicleTick(state, lvl, lvlDef) {
     for (const v of state.vehicles) {
         if (!v.active || v.finished) continue;
 
+        // Sequential vehicles wait for a previous vehicle before they start
+        // driving. The trigger releases as soon as the predecessor crosses
+        // its goal flag (_passedFlag) — predecessor can keep driving offscreen
+        // while this one starts, for an immersive "they swap on the road"
+        // feel. Falls back to .finished for non-passOnly predecessors.
+        if (v._waitFor != null) {
+            const waiting = state.vehicles[v._waitFor];
+            const released = waiting && (waiting._passedFlag || waiting.finished);
+            if (!released) {
+                // Snap to the approach surface and idle.
+                const sideY = v._dir < 0 ? lvl.rY : lvl.lY;
+                const targetY = sideY - 5 - v.cfg.h * 0.5;
+                v.y = targetY;
+                v.vx = 0;
+                v.vy = 0;
+                v.angle = 0;
+                continue;
+            }
+            v._waitFor = null;          // released — start driving this tick
+        }
+
+        const dir = v._dir || 1;        // +1 right-bound (default), −1 left-bound
+
         let roadY = null;
         let roadAngle = 0;
         let bestMember = null;
@@ -419,30 +464,12 @@ export function vehicleTick(state, lvl, lvlDef) {
         // visual width so the car rolls on top of the plank instead of floating
         // at its centerline.
         const APPROACH_SURFACE_OFFSET = 5;  // matches ROAD_H / 2 in game.js
-        // Lip pivot — the vehicle keeps a contact patch with the cliff edge until
-        // its physics-box back wheel reaches the edge. During that phase the
-        // center of mass follows an arc: drops and tilts forward together. This
-        // way the back wheel visibly stays on the cliff while the front dips,
-        // instead of the vehicle going airborne with its back wheel still
-        // appearing planted on the ground.
+        // Lip pivot — cliff-edge blends (used only when no plank carries this x).
         const lipReach = v.cfg.w * 0.4;
-        if (v.x < lvl.lX) {
-            roadY = lvl.lY - APPROACH_SURFACE_OFFSET;
-            roadAngle = 0;
-        } else if (v.x < lvl.lX + lipReach) {
-            const t = (v.x - lvl.lX) / lipReach;          // 0 → 1
-            roadY = lvl.lY - APPROACH_SURFACE_OFFSET + t * t * 14;
-            roadAngle = t * 0.55;
-        }
-        else if (v.x > lvl.rX) {
-            roadY = lvl.rY - APPROACH_SURFACE_OFFSET;
-            roadAngle = 0;
-        } else if (v.x > lvl.rX - lipReach) {
-            const t = (lvl.rX - v.x) / lipReach;
-            roadY = lvl.rY - APPROACH_SURFACE_OFFSET + t * t * 14;
-            roadAngle = -t * 0.55;
-        }
 
+        // Sample bridge / road PLANKS first. If we blended cliff lips before this
+        // loop, the lip curve could win while the car was still on a sloped deck,
+        // forcing roadAngle≈0 — cars looked horizontal on ramps.
         for (const m of state.members) {
             if (m.broken || !MATERIALS[m.type].isRoad) continue;
 
@@ -464,6 +491,25 @@ export function vehicleTick(state, lvl, lvlDef) {
             }
         }
 
+        // No plank — cliff asphalt & lip transitions onto / off the gap.
+        if (roadY === null) {
+            if (v.x < lvl.lX) {
+                roadY = lvl.lY - APPROACH_SURFACE_OFFSET;
+                roadAngle = 0;
+            } else if (v.x < lvl.lX + lipReach) {
+                const t = (v.x - lvl.lX) / lipReach;          // 0 → 1
+                roadY = lvl.lY - APPROACH_SURFACE_OFFSET + t * t * 14;
+                roadAngle = t * 0.55;
+            } else if (v.x > lvl.rX) {
+                roadY = lvl.rY - APPROACH_SURFACE_OFFSET;
+                roadAngle = 0;
+            } else if (v.x > lvl.rX - lipReach) {
+                const t = (lvl.rX - v.x) / lipReach;
+                roadY = lvl.rY - APPROACH_SURFACE_OFFSET + t * t * 14;
+                roadAngle = -t * 0.55;
+            }
+        }
+
         const carBottom = v.y + v.cfg.h * 0.5;
         const snapDist = v._falling ? 5 : 10;
         const onSurface = roadY !== null && carBottom >= roadY - snapDist && carBottom <= roadY + snapDist;
@@ -472,11 +518,17 @@ export function vehicleTick(state, lvl, lvlDef) {
             v._falling = false;
             v._wasOnSurface = true;
             const spd = v.cfg.speed * 1.2;
-            v.x += spd * Math.cos(roadAngle);
+            v.x += dir * spd * Math.cos(roadAngle);
             const targetY = roadY - v.cfg.h * 0.5;
             v.y = v.y * 0.5 + targetY * 0.5;
+            // Body tilt follows the local plank angle directly. Kaplay applies
+            // flipX as scaleX(-1) AFTER rotation, so a left-bound (unflipped)
+            // sprite and a right-bound (flipped) sprite both visually tilt the
+            // same way for a given v.angle — no mirror needed. Smoothing is
+            // the original 0.6 / 0.4 (gentle); heavier blends snap between
+            // adjacent plank slopes and read as jittery.
             v.angle = v.angle * 0.6 + roadAngle * 0.4;
-            v.vx = spd;
+            v.vx = dir * spd;
             v.vy = 0;
 
             // Apply vehicle weight to road nodes
@@ -492,21 +544,26 @@ export function vehicleTick(state, lvl, lvlDef) {
                 if (right.invMass > 0) right.fy += w * t;
             }
         } else {
-            // Falling
-            const sign = v.vx >= 0 ? 1 : -1;
+            // Falling. The "rotation sign" controls which way the visual
+            // sprite tips during the fall. Right-bound cars (right-facing
+            // sprite via flipX) want clockwise rotation so the nose stays
+            // pointing forward+down. Left-bound cars (left-facing sprite,
+            // no flip) want clockwise rotation too — that ALSO drops the
+            // nose since the nose is on the left side of an unflipped
+            // sprite. So the sign is constant +1 regardless of direction;
+            // the previous code keyed off vx and incorrectly flipped it
+            // for left-bound cars, leaving them tipping backwards.
+            const rotSign = 1;
             if (!v._falling) {
                 v._falling = true;
-                if (!v.vx) v.vx = v.cfg.speed;
-                // Small initial nudge to keep angVel pointing forward — the edge
-                // tipping above already puts the vehicle at a forward angle, so
-                // we just need a gentle push to continue the rotation.
-                if (v._wasOnSurface) v.angVel = 0.008 * sign;
+                if (!v.vx) v.vx = v.cfg.speed * (v._dir || 1);
+                if (v._wasOnSurface) v.angVel = 0.008 * rotSign;
             }
             v.vy += 0.5;
             v.x += v.vx;
             v.y += v.vy;
             v.vx *= 0.998;
-            v.angVel = (v.angVel || 0) * 0.99 + 0.004 * sign;
+            v.angVel = (v.angVel || 0) * 0.99 + 0.004 * rotSign;
             v.angle += v.angVel;
 
             // Wall collision — only kicks in when the vehicle is actually moving
@@ -543,7 +600,35 @@ export function vehicleTick(state, lvl, lvlDef) {
         if (failY > 0 && v.y > failY) { v.active = false; return "fail"; }
         // Legacy hard-stop in case _screenBottomY isn't wired up.
         if (v.y > 1400) { v.active = false; return "fail"; }
-        if (v.x > lvl.rX + 80 && v.y < lvl.rY + 60 && Math.abs(v.vy) < 3) v.finished = true;
+        // Finish check: vehicle reached its goal cliff and is settled. Goal
+        // side defaults to whichever cliff matches the travel direction,
+        // unless the level config overrode it via v._goalSide.
+        const goalSide = v._goalSide || (dir < 0 ? "L" : "R");
+        const multi = !!(lvlDef && lvlDef.multiVehicle);
+        let finishRX = lvl.rX + 80;
+        let finishLX = lvl.lX - 80;
+        if (multi && typeof lvl._finishRightX === "number") {
+            finishRX = lvl._finishRightX;
+            finishLX = lvl._finishLeftX;
+        }
+        // Mark _passedFlag the first time the vehicle clears the flag x. Used
+        // both as the release trigger for waiting sequel vehicles and as the
+        // gate before passOnly cars accept .finished off-screen.
+        const settled = v.y < (goalSide === "R" ? lvl.rY : lvl.lY) + 60 && Math.abs(v.vy) < 3;
+        const reachedFlag = goalSide === "R" ? (v.x > finishRX && settled) : (v.x < finishLX && settled);
+        if (reachedFlag) v._passedFlag = true;
+
+        if (v._passOnly) {
+            // Drive past the flag and finish only after leaving the screen.
+            // Margin is generous so the car is comfortably off before the
+            // level resolution kicks in.
+            const offMargin = 60;
+            const offRight = (lvl._screenRightX ?? (lvl.rX + 600)) + offMargin;
+            const offLeft  = (lvl._screenLeftX  ?? (lvl.lX - 600)) - offMargin;
+            if (goalSide === "R" ? v.x > offRight : v.x < offLeft) v.finished = true;
+        } else if (reachedFlag) {
+            v.finished = true;
+        }
     }
 
     if (state.vehicles.length && state.vehicles.every(v => v.finished)) return "win";

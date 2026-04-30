@@ -38,6 +38,13 @@ k.loadSprite("flag", `${BASE}assets/misc/flag animation.png`, {
         wave: { from: 0, to: 4, loop: true, speed: 8 },
     },
 });
+// Blue variant — same spritesheet, recolored cloth. Used for car B finish flags.
+k.loadSprite("flagBlue", "/assets/misc/flag blue animation.png", {
+    sliceX: 5,
+    anims: {
+        wave: { from: 0, to: 4, loop: true, speed: 8 },
+    },
+});
 
 // Vehicle sprites (retro pixel art)
 k.loadSprite("veh_bicycle",  `${BASE}assets/vehicles/motor-cycle-male.png`);
