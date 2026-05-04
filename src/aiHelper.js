@@ -1,5 +1,40 @@
 import { MATERIALS, GRID } from "./constants.js";
 
+// ─── Two transport paths ──────────────────────────────────
+// 1) .env key (dev only) → fetch OpenAI directly. Read from
+//    `VITE_OPENAI_API_KEY` in .env so the dev can test the helper while
+//    running `npm run dev`. The key never appears in committed code (.env
+//    is gitignored) but bundlers DO inline it into the client build, so
+//    only use this in local dev — never publish a build with it set.
+// 2) Portal proxy → postMessage to the parent frame, which forwards the
+//    request through its server-side OpenAI integration. Used in the web
+//    portal where the player doesn't have their own key.
+
+function getDevKey() {
+    try {
+        return (import.meta.env && import.meta.env.VITE_OPENAI_API_KEY) || "";
+    } catch { return ""; }
+}
+
+async function localAIRequest(payload) {
+    const key = getDevKey();
+    if (!key) throw new Error("VITE_OPENAI_API_KEY not set");
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${key}`,
+        },
+        body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+        let detail = "";
+        try { detail = (await res.json())?.error?.message || ""; } catch {}
+        throw new Error(`OpenAI ${res.status}${detail ? ": " + detail : ""}`);
+    }
+    return await res.json();
+}
+
 let _requestId = 0;
 function portalAIRequest(payload) {
     return new Promise((resolve, reject) => {
@@ -30,19 +65,21 @@ function portalAIRequest(payload) {
     });
 }
 
-// Build a Socratic-tutor prompt. The model returns a step-by-step lesson
-// where each step is a multiple-choice question followed by the members to
-// place when the player answers, so the bridge grows as the lesson progresses.
+// ─── Prompt — TEACHING-MODE helper ────────────────────────
+// The model returns a step-by-step plan where each step has a one-line title,
+// a 1-3 sentence engineering explanation (why we're doing this — physics,
+// shape, material choice, load path), and the members to place. The UI walks
+// through the steps; the bridge grows as the player clicks "Next".
+//
+// No quiz options, no correct/wrong feedback. The goal is to teach concepts
+// while building an effective bridge.
 export function buildPrompt(lvl, lvlDef) {
-    // Only include materials actually unlocked for THIS level
     const allowedKeys = lvlDef.materials || Object.keys(MATERIALS);
     const allowedMats = allowedKeys.filter(k => MATERIALS[k]);
     const matList = allowedMats
         .map(k => {
             const m = MATERIALS[k];
             const role = m.isRoad ? "ROAD SURFACE (drive on this)" : (m.tensionOnly ? "TENSION-ONLY (goes slack in compression — use as a cable from a HIGH anchor to pull the road up)" : "structural beam (compression + tension)");
-            // Internal key is for YOUR "members" output only — the DISPLAY NAME
-            // is "${m.label}" (this is what you must use in question and option text).
             return `- key="${k}" displayName="${m.label}" — breakForce=${m.breakForce}, cost=$${m.price}/10 units length, maxLen=${m.maxLength}. ${role}.`;
         })
         .join("\n");
@@ -50,7 +87,7 @@ export function buildPrompt(lvl, lvlDef) {
     const beamKeys = allowedMats.filter(k => !MATERIALS[k].isRoad && !MATERIALS[k].tensionOnly);
     const tensionKeys = allowedMats.filter(k => MATERIALS[k].tensionOnly);
 
-    // ── Pre-compute geometric scaffolding so the model has real numbers ──
+    // Pre-compute geometric scaffolding
     const roadMatKey = roadKeys[0] || "wood_road";
     const roadMax = MATERIALS[roadMatKey].maxLength;
     const roadSegs = Math.max(1, Math.ceil(lvl.gap / roadMax));
@@ -88,7 +125,7 @@ export function buildPrompt(lvl, lvlDef) {
         ? lvlDef.multiVehicle.map(mv => mv.vType).join(" + ")
         : lvlDef.vType;
 
-    return `You are a SHARP bridge-engineering tutor. Teach through a Socratic multiple-choice lesson while the bridge actually grows on-screen as the player answers. Every question should make the player think about a concrete decision on THIS bridge — not parrot vocabulary.
+    return `You are an EXPERT bridge-engineering tutor. Your job: design a working bridge for THIS level and walk the player through HOW and WHY it works, step by step. The bridge will be built on-screen as the player advances through your steps. NO quiz questions — you are teaching, not testing.
 
 ## Coordinate system (critical!):
 - X increases RIGHT, Y increases DOWNWARD (screen coords)
@@ -110,7 +147,7 @@ ${anchors.join("\n")}
 ## Materials available on THIS LEVEL (you MUST NOT use any other):
 ${matList}
 
-Grouped for convenience:
+Grouped:
 - ROAD material(s): ${roadKeys.length ? roadKeys.join(", ") : "(none — unusual!)"}
 - STRUCTURAL beam(s): ${beamKeys.length ? beamKeys.join(", ") : "(none — unusual!)"}
 - TENSION-ONLY: ${tensionKeys.length ? tensionKeys.join(", ") : "(none — no suspension possible here)"}
@@ -121,123 +158,87 @@ Grouped for convenience:
 - Roadbed members should go: ${roadbedPairs}
 - Suggested bottom-chord support row ${supDepth}u BELOW roadbed: ${supList}
 
-## Bridge archetypes — PICK THE ONE THAT FITS THIS LEVEL and commit to it
-Don't mix patterns ad-hoc. Decide on a design first, then all your members should serve it.
+## Bridge archetypes — PICK ONE and commit
+Beam supports can sit ABOVE the deck (overhead truss / roof-style) OR BELOW (floor-style truss). On levels with high anchors, an overhead truss often saves cost because the beams pull the deck up via tension/compression to anchor points already provided. Prefer overhead when high anchors exist; prefer below when only cliff-top anchors are available.
 
-- **Warren/Pratt TRUSS** (for Triangulation / plain beam levels):
-  Road on top chord. Bottom chord below (same length, parallel). Diagonals zig-zag between them forming triangles. Every interior road node is the APEX of at least one triangle whose base sits on the bottom chord. Bottom chord EXTENDS TO BOTH ANCHORS.
-- **ARCH** (good for rigid stone/reinforced road over a canyon):
-  Arch apex in the middle, curving down to the two bottom anchors (or to the bridge endpoints sitting on them). Short vertical struts rise from the arch to each interior road node. The arch carries compression; vehicles rest on top.
-- **SUSPENSION** (requires high anchors ABOVE the road):
-  Main cable from high-anchor to high-anchor draping below its anchors. Vertical hangers (also cable/rope) drop from the main cable to each road node. Cables MUST pull up, never push down.
-- **CABLE-STAYED** (one high tower or high anchor):
-  Separate cables run from the top of the tower directly to each road node, like a fan. Each cable is straight.
-- **CANTILEVER** (when only one anchor is available on one side):
-  Rigid truss extends from the supported cliff past the gap. Back-stays / counter-weight beams anchor the root so it doesn't tip over.
-- **BEAM + PIER** (tall levels with mid-gap anchor): single vertical pier from mid-gap anchor straight up to the roadbed, then roadbed spans between pier and both cliffs.
+- **Warren/Pratt TRUSS** (above OR below): road on one chord, parallel chord on the OTHER side, diagonals zig-zag forming triangles. Both chords EXTEND TO ANCHORS. Below-deck = floor truss; above-deck = overhead truss.
+- **ARCH** (above OR below): arch curves toward the anchors. Short verticals tie the deck to the arch. A below-deck arch carries compression upward; an above-deck arch carries the deck via hangers.
+- **SUSPENSION** (needs HIGH anchors): main cable drapes between high anchors, vertical hangers drop to each road node. Always above the deck.
+- **CABLE-STAYED** (one tower): straight cables from tower top down to each road node.
+- **CANTILEVER** (one anchor only): rigid truss extends from cliff. Back-stays anchor the root.
+- **BEAM + PIER** (mid-gap anchor): single vertical pier from mid-anchor up to road, then road spans both halves.
 
-If the concept is "${lvlDef.concept}", the archetype of choice is usually obvious — commit to it.
-
-## HARD RULES (the final bridge MUST satisfy all of these):
+## HARD RULES — the final bridge MUST satisfy ALL of these:
 1. **Connectivity**: every member connects TWO nodes. A node is legal only if it (a) IS an anchor, or (b) is also an endpoint of ANOTHER member that traces back to an anchor.
-2. **NO ANCHORING INTO THE CLIFF**: the ONLY valid attachment points that are inside the cliff/table geometry are the anchors listed above. Any non-anchor endpoint must be in OPEN AIR — i.e. NOT inside a cliff wall. Formally: a non-anchor point (x, y) must satisfy BOTH of these: if x ≤ ${lvl.lX} then y ≤ ${lvl.lY}; if x ≥ ${lvl.rX} then y ≤ ${lvl.rY}. If you want to "anchor" something to a cliff, the cliff-top corner anchor is your ONLY option. Do not invent attachment points on the side of a cliff.
+2. **NO ANCHORING INTO THE CLIFF**: a non-anchor point (x, y) must satisfy: if x ≤ ${lvl.lX} then y ≤ ${lvl.lY}; if x ≥ ${lvl.rX} then y ≤ ${lvl.rY}.
 3. **Road continuity**: road members form one unbroken chain from LEFT ANCHOR (${lvl.lX},${lvl.lY}) to RIGHT ANCHOR (${lvl.rX},${lvl.rY}).
-4. **Load path to anchors**: pick ANY interior road node and trace through structural members — you MUST reach an anchor. Prefer designs where the bottom-chord/truss EXTENDS ALL THE WAY to both anchors, or where cables from high anchors hold up each interior node. NEVER leave a road hanging only from a truss that dead-ends mid-span.
-5. **Trusses need BOTH chords**: if you pick a truss archetype, you need the top chord (the road itself) AND a bottom chord (a parallel chain of beams below the road, connecting the same endpoints) AND diagonals between them. A bare zigzag below the road with no horizontal bottom chord is NOT a truss — the zigzag apexes just swing freely and the bridge collapses.
-6. **Materials**: you may ONLY use the material keys listed above. Do not invent keys.
+4. **Load path to anchors**: every interior road node traces through structural members to an anchor. Bottom chords / cables EXTEND ALL THE WAY to both anchors.
+5. **Trusses need BOTH chords**: top chord (road) AND bottom chord (parallel chain below) AND diagonals. A bare zigzag with no horizontal bottom chord is NOT a truss.
+6. **Materials**: use only the listed keys. No invented keys.
 7. **Coordinates**: every x,y is a multiple of ${GRID}.
-8. **Budget**: sum of (member_length × price / 10) must be < $${lvl.budget}.
+8. **Budget**: sum of (member_length × price / 10) must be < $${lvl.budget}. STRICT: count every member you list across all steps. If you're close, drop a redundant diagonal or use a cheaper material on non-critical members. Going over budget fails the level — don't.
 9. **maxLength**: no single member longer than its material's maxLen.
-10. **Tension-only**: rope/cable only work when the anchor end is ABOVE (lower Y) the road end. Don't put them underneath the road — they'll go slack.
-11. **Triangulation**: for truss designs, every interior road node must be the apex of a triangle whose base is on the bottom chord.
+10. **Tension-only**: rope/cable only work when the anchor end is ABOVE (lower Y) the road end. Don't put them underneath the road — they go slack.
+11. **Triangulation**: for trusses, every interior road node is the apex of a triangle whose base is on the bottom chord.
 
-## Writing good questions — pedagogy rules (read carefully)
+## Teaching voice — pedagogy rules
+The player is reading your "explanation" text while the bridge gets built. Talk to them.
 
-This is a LEARNING tool for students. Your questions are how they build physical intuition about bridges.
+- NEVER show internal keys ("wood_road"). Use displayNames ("Wood Road", "Wood Beam", "Steel Cable").
+- NEVER show raw coordinates ("(180, 360)"). Use plain English: "the middle of the deck", "two grid cells below the road", "where the road meets the right cliff", "halfway between the tower and the deck".
+- Coordinates only appear inside the "members" array — that's for the engine, never visible.
+- Each "explanation" should teach ONE engineering concept tied to what's being placed:
+  - WHY this shape: triangulation = rigid; arch = compression; cables = tension; pier = shorter spans.
+  - WHY this material: stone road for heavy loads; cables can only PULL; steel beams when the load is high.
+  - WHY this load path: forces flow from the deck → through structural members → to the anchors. If the path breaks, the bridge collapses.
+  - HOW the physics matters in real engineering: bridges in the real world balance these same trade-offs.
+- Tone: clear, energetic, high-school physics depth. 1-3 sentences. Not condescending. Use real terms (compression, tension, span, chord, hanger, thrust, deflection) — but always explain on first use.
 
-**Voice rules (non-negotiable):**
-- In visible text (question, options, explanations), NEVER show internal keys like "wood_road" — always use the displayName (e.g. "Wood Road", "Wood Beam", "Steel Cable").
-- NEVER show raw coordinates like "(180, 360)" to the student. Describe positions in PLAIN ENGLISH: "the middle of the deck", "over the left cliff", "just above the canyon floor", "where the road meets the right anchor", "halfway between the tower and the deck". A student should never see a pair of numbers.
-- Internal x/y values only appear inside the "members" array of the JSON — students never see that; it's for the physics engine.
+### Good explanation examples — calibrate by these
+Triangulation (truss being built):
+"Notice the triangle forming under the deck: a triangle is the only shape whose angles can't change without one of its sides stretching or breaking. When the car's weight pushes the road down, that force gets redirected sideways along the diagonal beams into the cliffs instead of dropping straight down — that's why every bridge ever built uses triangles."
 
-**Content rules:**
-- Questions should test PHYSICAL REASONING — what force is at work, what would fail, which shape distributes load, how compression vs tension differ — NOT "which material key is which". The player can see the material list on screen; don't quiz them on its contents.
-- Every wrong option must be a real misconception a beginner would pick, explained by the physics (e.g. "a single vertical post under the deck" reads plausible but doesn't stop sag — that's the lesson).
-- No yes/no questions. No "which is true about X" vocabulary questions. Ask what to DO in this specific situation.
-- The "explainCorrect" should teach the principle in 1–2 sentences of real physics language — forces, triangles, tension, compression, load paths — at a high-school level.
-- The "explainWrong" should name the failure mode that option would cause: "without cross-bracing, the car's weight pushes the center road node down and the deck snaps", not "it's wrong because it's wrong".
+Pier:
+"By running a vertical Wood Beam from the rock pier up to the deck we're splitting the gap into TWO short spans instead of one long one. Shorter spans deflect less under load, so each half can be built much lighter than a single long span would need to be. Real highway bridges follow this pattern — that's why you see piers in the water under most river crossings."
 
-### Good-question examples — use these to calibrate TONE and DEPTH (don't copy the text)
+Suspension cable:
+"Cables can only pull, never push, so we're using rope IN TENSION between the high tower and the road node. Gravity pulls the deck down → the rope stretches and pulls back up. If the cable were below the deck it'd go slack and contribute nothing — tension members must always have their anchor ABOVE the load they support."
 
-Triangulation level (flat span, wood beams available):
-Q: "You've laid the road across the gap. The car's weight will push down hardest at the middle of the deck. What shape, placed UNDER the deck, actually stops the middle from dropping?"
-Options (any order):
-- A triangle formed by two beams running from the middle of the deck down-outward to the cliffs on either side — the two beams meet above the canyon floor
-- A single vertical post straight down from the middle of the deck to a new point below
-- A horizontal beam running left-to-right under the deck, hanging in the gap
-Correct answer: the triangle. explainCorrect: "A triangle is the only shape that can't change its angles without one of its sides stretching or breaking — the car's weight pushes sideways along the two beams into the cliffs instead of dropping straight down." explainWrong: "A lone vertical post has nothing stopping it from swinging sideways, so it falls over under load. A horizontal beam hanging in mid-air isn't connected to anything solid and just drops with the deck."
-
-${hasMidPier ? `Pier level (mid-gap rock pier available, like the level you're on now):
-Q: "There's a stone pier sticking up out of the water in the middle of the gap. What's the smartest way to use it for this build?"
-Options:
-- Run a single vertical wood beam straight up from the pier to the deck right above it, then triangulate each half-span (pier→cliff) underneath with diagonals
-- Ignore the pier and span the entire gap with one long truss as if the pier weren't there
-- Run cables from the pier diagonally up to the cliff anchors as a substitute for the deck
-Correct answer: vertical post + triangulation in each half. explainCorrect: "Splitting the span at the pier turns one long span into two short ones. The vertical pier post takes the deck's weight straight down into the rock, and each half can be triangulated cheaply since it's much shorter." explainWrong: "Spanning the whole gap when you have a free pier is wasteful — it forces the truss to be much taller and heavier. Diagonal cables from a low pier point downward to the cliffs, which doesn't help hold the deck up at all."
-
-` : ""}Suspension level (tall anchors above the deck):
-Q: "The two tall anchors above the deck are perfect for a suspension bridge. What should hang between them to carry the deck's weight?"
-Options:
-- A single straight cable stretched tight between the two tall anchors — the deck hangs from that
-- A draping curved main cable between the two tall anchors, with short vertical hangers dropping from the drape to each point on the deck
-- Two diagonal cables forming an X between opposing tall anchors and road ends
-Correct answer: the draping cable with hangers. explainCorrect: "Suspension bridges work because cables are strongest in tension — and a drape lets a long cable split the deck's weight equally between both towers. Short vertical hangers then pull each part of the deck up toward the drape." explainWrong: "A single straight cable can't hold the middle of the deck up — the middle is far below the cable. A crossed X doesn't support anything vertical; it resists lateral wind, not weight."
-
-## Step order (3–5 steps):
+## Step plan (3-5 steps):
 1. Lay the full roadbed from LEFT ANCHOR to RIGHT ANCHOR.
-2. Install the PRIMARY LOAD PATH of your chosen archetype (main cable, arch apex, truss bottom chord + diagonals, pier, etc.) — members that REACH ALL THE WAY to both anchors.
-3. Connect each interior road node to the primary load path (hangers, struts, or triangle apexes).
-4. (Optional) Reinforce weak spots, add back-stays or counterweights, switch to stronger material if budget allows.
-Each step's "members" array should ONLY contain members not already placed in earlier steps.
+2. Install the PRIMARY LOAD PATH of your chosen archetype (truss bottom chord, arch curve, main cable, central pier) — all the way to both anchors.
+3. Connect each interior road node to that primary load path (diagonals, hangers, struts).
+4. (Optional) Reinforce weak spots, switch to stronger material at the highest-stress members.
+
+Each step's "members" array contains ONLY the new members for that step (don't repeat earlier ones).
+The first step's "title" should be 2-4 words ("Lay the deck", "Hang the cable"), the explanation 1-3 sentences.
 
 ## Self-check BEFORE you output:
-- Does every member connect to a node placed earlier or an anchor?
+- Does every member connect to a node placed earlier OR an anchor?
 - Does EVERY interior road node trace to an anchor through structural members?
 - Is every material key in the allowed list?
 - Is total cost < budget? (Run the sum.)
 - Is every member ≤ its maxLen?
-- Is each question tied to THIS level, and does each wrong option represent a real misconception?
-If any answer is "no", FIX it before returning.
+- Does each explanation teach a real engineering concept tied to that step?
+If any answer is "no", fix it before returning.
 
 ## Output — return a single JSON object. No prose outside the JSON.
-Put the correct answer at WHICHEVER index (0, 1, or 2) — the UI shuffles options before showing them, so position doesn't matter; pick whatever reads best and set "correct" to that index honestly.
-
 {
   "concept": "the core concept name (e.g. Triangulation, Suspension, Cantilever, Arch)",
   "archetype": "which bridge pattern you chose (truss/arch/suspension/cable-stayed/cantilever/beam-pier)",
+  "summary": "One sentence recap of the design choice and why it works for THIS level.",
   "steps": [
     {
-      "question": "A level-specific question that mentions real coordinates, materials, or numbers from THIS level",
-      "options": ["option phrased concretely with real numbers", "another concrete option", "third concrete option"],
-      "correct": 0,
-      "explainCorrect": "WHY the correct option works here, citing the actual physics/numbers.",
-      "explainWrong": "Name the specific failure mode(s) of the wrong options.",
+      "title": "Short action label (2-4 words)",
+      "explanation": "1-3 sentences explaining the engineering concept — what force is at work, why this shape/material, how it ties into the load path. Real physics terms, no coordinates, no material keys.",
       "members": [
         {"x1": ${lvl.lX}, "y1": ${lvl.lY}, "x2": ${roadXs[1] || lvl.rX}, "y2": ${roadYs[1] || lvl.rY}, "type": "${roadMatKey}"}
       ]
     }
-  ],
-  "summary": "One sentence recap tied to ${lvlDef.concept}, naming the archetype used."
+  ]
 }
 
-## Variety — VARY YOUR APPROACH each time
-This player may run the AI tutor multiple times on the same level. Don't repeat the same lesson verbatim. Ways to vary:
-- Pick different question angles (force-on-the-deck → load-path-to-anchors → why-this-shape-not-that-one).
-- Vary the order of steps (you don't always have to do roadbed first if a different starter makes more pedagogical sense).
-- For trusses, alternate between Warren (alternating diagonals) and Pratt (vertical members) patterns.
-- For pier levels, vary HOW the pier is used (single vertical post vs. triangulated A-frame from pier to cliffs).
-- Vary which materials you emphasize when multiple are available.
-Treat this prompt's variation seed: ${Math.floor(Math.random() * 1000)}. Use it as a hint to pick a different angle than your default — different first question, different step ordering, etc.`;
+Variation seed: ${Math.floor(Math.random() * 1000)}. Use it as a hint to vary the angle of explanation across runs (different opening concept, different archetype if the level allows).`;
 }
 
 // Compute the set of preset anchor coordinates for a level. A beam endpoint
@@ -257,19 +258,12 @@ function getAnchorSet(lvl, lvlDef) {
     return s;
 }
 
-// Returns true if (x,y) is inside a solid cliff/table interior. Below the
-// cliff-top on either approach is solid ground — beam endpoints can't live
-// there unless the point is a preset anchor (handled by the caller).
 function isInsideTerrain(x, y, lvl) {
     if (x <= lvl.lX && y > lvl.lY) return true;   // left cliff / table
     if (x >= lvl.rX && y > lvl.rY) return true;   // right cliff / table
     return false;
 }
 
-// Drop any member whose endpoint sits inside a cliff and isn't on a preset
-// anchor. GPT-4o sometimes "extends" a diagonal into the cliff wall, which
-// the physics engine then treats as a floating node — the bridge fails
-// spectacularly even though the structure looked complete on screen.
 function stripCliffIntrusions(result, lvl, lvlDef) {
     const anchorSet = getAnchorSet(lvl, lvlDef);
     const nodeOk = (x, y) => anchorSet.has(`${x},${y}`) || !isInsideTerrain(x, y, lvl);
@@ -281,10 +275,62 @@ function stripCliffIntrusions(result, lvl, lvlDef) {
     }
 }
 
-// Walk all road members the AI placed and check whether you can trace a path
-// of road segments from the left anchor to the right anchor. If not, append
-// the missing canonical road segments (using the same geometry the prompt
-// suggested) to the final step so the bridge always spans the gap.
+// Trim members until the AI's plan fits under budget. Strategy: keep all
+// road members and any member whose endpoints are both anchors (load-path
+// critical), then drop the most expensive non-essential members one by
+// one until under budget. The model still occasionally overspends despite
+// the prompt; this is a final guarantee.
+function enforceBudget(result, lvl, lvlDef) {
+    const allowed = lvlDef.materials || Object.keys(MATERIALS);
+    const roadKeys = new Set(allowed.filter(k => MATERIALS[k]?.isRoad));
+    const anchorSet = getAnchorSet(lvl, lvlDef);
+    const isAnchorPt = (x, y) => anchorSet.has(`${x},${y}`);
+
+    const memberCost = (m) => {
+        const mat = MATERIALS[m.type];
+        if (!mat) return 0;
+        const len = Math.hypot(m.x2 - m.x1, m.y2 - m.y1);
+        return Math.round(len * mat.price / 10);
+    };
+
+    const totalCost = () => {
+        let sum = 0;
+        for (const s of result.steps || []) for (const m of s.members || []) sum += memberCost(m);
+        return sum;
+    };
+
+    let budget = lvl.budget;
+    let cost = totalCost();
+    if (cost <= budget) return;
+
+    // Build a list of removable members (skip roads; skip pure anchor-to-anchor)
+    const candidates = [];
+    for (let si = 0; si < (result.steps || []).length; si++) {
+        const arr = result.steps[si].members || [];
+        for (let mi = 0; mi < arr.length; mi++) {
+            const m = arr[mi];
+            if (roadKeys.has(m.type)) continue;
+            if (isAnchorPt(m.x1, m.y1) && isAnchorPt(m.x2, m.y2)) continue;
+            candidates.push({ si, mi, cost: memberCost(m) });
+        }
+    }
+    // Drop the most expensive first, then re-key indices because splice shifts
+    candidates.sort((a, b) => b.cost - a.cost);
+    for (const c of candidates) {
+        if (cost <= budget) break;
+        const arr = result.steps[c.si].members;
+        const idx = arr.findIndex(m => memberCost(m) === c.cost && !roadKeys.has(m.type));
+        if (idx === -1) continue;
+        cost -= memberCost(arr[idx]);
+        arr.splice(idx, 1);
+    }
+
+    if (cost > budget) {
+        // Last resort: surface a warning so the UI can show it.
+        result._budgetWarning = `AI plan still $${cost - budget} over the $${budget} budget after trimming.`;
+    }
+}
+
 function ensureRoadContinuity(result, lvl, lvlDef) {
     const allowed = lvlDef.materials || Object.keys(MATERIALS);
     const roadKeys = new Set(allowed.filter(k => MATERIALS[k]?.isRoad));
@@ -311,14 +357,13 @@ function ensureRoadContinuity(result, lvl, lvlDef) {
     const queue = [startKey];
     while (queue.length) {
         const cur = queue.shift();
-        if (cur === endKey) return; // already continuous — nothing to do
+        if (cur === endKey) return; // already continuous
         for (const nb of (adj.get(cur) || [])) {
             if (!visited.has(nb)) { visited.add(nb); queue.push(nb); }
         }
     }
 
-    // Road doesn't span the gap. Compute the canonical roadbed and fill in
-    // any segment that isn't already covered by an AI-placed road member.
+    // Road doesn't span the gap — fill missing canonical segments
     const roadMatKey = [...roadKeys][0];
     const roadMax = MATERIALS[roadMatKey].maxLength;
     const roadSegs = Math.max(1, Math.ceil(lvl.gap / roadMax));
@@ -344,29 +389,28 @@ function ensureRoadContinuity(result, lvl, lvlDef) {
     }
 }
 
-// Fetch a lesson from OpenAI via the portal proxy. Returns
-// `{ concept, steps, summary }` on success, `{ error }` on failure.
+// Fetch a lesson. Uses the dev .env key when present (standalone testing);
+// otherwise routes through the portal proxy. Returns
+// `{ concept, archetype, summary, steps }` on success, `{ error }` on failure.
 export async function solveBridge(lvl, lvlDef) {
-    if (window.parent === window) {
-        return { error: "AI tutor requires the web portal." };
+    const useLocal = !!getDevKey();
+    const standalone = window.parent === window;
+    if (!useLocal && standalone) {
+        return { error: "AI helper requires the web portal." };
     }
 
     try {
         const prompt = buildPrompt(lvl, lvlDef);
-        const data = await portalAIRequest({
-            model: "gpt-4o",               // full 4o — spatial reasoning matters here
+        const requestBody = {
+            model: "gpt-4o",
             max_tokens: 3500,
-            // Bumped for variety — the spatial-reasoning rules in the
-            // prompt keep geometry stable; this temp lets question angles
-            // and archetype choices vary across runs of the same level.
             temperature: 0.7,
             response_format: { type: "json_object" },
             messages: [{ role: "user", content: prompt }],
-        });
+        };
+        const data = useLocal ? await localAIRequest(requestBody) : await portalAIRequest(requestBody);
 
         const text = data.choices?.[0]?.message?.content || "";
-
-        // json_object mode returns pure JSON; still handle fenced fallback for robustness
         const jsonMatch =
             text.match(/```json\s*([\s\S]*?)```/) ||
             text.match(/\{[\s\S]*"steps"[\s\S]*\}/);
@@ -379,36 +423,15 @@ export async function solveBridge(lvl, lvlDef) {
             return { error: "AI response missing steps array." };
         }
         for (const s of result.steps) {
-            if (typeof s.question !== "string" || !Array.isArray(s.options) ||
-                typeof s.correct !== "number" || !Array.isArray(s.members)) {
+            if (typeof s.explanation !== "string" || !Array.isArray(s.members)) {
                 return { error: "AI response step is malformed." };
             }
+            if (typeof s.title !== "string") s.title = "Build step";
         }
 
-        // Drop any members whose endpoints fall inside a cliff wall (unless
-        // the endpoint is a preset anchor). Done BEFORE the road-continuity
-        // pass so a cliff-intrusive "road" member doesn't count as coverage.
         stripCliffIntrusions(result, lvl, lvlDef);
-
-        // Guarantee road continuity. GPT-4o frequently stops the roadbed short
-        // of the right anchor — no amount of prompt-pleading reliably fixes
-        // this, so we check it in code and append any missing canonical road
-        // segments to the final step's members.
         ensureRoadContinuity(result, lvl, lvlDef);
-
-        // Shuffle each step's options client-side. GPT-4o has a strong bias to
-        // put the correct answer at the index shown in the example output (we
-        // saw it land on index 1 virtually every time). Randomizing here makes
-        // the lesson feel like a real quiz instead of "always pick B".
-        for (const s of result.steps) {
-            if (s.correct < 0 || s.correct >= s.options.length) continue;
-            const correctText = s.options[s.correct];
-            for (let i = s.options.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [s.options[i], s.options[j]] = [s.options[j], s.options[i]];
-            }
-            s.correct = s.options.indexOf(correctText);
-        }
+        enforceBudget(result, lvl, lvlDef);
 
         return result;
     } catch (err) {

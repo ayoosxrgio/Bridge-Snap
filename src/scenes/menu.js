@@ -1,6 +1,7 @@
 import { C } from "../constants.js";
 import { LEVELS } from "../levels.js";
 import { isUnlocked, getGrade, resetProgress } from "../progression.js";
+import { getLeaderboard } from "../leaderboard.js";
 // Settings persistence
 const SETTINGS_KEY_INIT = "bridgesnap_settings";
 const SETTINGS_DEFAULTS = { masterVol: 0.8, musicVol: 0.7, sfxVol: 0.9, showGrid: true, showStress: true, fpsCap: 60 };
@@ -237,6 +238,17 @@ export function menuScene(k, params = {}) {
     let needsInitScroll = startAtLevelSelect;
     let lsSelectedIdx = -1;
     let scrollDist = 0;
+    // Card-cascade animation: re-armed every time the player arrives at the
+    // level-select screen. -1 means "not animating". Set when scrollY first
+    // crosses fully into level-select; cleared when leaving.
+    let lsAnimStart = -1;
+    let lsWasIn = false;
+    // Leaderboard slide-in panel state
+    let lbOpen = false;
+    let lbAnimT = 0;             // 0 = closed, 1 = fully slid in (eased toward lbOpen)
+    let lbLevel = 0;
+    let lbData = null;
+    let lbLoadingFor = -1;       // level idx currently being fetched (debounce)
 
     // ─── Settings state ──────────────────────────────
     const SETTINGS_KEY = "bridgesnap_settings";
@@ -250,6 +262,17 @@ export function menuScene(k, params = {}) {
 
     // ─── Sticky note rip animation ─────────────────
     let noteRip = null; // { idx, cx, cy, w, h, noteCol, t, vy, rot, rotSpd, pieces }
+
+    function loadLeaderboard(levelIdx) {
+        const lvl = LEVELS[levelIdx];
+        if (!lvl) return;
+        lbLoadingFor = levelIdx;
+        lbData = null;
+        getLeaderboard(lvl.id, { budget: lvl.budget }).then(res => {
+            // Drop stale results if the user has tabbed to a different level
+            if (lbLoadingFor === levelIdx) lbData = res;
+        }).catch(() => { if (lbLoadingFor === levelIdx) lbData = { error: true }; });
+    }
 
     function startCrack(btnIdx, cx, cy, w, h, target) {
         const angle = plankAngles[btnIdx] || 0;
@@ -615,6 +638,32 @@ export function menuScene(k, params = {}) {
         else if (scrollY < -scrollDist * 0.5) currentView = "settings";
         else currentView = "menu";
 
+        // Arm the level-select cascade once the pan-up is mostly there so the
+        // cards start animating just before the scroll fully lands — feels
+        // snappy instead of a hold-then-pop. `lsWasIn` doubles as the
+        // "revealed" flag: cards stay hidden until it flips true.
+        const lsSettled = currentView === "levelSelect"
+            && scrollTarget === scrollDist
+            && scrollY >= scrollDist * 0.92;
+        if (lsSettled && !lsWasIn) {
+            lsAnimStart = k.time();
+            lsWasIn = true;
+        }
+        // Re-arm whenever we leave the level-select target so the next visit
+        // replays the animation.
+        if (currentView !== "levelSelect" && scrollTarget !== scrollDist) {
+            lsWasIn = false;
+            lsAnimStart = -1;
+        }
+
+        // Smooth toward open/closed for the leaderboard slide animation
+        const lbTarget = lbOpen ? 1 : 0;
+        lbAnimT += (lbTarget - lbAnimT) * Math.min(1, dt * 4.5);
+        if (Math.abs(lbAnimT - lbTarget) < 0.005) lbAnimT = lbTarget;
+        // If the player leaves level-select with the panel open, snap shut so
+        // re-entering doesn't show a half-open panel
+        if (currentView !== "levelSelect" && lbOpen) { lbOpen = false; lbAnimT = 0; }
+
         // Settings message timer
         if (settingsMsgTimer > 0) { settingsMsgTimer -= dt; if (settingsMsgTimer <= 0) settingsMessage = null; }
 
@@ -708,7 +757,7 @@ export function menuScene(k, params = {}) {
         // Crack animation
         drawCrack(W, H);
 
-        // ── Level select content (sticky notes on corkboard) ──
+        // ── Level select content (wooden card grid) ──
         {
             const lsY = -scrollDist + sy;
             const lsFW = 38;
@@ -723,31 +772,139 @@ export function menuScene(k, params = {}) {
             k.drawText({ text: "SELECT LEVEL", pos: k.vec2(W/2 + 2, titleY + 2), size: titleSz, font: "PressStart2P", color: col("#1a0e05"), anchor: "top", opacity: 0.25 });
             k.drawText({ text: "SELECT LEVEL", pos: k.vec2(W/2, titleY), size: titleSz, font: "PressStart2P", color: col("#4a2808"), anchor: "top" });
 
-            // Sticky note grid — 5 cols × 3 rows, fills available space
-            const cols = 5;
-            const rows = 3;
-            const topArea = titleSz + 24;
-            const bottomArea = 50;
-            const noteGap = 10;
-            const noteW = Math.floor((usableW * 0.88 - (cols - 1) * noteGap) / cols);
-            const noteH = Math.floor(((usableH - topArea - bottomArea) * 0.88 - (rows - 1) * noteGap) / rows);
+            // Wooden card grid — 4 cols × 2 rows = 8 cards.
+            const SHOWN_LEVELS = 8;
+            const cols = 4;
+            const rows = 2;
+            const topArea = titleSz + 28;
+            const bottomArea = 60;
+            const noteGap = 18;
+            const noteW = Math.floor((usableW * 0.86 - (cols - 1) * noteGap) / cols);
+            const noteH = Math.floor(((usableH - topArea - bottomArea) * 0.92 - (rows - 1) * noteGap) / rows);
             const gridW = cols * noteW + (cols - 1) * noteGap;
             const gridStartX = W / 2 - gridW / 2;
             const gridStartY = titleY + topArea;
 
-            const NOTE_COLS = ["#ffe97a","#ffb07a","#ff8fa0","#a0d4ff","#a0ffb8","#e0a0ff","#ffcf7a","#7ae8d0","#f0a0c0","#b8e87a","#ffa07a","#a0c8ff","#ffe07a","#c0ff90","#ffb8d0"];
-            const gradeColors = { S: "#ffd700", A: "#50c878", B: "#5090d0", C: "#b08050" };
+            // Wood-stamped grade plaque colors — matches the win modal medallion.
+            const gradeColors = { S: "#fbbf24", A: "#22c55e", B: "#60a5fa", C: "#f97316", F: "#ef4444" };
 
-            // Compute grid layout once (reused by click handler)
-            // Each note gets a slight random tilt (seeded by index)
+            // Compute grid layout once (reused by click handler).
             function noteLayout(i) {
                 const r = Math.floor(i / cols);
                 const c2 = i % cols;
                 const cx = gridStartX + c2 * (noteW + noteGap) + noteW / 2;
                 const cy = gridStartY + r * (noteH + noteGap) + noteH / 2;
-                // Deterministic tilt per note
-                const tilt = (Math.sin(i * 7.3 + 2.1) * 0.04);
-                return { cx, cy, tilt };
+                return { cx, cy, tilt: 0 };
+            }
+
+            // Wooden coin medallion — same look as the win-modal grade plaque.
+            // `animT` is seconds since the stamp started; pass Infinity for
+            // "already settled, just keep drawing the idle state".
+            function drawCoin(cx, cy, r, letter, animT) {
+                const t = k.time();
+                const gradeCol = letter ? (gradeColors[letter] || "#ef4444") : null;
+                if (animT == null) animT = Infinity;
+
+                // Stamp phases — write (letter pops in) → circle (marker
+                // strokes around) → idle (sparkles, shimmer).
+                const writeDur = 0.45, circleDur = 0.6;
+                const writeT  = Math.max(0, Math.min(1, animT / writeDur));
+                const circleT = Math.max(0, Math.min(1, (animT - writeDur) / circleDur));
+                const idleT   = Math.max(0, animT - writeDur - circleDur);
+
+                const easeOutBack = (x) => {
+                    if (x <= 0) return 0;
+                    if (x >= 1) return 1;
+                    const c1 = 1.70158, c3 = c1 + 1;
+                    return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+                };
+
+                // S grade — soft gold halo behind the coin (kept subtle so it
+                // doesn't wash out the bottom row).
+                if (letter === "S" && idleT > 0) {
+                    const haloR = r * 1.50 + Math.sin(t * 2) * 1.5;
+                    k.drawCircle({
+                        pos: k.vec2(cx, cy), radius: haloR,
+                        color: col("#ffe17a"),
+                        opacity: 0.12 + 0.06 * Math.sin(t * 3),
+                    });
+                }
+
+                // Coin body + outline (always shown — the disc IS the badge,
+                // even before the letter stamps in).
+                k.drawCircle({ pos: k.vec2(cx, cy + 1.5), radius: r, color: col("#1a0e05"), opacity: 0.35 });
+                k.drawCircle({ pos: k.vec2(cx, cy), radius: r, color: col(letter ? "#a35e22" : "#7a4416") });
+                k.drawCircle({
+                    pos: k.vec2(cx, cy - 1), radius: r - 1.5,
+                    fill: false, outline: { width: 1, color: col(letter ? "#e89c4a" : "#9c6230") },
+                    opacity: 0.5,
+                });
+                k.drawCircle({
+                    pos: k.vec2(cx, cy), radius: r,
+                    fill: false, outline: { width: 1.5, color: col("#3a2110") },
+                    opacity: 0.7,
+                });
+
+                if (letter && animT > 0) {
+                    // Letter — pops in with overshoot during the write phase,
+                    // then settles with a tiny breathe.
+                    const letterScale = writeT < 1 ? Math.max(0, easeOutBack(writeT)) : 1 + Math.sin(idleT * 2.4) * 0.025;
+                    const sz = r * 1.05;
+                    let drawColor = gradeCol;
+                    if (letter === "S" && idleT > 0) {
+                        // Shimmer between deep gold and bright highlight
+                        const v = (Math.sin(t * 1.6) + 1) / 2;
+                        const lerp = (a, b) => Math.round(a + (b - a) * v);
+                        const rr = lerp(0xfb, 0xff), gg = lerp(0xbf, 0xe4), bb = lerp(0x24, 0x5a);
+                        drawColor = "#" + [rr, gg, bb].map(c => c.toString(16).padStart(2, "0")).join("");
+                    }
+
+                    // PressStart2P glyphs are left-aligned in their cell with
+                    // a baseline that's not at the cell's vertical center, so
+                    // anchor:"center" centers the cell instead of the visible
+                    // letter. Nudge into optical center.
+                    const lxOff = sz * 0.06;
+                    const lyOff = sz * 0.06;
+                    k.pushTransform();
+                    k.pushTranslate(cx + lxOff, cy + lyOff);
+                    k.pushScale(letterScale, letterScale);
+                    k.drawText({ text: letter, pos: k.vec2(1.4, 1.6), size: sz, font: "PressStart2P", color: col("#1a0e05"), opacity: 0.45, anchor: "center" });
+                    k.drawText({ text: letter, pos: k.vec2(0, 0),     size: sz, font: "PressStart2P", color: col(drawColor), anchor: "center" });
+                    k.popTransform();
+
+                    // Marker circle — strokes around the coin clockwise during
+                    // the circle phase, full ring once it finishes.
+                    if (circleT > 0) {
+                        const markerR = r + 4;
+                        const segs = 40;
+                        const maxA = -Math.PI / 2 + circleT * Math.PI * 2;
+                        for (let si = 0; si < segs; si++) {
+                            const a0 = -Math.PI / 2 + (si / segs) * Math.PI * 2;
+                            if (a0 >= maxA) break;
+                            const a1 = Math.min(-Math.PI / 2 + ((si + 1) / segs) * Math.PI * 2, maxA);
+                            k.drawLine({
+                                p1: k.vec2(cx + Math.cos(a0) * markerR, cy + Math.sin(a0) * markerR),
+                                p2: k.vec2(cx + Math.cos(a1) * markerR, cy + Math.sin(a1) * markerR),
+                                width: 2.2, color: col(gradeCol),
+                            });
+                        }
+                    }
+
+                    // S grade — orbiting sparkles (bigger, brighter — user
+                    // wanted them more prominent).
+                    if (letter === "S" && idleT > 0) {
+                        for (let i = 0; i < 4; i++) {
+                            const angle = idleT * 0.8 + i * (Math.PI / 2);
+                            const dist = r * 1.32 + Math.sin(idleT * 1.8 + i) * 2;
+                            const sx = cx + Math.cos(angle) * dist;
+                            const sy = cy + Math.sin(angle) * dist;
+                            const spk = 4.2 + Math.sin(idleT * 3 + i * 0.7) * 1.6;
+                            k.drawCircle({ pos: k.vec2(sx, sy), radius: spk, color: col("#ffe17a"), opacity: 0.95 });
+                            k.drawLine({ p1: k.vec2(sx - spk - 4, sy), p2: k.vec2(sx + spk + 4, sy), width: 1.6, color: col("#fff7c4"), opacity: 0.95 });
+                            k.drawLine({ p1: k.vec2(sx, sy - spk - 4), p2: k.vec2(sx, sy + spk + 4), width: 1.6, color: col("#fff7c4"), opacity: 0.95 });
+                        }
+                    }
+                }
             }
 
             function drawGimmickIcon(gimmick, cx, cy, sz, op) {
@@ -814,131 +971,490 @@ export function menuScene(k, params = {}) {
                 }
             }
 
-            for (let i = 0; i < LEVELS.length; i++) {
-                // Skip the ripping note
-                if (noteRip && noteRip.idx === i) continue;
-
-                const { cx, cy, tilt } = noteLayout(i);
+            const totalToShow = Math.min(SHOWN_LEVELS, LEVELS.length);
+            const mp = k.mousePos();
+            const tNow = k.time();
+            // easeOutBack — card pops in with a tiny overshoot
+            const easeOutBack = (x) => {
+                if (x <= 0) return 0;
+                if (x >= 1) return 1;
+                const c1 = 1.70158, c3 = c1 + 1;
+                return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+            };
+            for (let i = 0; i < totalToShow; i++) {
+                const { cx, cy } = noteLayout(i);
                 const unlocked = isUnlocked(i);
                 const grade = getGrade(i);
                 const lvl = LEVELS[i];
-                const noteCol = NOTE_COLS[i % NOTE_COLS.length];
+
+                // Cascade-in animation — staggered by index, eases out with a
+                // small overshoot. After settling, an idle bob keeps the cards
+                // breathing slightly.
+                const cascadeDur = 0.45;
+                const stagger = 0.07;
+                // While the screen pans up (lsWasIn=false), keep cards fully
+                // invisible. Once revealed, run the staggered cascade. After
+                // the cascade plays out, introT just sits at 1.
+                const localT = !lsWasIn ? -1 : (tNow - lsAnimStart - i * stagger) / cascadeDur;
+                const introT = Math.max(0, Math.min(1, localT));
+                const introScale = easeOutBack(introT);
+                const introOp = Math.min(1, Math.max(0, localT));
+                const introDrop = (1 - introT) * 24;       // px, comes in from above
+
+                const hovered = unlocked && introT >= 1
+                    && Math.abs(mp.x - cx) < noteW / 2
+                    && Math.abs(mp.y - cy) < noteH / 2;
+
+                // Idle bob — every card breathes lightly out of phase
+                const idle = introT >= 1
+                    ? Math.sin(tNow * 1.4 + i * 0.7) * 0.7
+                    : 0;
+                const lift = (hovered ? 4 : 0) + idle;
+                const hoverScale = hovered ? 1.04 : 1;
+                const scale = introScale * hoverScale;
+
+                k.pushTransform();
+                k.pushTranslate(cx, cy - lift - introDrop);
+                k.pushScale(scale, scale);
+
+                // Drop shadow
+                k.drawRect({
+                    width: noteW + 4, height: noteH + 4,
+                    pos: k.vec2(3, 5),
+                    color: col("#1a0e05"),
+                    anchor: "center", opacity: 0.30 * introOp, radius: 4,
+                });
 
                 if (unlocked) {
-                    // Shadow (pixelated — no rounding)
-                    k.drawRect({ width: noteW, height: noteH, pos: k.vec2(cx + 3, cy + 3), color: col("#1a0e05"), anchor: "center", opacity: 0.18 });
-                    // Sticky note body
-                    k.drawRect({ width: noteW, height: noteH, pos: k.vec2(cx, cy), color: col(noteCol), anchor: "center" });
-                    // Dark border (pixel art style)
-                    k.drawRect({ width: noteW, height: noteH, pos: k.vec2(cx, cy), fill: false, outline: { width: 2, color: col("#2a1505") }, anchor: "center", opacity: 0.25 });
-                    // Fold line at bottom
-                    k.drawLine({ p1: k.vec2(cx - noteW/2 + 2, cy + noteH/2 - 4), p2: k.vec2(cx + noteW/2 - 2, cy + noteH/2 - 4), width: 1, color: col("#000000"), opacity: 0.08 });
-
-                    // Level number — top left, pixel font
-                    k.drawText({ text: (i + 1) + "", pos: k.vec2(cx - noteW/2 + 8, cy - noteH/2 + 8), size: Math.min(14, noteW * 0.08), font: "PressStart2P", color: col("#2a1505"), anchor: "topleft", opacity: 0.5 });
-
-                    // Gimmick icon — center area
-                    const iconSz = Math.min(noteW, noteH) * 0.2;
-                    drawGimmickIcon(lvl.gimmick, cx, cy - noteH * 0.08, iconSz, 0.4);
-
-                    // Level name — hand-drawn readable font
-                    k.drawText({ text: lvl.name, pos: k.vec2(cx, cy + noteH * 0.22), size: Math.min(22, noteW * 0.11), font: "PatrickHand", color: col("#2a1505"), anchor: "center", width: noteW - 12 });
-
-                    // Concept tag
-                    k.drawText({ text: lvl.concept, pos: k.vec2(cx, cy + noteH * 0.38), size: Math.min(16, noteW * 0.08), font: "PatrickHand", color: col("#5a4020"), anchor: "center", opacity: 0.5 });
-
-                    // Grade stamp — big pixel art badge, top right
-                    if (grade) {
-                        const gx = cx + noteW/2 - 14;
-                        const gy = cy - noteH/2 + 14;
-                        // Square badge (pixel art)
-                        k.drawRect({ width: 22, height: 22, pos: k.vec2(gx, gy), color: col(gradeColors[grade] || "#888888"), anchor: "center" });
-                        k.drawRect({ width: 22, height: 22, pos: k.vec2(gx, gy), fill: false, outline: { width: 2, color: col("#2a1505") }, anchor: "center", opacity: 0.4 });
-                        k.drawText({ text: grade, pos: k.vec2(gx, gy), size: 12, font: "PressStart2P", color: col("#ffffff"), anchor: "center" });
+                    // Wooden border — slightly larger plate behind the body
+                    k.drawRect({
+                        width: noteW + 4, height: noteH + 4,
+                        pos: k.vec2(0, 0),
+                        color: col("#5a3210"),
+                        anchor: "center", opacity: introOp, radius: 5,
+                    });
+                    // Main wooden body
+                    k.drawRect({
+                        width: noteW, height: noteH,
+                        pos: k.vec2(0, 0),
+                        color: col(hovered ? "#e08e4d" : "#d37e3d"),
+                        anchor: "center", opacity: introOp, radius: 4,
+                    });
+                    // Top highlight stripe
+                    k.drawRect({
+                        width: noteW - 8, height: 4,
+                        pos: k.vec2(0, -noteH/2 + 5),
+                        color: col("#e0b860"),
+                        anchor: "center", opacity: 0.45 * introOp, radius: 2,
+                    });
+                    // Wood grain — a few horizontal hairlines
+                    for (let g = 0; g < 3; g++) {
+                        const gy = -noteH/2 + noteH * (0.28 + g * 0.22);
+                        k.drawLine({
+                            p1: k.vec2(-noteW/2 + 8, gy),
+                            p2: k.vec2( noteW/2 - 8, gy),
+                            width: 1, color: col("#7a4416"), opacity: 0.16 * introOp,
+                        });
                     }
 
-                    // Pushpin — square pixel tack
-                    k.drawRect({ width: 8, height: 8, pos: k.vec2(cx, cy - noteH/2 - 2), color: col("#d04040"), anchor: "center" });
-                    k.drawRect({ width: 4, height: 4, pos: k.vec2(cx - 1, cy - noteH/2 - 3), color: col("#ff8080"), anchor: "center", opacity: 0.6 });
+                    // Random scars + nail holes — seeded per level index so
+                    // each card has consistent, unique roughness across
+                    // sessions. Same approach as the win/fail modal planks.
+                    {
+                        let s = ((i + 1) * 0x9E3779B1) >>> 0 || 1;
+                        const rand = () => {
+                            s = (s * 1664525 + 1013904223) >>> 0;
+                            return s / 0xFFFFFFFF;
+                        };
+                        // Knot — about half the cards get one
+                        if (rand() > 0.4) {
+                            const kx = -noteW * 0.5 + noteW * (0.15 + rand() * 0.7);
+                            const ky = -noteH * 0.5 + noteH * (0.15 + rand() * 0.7);
+                            // Skip if it would land on the centered coin
+                            if (Math.hypot(kx, ky + noteH * 0.10) > noteW * 0.22) {
+                                k.drawCircle({ pos: k.vec2(kx, ky), radius: 5, color: col("#7d4519"), opacity: 0.5 * introOp });
+                                k.drawCircle({ pos: k.vec2(kx, ky), radius: 3, color: col("#5e351a"), opacity: 0.55 * introOp });
+                                k.drawCircle({ pos: k.vec2(kx, ky), radius: 5, fill: false, outline: { width: 0.8, color: col("#3a2110") }, opacity: 0.45 * introOp });
+                            }
+                        }
+                        // Scars — 2 to 4 per card, varying length and tilt
+                        const scarCount = 2 + Math.floor(rand() * 3);
+                        for (let sc = 0; sc < scarCount; sc++) {
+                            const sx = -noteW/2 + noteW * (0.05 + rand() * 0.85);
+                            const sy = -noteH/2 + noteH * (0.12 + rand() * 0.78);
+                            // Avoid the coin region (within ~0.22 of center horizontally
+                            // and the upper half of the card vertically)
+                            if (Math.abs(sx) < noteW * 0.20 && Math.abs(sy + noteH * 0.10) < noteH * 0.22) continue;
+                            const slen = 14 + rand() * 32;
+                            const tilt = (rand() - 0.5) * 1.5;
+                            k.drawLine({
+                                p1: k.vec2(sx, sy),
+                                p2: k.vec2(sx + slen, sy + tilt),
+                                width: 1.1, color: col("#3a2110"), opacity: (0.55 + rand() * 0.2) * introOp,
+                            });
+                            k.drawLine({
+                                p1: k.vec2(sx, sy + 1.2),
+                                p2: k.vec2(sx + slen * (0.4 + rand() * 0.5), sy + 1.2 + tilt * 0.7),
+                                width: 0.6, color: col("#5e351a"), opacity: 0.4 * introOp,
+                            });
+                        }
+                        // Nail holes — 1 to 3 small dark dots
+                        const nailCount = 1 + Math.floor(rand() * 3);
+                        for (let n = 0; n < nailCount; n++) {
+                            const nx = -noteW/2 + noteW * (0.05 + rand() * 0.9);
+                            const ny = -noteH/2 + noteH * (0.12 + rand() * 0.78);
+                            if (Math.abs(nx) < noteW * 0.20 && Math.abs(ny + noteH * 0.10) < noteH * 0.22) continue;
+                            const nr = 1.4 + rand() * 0.9;
+                            k.drawCircle({ pos: k.vec2(nx, ny), radius: nr + 0.5, color: col("#7d4519"), opacity: 0.5 * introOp });
+                            k.drawCircle({ pos: k.vec2(nx, ny), radius: nr,       color: col("#1a0e05"), opacity: 0.75 * introOp });
+                            k.drawCircle({ pos: k.vec2(nx - nr * 0.4, ny - nr * 0.4), radius: 0.5, color: col("#e0b860"), opacity: 0.4 * introOp });
+                        }
+                    }
+
+                    // Inner outline
+                    k.drawRect({
+                        width: noteW, height: noteH,
+                        pos: k.vec2(0, 0),
+                        fill: false, outline: { width: 1.5, color: col("#3a1f08") },
+                        anchor: "center", opacity: 0.55 * introOp, radius: 4,
+                    });
+
+                    // Level number — top-left, larger stamped pixel font with
+                    // a tiny vertical bob so it feels alive.
+                    const numSz = Math.min(20, noteW * 0.14);
+                    const numBob = introT >= 1 ? Math.sin(tNow * 2.1 + i) * 0.8 : 0;
+                    k.drawText({
+                        text: (i + 1) + "",
+                        pos: k.vec2(-noteW/2 + 12, -noteH/2 + 12 + numBob + 2),
+                        size: numSz, font: "PressStart2P",
+                        color: col("#1a0e05"), opacity: 0.45 * introOp, anchor: "topleft",
+                    });
+                    k.drawText({
+                        text: (i + 1) + "",
+                        pos: k.vec2(-noteW/2 + 11, -noteH/2 + 11 + numBob),
+                        size: numSz, font: "PressStart2P",
+                        color: col("#fff1a0"), opacity: introOp, anchor: "topleft",
+                    });
+
+                    // Center wooden coin — pulses in size on hover. The grade
+                    // is "stamped" in after the card cascade settles, with a
+                    // small extra delay so the cards land before the marker
+                    // strokes around them.
+                    const coinBaseR = Math.min(noteW, noteH) * 0.21;
+                    const coinR = coinBaseR * (hovered ? 1.06 + 0.02 * Math.sin(tNow * 4) : 1);
+                    const stampDelay = cascadeDur + 0.15;
+                    const stampLocalT = !lsWasIn
+                        ? -1
+                        : (tNow - lsAnimStart - i * stagger - stampDelay);
+                    drawCoin(0, -noteH * 0.10, coinR, grade || null, stampLocalT);
+
+                    // Level name — bottom-center, hand-drawn font (no width
+                    // wrap so anchor:center actually centers the string).
+                    const nameSz = Math.min(20, noteW * 0.12);
+                    k.drawText({
+                        text: lvl.name,
+                        pos: k.vec2(1, noteH * 0.36 + 2),
+                        size: nameSz, font: "PatrickHand",
+                        color: col("#1a0e05"), opacity: 0.4 * introOp, anchor: "center",
+                    });
+                    k.drawText({
+                        text: lvl.name,
+                        pos: k.vec2(0, noteH * 0.36),
+                        size: nameSz, font: "PatrickHand",
+                        color: col("#fff1a0"), opacity: introOp, anchor: "center",
+                    });
                 } else {
-                    // LOCKED — gray sticky note
-                    k.drawRect({ width: noteW, height: noteH, pos: k.vec2(cx + 3, cy + 3), color: col("#1a0e05"), anchor: "center", opacity: 0.08 });
-                    k.drawRect({ width: noteW, height: noteH, pos: k.vec2(cx, cy), color: col("#c0b8a8"), anchor: "center" });
-                    k.drawRect({ width: noteW, height: noteH, pos: k.vec2(cx, cy), fill: false, outline: { width: 2, color: col("#8a8070") }, anchor: "center", opacity: 0.2 });
+                    // LOCKED — dimmer, weathered wood (still inside the
+                    // pushTransform, so all coords are relative to the card)
+                    k.drawRect({
+                        width: noteW + 4, height: noteH + 4,
+                        pos: k.vec2(0, 0),
+                        color: col("#3a2810"),
+                        anchor: "center", radius: 5, opacity: 0.85 * introOp,
+                    });
+                    k.drawRect({
+                        width: noteW, height: noteH,
+                        pos: k.vec2(0, 0),
+                        color: col("#7a5a3a"),
+                        anchor: "center", radius: 4, opacity: 0.75 * introOp,
+                    });
+                    k.drawRect({
+                        width: noteW, height: noteH,
+                        pos: k.vec2(0, 0),
+                        fill: false, outline: { width: 1.5, color: col("#3a2110") },
+                        anchor: "center", opacity: 0.5 * introOp, radius: 4,
+                    });
 
-                    // Pixel lock icon
-                    const lx = cx, ly = cy - 2;
-                    // Body (rectangle)
-                    k.drawRect({ width: 16, height: 12, pos: k.vec2(lx, ly + 6), color: col("#8a8070"), anchor: "center" });
-                    // Shackle (blocky U shape)
-                    k.drawRect({ width: 12, height: 3, pos: k.vec2(lx, ly - 5), color: col("#8a8070"), anchor: "center" });
-                    k.drawRect({ width: 3, height: 8, pos: k.vec2(lx - 5, ly - 1), color: col("#8a8070"), anchor: "center" });
-                    k.drawRect({ width: 3, height: 8, pos: k.vec2(lx + 5, ly - 1), color: col("#8a8070"), anchor: "center" });
-                    // Keyhole
-                    k.drawRect({ width: 4, height: 4, pos: k.vec2(lx, ly + 5), color: col("#6a6050"), anchor: "center" });
+                    // Pixel lock icon (centered)
+                    k.drawRect({ width: 18, height: 14, pos: k.vec2(0,  4), color: col("#3a2110"), anchor: "center", opacity: 0.7 * introOp });
+                    k.drawRect({ width: 14, height:  4, pos: k.vec2(0, -6), color: col("#3a2110"), anchor: "center", opacity: 0.7 * introOp });
+                    k.drawRect({ width:  4, height:  9, pos: k.vec2(-5, -2), color: col("#3a2110"), anchor: "center", opacity: 0.7 * introOp });
+                    k.drawRect({ width:  4, height:  9, pos: k.vec2( 5, -2), color: col("#3a2110"), anchor: "center", opacity: 0.7 * introOp });
+                    k.drawRect({ width:  4, height:  4, pos: k.vec2(0,  4), color: col("#5a3a1a"), anchor: "center", opacity: 0.8 * introOp });
 
-                    // Level number
-                    k.drawText({ text: (i + 1) + "", pos: k.vec2(cx, cy + noteH * 0.30), size: 8, font: "PressStart2P", color: col("#8a8070"), anchor: "center", opacity: 0.4 });
-
-                    // Gray pin
-                    k.drawRect({ width: 8, height: 8, pos: k.vec2(cx, cy - noteH/2 - 2), color: col("#a09888"), anchor: "center" });
+                    // Level number — top-left, larger
+                    k.drawText({
+                        text: (i + 1) + "",
+                        pos: k.vec2(-noteW/2 + 11, -noteH/2 + 11),
+                        size: Math.min(20, noteW * 0.14), font: "PressStart2P",
+                        color: col("#3a2110"), opacity: 0.5 * introOp, anchor: "topleft",
+                    });
                 }
+
+                k.popTransform();
             }
 
-            // ─── Note rip animation ─────────────────────
-            if (noteRip) {
-                noteRip.t += dt;
-                const nr = noteRip;
-                const noteCol = NOTE_COLS[nr.idx % NOTE_COLS.length];
+            // Footer buttons — HOME (left) and LEADERBOARD (right). Both stay
+            // pinned in place; the panel itself is what slides in.
+            const homeY = gridStartY + rows * (noteH + noteGap) + 36;
+            const homeBtnX = W / 2 - 100;
+            const lbBtnX   = W / 2 + 100;
+            // easeInOutCubic so the slide feels weighty
+            const easeInOutCubic = (x) => x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+            const slideE = easeInOutCubic(lbAnimT);
+            const mp2 = k.mousePos();
+            const homeHover = Math.abs(mp2.x - homeBtnX) < 70 && Math.abs(mp2.y - homeY) < 18;
+            const lbHover   = lbAnimT < 0.05
+                && Math.abs(mp2.x - lbBtnX) < 90 && Math.abs(mp2.y - homeY) < 18;
+            drawPlankButton(homeBtnX, homeY, 130, 30, "< HOME",      homeHover, 0);
+            drawPlankButton(lbBtnX,   homeY, 170, 30, "LEADERBOARD", lbHover,   1);
 
-                // Main note falling/rotating
-                const fallY = nr.vy * nr.t + 400 * nr.t * nr.t;
-                const rot = nr.rot + nr.rotSpd * nr.t;
-                const opacity = Math.max(0, 1 - nr.t * 1.5);
-                const ncx = nr.cx + nr.driftX * nr.t;
-                const ncy = nr.cy + fallY;
-
-                // Draw rotated sticky note
-                const hw = nr.w / 2, hh = nr.h / 2;
-                const cos = Math.cos(rot), sin = Math.sin(rot);
-                function rotPt(rx, ry) {
-                    return k.vec2(ncx + rx * cos - ry * sin, ncy + rx * sin + ry * cos);
-                }
-                const tl = rotPt(-hw, -hh), tr = rotPt(hw, -hh), br = rotPt(hw, hh), bl = rotPt(-hw, hh);
-                k.drawTriangle({ p1: tl, p2: tr, p3: br, color: col(noteCol), opacity });
-                k.drawTriangle({ p1: tl, p2: br, p3: bl, color: col(noteCol), opacity });
-
-                // Torn edge at top — jagged line
-                for (let j = 0; j < 6; j++) {
-                    const t1 = j / 6, t2 = (j + 1) / 6;
-                    const jag1 = (Math.sin(j * 13.7) * 0.5 + 0.5) * 4;
-                    const jag2 = (Math.sin((j+1) * 13.7) * 0.5 + 0.5) * 4;
-                    const p1 = rotPt(-hw + t1 * nr.w, -hh + jag1);
-                    const p2 = rotPt(-hw + t2 * nr.w, -hh + jag2);
-                    k.drawLine({ p1, p2, width: 1.5, color: col("#fff8ee"), opacity: opacity * 0.7 });
+            // ─── Leaderboard slide-in panel ───────────────────────
+            if (lbAnimT > 0.005) {
+                // Build the list of unlocked levels (locked ones are hidden).
+                const unlockedLevels = [];
+                const totalAvail = Math.min(8, LEVELS.length);
+                for (let i = 0; i < totalAvail; i++) {
+                    if (isUnlocked(i)) unlockedLevels.push(i);
                 }
 
-                // Tiny paper scraps
-                for (const p of nr.pieces) {
-                    p.x += p.vx * dt;
-                    p.y += p.vy * dt;
-                    p.vy += 200 * dt;
-                    p.life -= dt;
-                    if (p.life > 0) {
-                        k.drawRect({ width: p.sz, height: p.sz * 0.6, pos: k.vec2(p.x, p.y), color: col(noteCol), anchor: "center", opacity: Math.max(0, p.life * 2) });
+                // Panel sized large — covers most of the screen, slides in from
+                // the right. Width matches the grid area so it feels grounded.
+                const panelW = Math.min(W * 0.72, 880);
+                const panelH = Math.min(H * 0.78, 600);
+                const panelTargetX = W / 2 - panelW / 2;
+                const panelY       = H / 2 - panelH / 2;
+                const panelStartX  = W + 60;
+                const panelX = panelStartX + (panelTargetX - panelStartX) * slideE;
+
+                // Backdrop dim — fades up with the slide
+                k.drawRect({ width: W, height: H, pos: k.vec2(0, 0), color: col("#1a0e05"), opacity: 0.55 * lbAnimT, anchor: "topleft" });
+
+                // Wood backing
+                k.drawRect({ width: panelW + 10, height: panelH + 10, pos: k.vec2(panelX + 4, panelY + 6), color: col("#1a0e05"), opacity: 0.5, anchor: "topleft", radius: 6 });
+                k.drawRect({ width: panelW + 6,  height: panelH + 6,  pos: k.vec2(panelX - 3, panelY - 3), color: col("#5a3210"), anchor: "topleft", radius: 6 });
+                k.drawRect({ width: panelW,      height: panelH,      pos: k.vec2(panelX,     panelY),     color: col("#d37e3d"), anchor: "topleft", radius: 5 });
+                // Top highlight
+                k.drawRect({ width: panelW - 16, height: 4, pos: k.vec2(panelX + 8, panelY + 6), color: col("#e0b860"), opacity: 0.45, anchor: "topleft", radius: 2 });
+                // Wood grain hairlines
+                for (let g = 0; g < 10; g++) {
+                    const gy = panelY + 28 + g * (panelH - 56) / 10;
+                    k.drawLine({ p1: k.vec2(panelX + 14, gy), p2: k.vec2(panelX + panelW - 14, gy), width: 1, color: col("#7a4416"), opacity: 0.14 });
+                }
+                // Seeded scars/nail-holes for that worn-wood feel (matches cards)
+                {
+                    let s = 0xA17F00B5 >>> 0;
+                    const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xFFFFFFFF; };
+                    for (let n = 0; n < 6; n++) {
+                        const sx = panelX + 20 + rnd() * (panelW - 40);
+                        const sy = panelY + 16 + rnd() * (panelH - 32);
+                        const slen = 16 + rnd() * 36;
+                        const tilt = (rnd() - 0.5) * 1.3;
+                        k.drawLine({ p1: k.vec2(sx, sy), p2: k.vec2(sx + slen, sy + tilt), width: 1.1, color: col("#3a2110"), opacity: 0.55 });
+                    }
+                    for (let n = 0; n < 5; n++) {
+                        const nx = panelX + 30 + rnd() * (panelW - 60);
+                        const ny = panelY + 24 + rnd() * (panelH - 48);
+                        const nr = 1.6 + rnd() * 1.0;
+                        k.drawCircle({ pos: k.vec2(nx, ny), radius: nr + 0.5, color: col("#7d4519"), opacity: 0.5 });
+                        k.drawCircle({ pos: k.vec2(nx, ny), radius: nr, color: col("#1a0e05"), opacity: 0.7 });
+                    }
+                }
+                // Inner outline
+                k.drawRect({ width: panelW, height: panelH, pos: k.vec2(panelX, panelY), fill: false, outline: { width: 1.5, color: col("#3a1f08") }, opacity: 0.55, anchor: "topleft", radius: 5 });
+
+                const cxP = panelX + panelW / 2;
+
+                // Title
+                const titleSz2 = 28;
+                k.drawText({ text: "LEADERBOARDS", pos: k.vec2(cxP + 1.5, panelY + 22 + 1.5), size: titleSz2, font: "PressStart2P", color: col("#1a0e05"), opacity: 0.45, anchor: "top" });
+                k.drawText({ text: "LEADERBOARDS", pos: k.vec2(cxP,       panelY + 22),       size: titleSz2, font: "PressStart2P", color: col("#fff1a0"), anchor: "top" });
+
+                // Level tabs — only unlocked levels
+                const tabRowY = panelY + 76;
+                const tabSz = 36;
+                const tabGap = 8;
+                const tabRowW = unlockedLevels.length * tabSz + Math.max(0, unlockedLevels.length - 1) * tabGap;
+                const tabStartX = cxP - tabRowW / 2;
+                for (let k2 = 0; k2 < unlockedLevels.length; k2++) {
+                    const lvIdx = unlockedLevels[k2];
+                    const tx = tabStartX + k2 * (tabSz + tabGap) + tabSz / 2;
+                    const ty = tabRowY + tabSz / 2;
+                    const active = lvIdx === lbLevel;
+                    const tabHover = !active
+                        && lbAnimT > 0.95
+                        && Math.abs(mp2.x - tx) < tabSz / 2
+                        && Math.abs(mp2.y - ty) < tabSz / 2;
+                    const tabCol = active ? "#fff1a0" : tabHover ? "#e0b860" : "#a35e22";
+                    k.drawRect({ width: tabSz, height: tabSz, pos: k.vec2(tx, ty + 2), color: col("#1a0e05"), opacity: 0.4, anchor: "center", radius: 4 });
+                    k.drawRect({ width: tabSz, height: tabSz, pos: k.vec2(tx, ty), color: col(tabCol), anchor: "center", radius: 4 });
+                    k.drawRect({ width: tabSz, height: tabSz, pos: k.vec2(tx, ty), fill: false, outline: { width: 1.5, color: col("#3a1f08") }, anchor: "center", opacity: 0.6, radius: 4 });
+                    k.drawText({
+                        text: (lvIdx + 1) + "",
+                        pos: k.vec2(tx, ty),
+                        size: 16, font: "PressStart2P",
+                        color: col(active ? "#3a1f08" : "#fff1a0"),
+                        anchor: "center",
+                    });
+                }
+
+                // Selected level name
+                const lvl = LEVELS[lbLevel];
+                const subY = tabRowY + tabSz + 28;
+                if (lvl) {
+                    k.drawText({ text: lvl.name, pos: k.vec2(cxP, subY), size: 22, font: "PatrickHand", color: col("#fff1a0"), anchor: "top" });
+                }
+
+                // Body — table on the left, percentile callout on the right
+                const bodyY = subY + 40;
+                const tableX = panelX + 60;
+                const tableW = panelW * 0.62;
+                const sideX  = panelX + 60 + tableW + 20;
+                const sideW  = panelW - tableW - 80 - 60 + 20;
+
+                const completed = !!getGrade(lbLevel);
+                const ready = lbData != null && lbLoadingFor === lbLevel && !lbData.error;
+
+                if (lbData == null || lbLoadingFor !== lbLevel) {
+                    k.drawText({ text: "Loading…", pos: k.vec2(cxP, bodyY + 80), size: 20, font: "PatrickHand", color: col("#fff1a0"), opacity: 0.7, anchor: "center" });
+                } else if (lbData.error) {
+                    k.drawText({ text: "Couldn't load leaderboard.", pos: k.vec2(cxP, bodyY + 80), size: 18, font: "PatrickHand", color: col("#fff1a0"), opacity: 0.7, anchor: "center" });
+                } else {
+                    // Table headers
+                    k.drawText({ text: "RANK",   pos: k.vec2(tableX,           bodyY), size: 12, font: "PressStart2P", color: col("#fff1a0"), opacity: 0.7, anchor: "topleft" });
+                    k.drawText({ text: "NAME",   pos: k.vec2(tableX + 80,      bodyY), size: 12, font: "PressStart2P", color: col("#fff1a0"), opacity: 0.7, anchor: "topleft" });
+                    k.drawText({ text: "BUDGET", pos: k.vec2(tableX + tableW,  bodyY), size: 12, font: "PressStart2P", color: col("#fff1a0"), opacity: 0.7, anchor: "topright" });
+                    k.drawLine({ p1: k.vec2(tableX, bodyY + 22), p2: k.vec2(tableX + tableW, bodyY + 22), width: 1, color: col("#3a1f08"), opacity: 0.45 });
+
+                    // Top 10 entries (now with more vertical room)
+                    const rowH = 26;
+                    const showCount = Math.min(10, lbData.top ? lbData.top.length : 0);
+                    // The leaderboard module returns top 5 — re-derive top 10
+                    // by rebuilding from the synthetic+user pool. Module
+                    // already sorted; we just slice deeper.
+                    const allEntries = lbData._all || lbData.top.slice();
+                    const slice = allEntries.slice(0, 10).length ? allEntries.slice(0, 10) : lbData.top.slice(0, 5);
+                    const tNow2 = k.time();
+                    for (let r = 0; r < slice.length; r++) {
+                        const e = slice[r];
+                        const ry = bodyY + 32 + r * rowH;
+                        if (e.isYou) {
+                            k.drawRect({ width: tableW + 12, height: rowH - 2, pos: k.vec2(tableX - 6, ry - 4), color: col("#fbbf24"), opacity: 0.22, anchor: "topleft", radius: 3 });
+                        }
+
+                        // ── Top 3: medal badge + glow + shadow on the rank ──
+                        if (r < 3) {
+                            const medalCol  = r === 0 ? "#fbbf24" : r === 1 ? "#e4e4ef" : "#e89455";
+                            const medalRim  = r === 0 ? "#a36a08" : r === 1 ? "#7a7a85" : "#7a3a10";
+                            const haloCol   = r === 0 ? "#ffe17a" : r === 1 ? "#f4f4ff" : "#ffb878";
+                            // 1st pulses brightest, 2nd softer, 3rd subtler
+                            const pulseRate = r === 0 ? 2.4 : r === 1 ? 1.8 : 1.4;
+                            const pulse = (Math.sin(tNow2 * pulseRate + r) + 1) / 2;
+                            const haloOp = (r === 0 ? 0.45 : r === 1 ? 0.30 : 0.25) * (0.7 + 0.3 * pulse);
+                            const haloR  = (r === 0 ? 16 : r === 1 ? 14 : 13) + pulse * 1.5;
+
+                            // Center the medal where the "#N" text would sit
+                            // for the lower ranks so the column lines up.
+                            const medalCx = tableX + 7;
+                            const medalCy = ry + 9;
+
+                            // Glow halo behind the medal
+                            k.drawCircle({ pos: k.vec2(medalCx, medalCy), radius: haloR, color: col(haloCol), opacity: haloOp });
+                            // Medal disc — drop shadow + body + rim + inner highlight
+                            k.drawCircle({ pos: k.vec2(medalCx + 1, medalCy + 1.5), radius: 11, color: col("#1a0e05"), opacity: 0.4 });
+                            k.drawCircle({ pos: k.vec2(medalCx, medalCy), radius: 11, color: col(medalCol) });
+                            k.drawCircle({ pos: k.vec2(medalCx, medalCy), radius: 11, fill: false, outline: { width: 1.5, color: col(medalRim) }, opacity: 0.85 });
+                            // Tiny shimmer highlight on the disc
+                            k.drawCircle({ pos: k.vec2(medalCx - 3, medalCy - 3), radius: 2, color: col("#ffffff"), opacity: 0.5 + 0.3 * pulse });
+
+                            // Rank number — cream PatrickHand with a dark
+                            // shadow + thin outline. The outline keeps the
+                            // "2" readable against the light silver medal.
+                            const numStr = (r + 1) + "";
+                            // Drop shadow
+                            k.drawText({ text: numStr, pos: k.vec2(medalCx + 1, medalCy + 2), size: 20, font: "PatrickHand", color: col("#1a0e05"), opacity: 0.55, anchor: "center" });
+                            // Outline — 4 dark offsets
+                            for (const [ox, oy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+                                k.drawText({ text: numStr, pos: k.vec2(medalCx + ox, medalCy + 0.5 + oy), size: 20, font: "PatrickHand", color: col("#1a0e05"), opacity: 0.85, anchor: "center" });
+                            }
+                            // Cream fill on top
+                            k.drawText({ text: numStr, pos: k.vec2(medalCx, medalCy + 0.5), size: 20, font: "PatrickHand", color: col("#fff8d8"), anchor: "center" });
+
+                            // Sparkles only on #1 — orbits the medal in the
+                            // same vocabulary as the S grade on a card.
+                            if (r === 0) {
+                                for (let s = 0; s < 3; s++) {
+                                    const a = tNow2 * 1.4 + s * (Math.PI * 2 / 3);
+                                    const sx = medalCx + Math.cos(a) * 16;
+                                    const sy = medalCy + Math.sin(a) * 16;
+                                    const sz = 1.4 + Math.sin(tNow2 * 4 + s) * 0.5;
+                                    k.drawCircle({ pos: k.vec2(sx, sy), radius: sz, color: col("#fff7c4"), opacity: 0.85 });
+                                }
+                            }
+                        } else {
+                            k.drawText({ text: "#" + (r + 1), pos: k.vec2(tableX, ry), size: 16, font: "PatrickHand", color: col("#fff1a0"), anchor: "topleft" });
+                        }
+
+                        k.drawText({ text: e.playerName,       pos: k.vec2(tableX + 80,     ry), size: 16, font: "PatrickHand", color: col("#fff1a0"), anchor: "topleft" });
+                        k.drawText({ text: "$" + e.budgetUsed, pos: k.vec2(tableX + tableW, ry), size: 16, font: "PatrickHand", color: col("#fff1a0"), anchor: "topright" });
+                    }
+
+                    // Player below the table if outside the displayed slice
+                    if (lbData.userEntry && lbData.userRank && lbData.userRank > slice.length) {
+                        const pry = bodyY + 32 + slice.length * rowH + 12;
+                        k.drawLine({ p1: k.vec2(tableX, pry - 6), p2: k.vec2(tableX + tableW, pry - 6), width: 1, color: col("#3a1f08"), opacity: 0.4 });
+                        k.drawRect({ width: tableW + 12, height: rowH - 2, pos: k.vec2(tableX - 6, pry - 2), color: col("#fbbf24"), opacity: 0.22, anchor: "topleft", radius: 3 });
+                        k.drawText({ text: "#" + lbData.userRank,             pos: k.vec2(tableX,          pry + 2), size: 16, font: "PatrickHand", color: col("#fbbf24"), anchor: "topleft" });
+                        k.drawText({ text: lbData.userEntry.playerName,       pos: k.vec2(tableX + 80,     pry + 2), size: 16, font: "PatrickHand", color: col("#fff1a0"), anchor: "topleft" });
+                        k.drawText({ text: "$" + lbData.userEntry.budgetUsed, pos: k.vec2(tableX + tableW, pry + 2), size: 16, font: "PatrickHand", color: col("#fff1a0"), anchor: "topright" });
+                    }
+
+                    // ─── Right side panel — percentile / status callout ─
+                    const sideCx = sideX + sideW / 2;
+                    const sideTopY = bodyY;
+                    // Plate behind the stat
+                    k.drawRect({ width: sideW + 4, height: 220, pos: k.vec2(sideX - 2, sideTopY - 2), color: col("#5a3210"), anchor: "topleft", radius: 5 });
+                    k.drawRect({ width: sideW,     height: 216, pos: k.vec2(sideX,     sideTopY),     color: col("#a35e22"), anchor: "topleft", radius: 4 });
+                    k.drawRect({ width: sideW,     height: 216, pos: k.vec2(sideX,     sideTopY),     fill: false, outline: { width: 1.5, color: col("#3a1f08") }, opacity: 0.5, anchor: "topleft", radius: 4 });
+
+                    if (!completed || !lbData.userEntry) {
+                        // No personal best yet — completed flag tracks grade existence
+                        k.drawText({ text: "YOUR RANK", pos: k.vec2(sideCx, sideTopY + 22), size: 12, font: "PressStart2P", color: col("#fff1a0"), opacity: 0.75, anchor: "top" });
+                        k.drawText({ text: "—", pos: k.vec2(sideCx, sideTopY + 70), size: 56, font: "PressStart2P", color: col("#fff1a0"), opacity: 0.85, anchor: "top" });
+                        const note = completed
+                            ? "no run recorded"
+                            : "complete the level to enter the field";
+                        k.drawText({ text: note, pos: k.vec2(sideCx, sideTopY + 160), size: 14, font: "PatrickHand", color: col("#fff1a0"), opacity: 0.75, anchor: "top", width: sideW - 18 });
+                    } else {
+                        // Player has a run — big percentile + rank
+                        const pct = lbData.userPercentile;
+                        k.drawText({ text: "YOUR RANK", pos: k.vec2(sideCx, sideTopY + 18), size: 12, font: "PressStart2P", color: col("#fff1a0"), opacity: 0.8, anchor: "top" });
+                        k.drawText({ text: "#" + lbData.userRank, pos: k.vec2(sideCx, sideTopY + 42), size: 26, font: "PressStart2P", color: col("#fff1a0"), anchor: "top" });
+                        k.drawText({ text: "TOP", pos: k.vec2(sideCx, sideTopY + 92), size: 11, font: "PressStart2P", color: col("#fff1a0"), opacity: 0.75, anchor: "top" });
+                        k.drawText({ text: (100 - pct + 1) + "%", pos: k.vec2(sideCx + 1.5, sideTopY + 110 + 1.5), size: 44, font: "PressStart2P", color: col("#1a0e05"), opacity: 0.4, anchor: "top" });
+                        k.drawText({ text: (100 - pct + 1) + "%", pos: k.vec2(sideCx,       sideTopY + 110),       size: 44, font: "PressStart2P", color: col("#fbbf24"), anchor: "top" });
+                        k.drawText({ text: "of " + lbData.totalPlayers + " players", pos: k.vec2(sideCx, sideTopY + 168), size: 14, font: "PatrickHand", color: col("#fff1a0"), opacity: 0.75, anchor: "top" });
+                        k.drawText({ text: "$" + lbData.userEntry.budgetUsed + " budget", pos: k.vec2(sideCx, sideTopY + 188), size: 13, font: "PatrickHand", color: col("#fff1a0"), opacity: 0.7, anchor: "top" });
                     }
                 }
 
-                // Transition after animation
-                if (nr.t > 0.5) {
-                    noteRip = null;
-                    k.go("game", { levelIdx: nr.idx });
-                }
+                // Close button
+                const closeY = panelY + panelH - 30;
+                const closeHover = lbAnimT > 0.95
+                    && Math.abs(mp2.x - cxP) < 60
+                    && Math.abs(mp2.y - closeY) < 18;
+                drawPlankButton(cxP, closeY, 120, 30, "CLOSE", closeHover, 2);
             }
-
-            // HOME button — centered at bottom
-            const homeY = gridStartY + rows * (noteH + noteGap) + 36;
-            drawPlankButton(W / 2, homeY, 130, 30, "< HOME", false, 0);
         }
 
         // ── Settings content (below menu, scrolls into view going down) ──
@@ -1091,6 +1607,55 @@ export function menuScene(k, params = {}) {
 
         if (crackAnim) return;
 
+        // ─── Leaderboard panel clicks (highest priority when fully open) ───
+        if (lbOpen && lbAnimT > 0.95) {
+            // Mirror the draw geometry so hit-testing matches what's on-screen.
+            const panelW = Math.min(W * 0.72, 880);
+            const panelH = Math.min(H * 0.78, 600);
+            const panelX = W / 2 - panelW / 2;
+            const panelY = H / 2 - panelH / 2;
+            const cxP = panelX + panelW / 2;
+
+            // Close button
+            const closeY = panelY + panelH - 30;
+            if (Math.abs(pos.x - cxP) < 60 && Math.abs(pos.y - closeY) < 18) {
+                lbOpen = false;
+                return;
+            }
+
+            // Level tabs — only the unlocked ones are interactive
+            const unlockedLevels = [];
+            for (let i = 0; i < Math.min(8, LEVELS.length); i++) {
+                if (isUnlocked(i)) unlockedLevels.push(i);
+            }
+            const tabRowY = panelY + 76;
+            const tabSz = 36;
+            const tabGap = 8;
+            const tabRowW = unlockedLevels.length * tabSz + Math.max(0, unlockedLevels.length - 1) * tabGap;
+            const tabStartX = cxP - tabRowW / 2;
+            for (let k2 = 0; k2 < unlockedLevels.length; k2++) {
+                const lvIdx = unlockedLevels[k2];
+                const tx = tabStartX + k2 * (tabSz + tabGap) + tabSz / 2;
+                const ty = tabRowY + tabSz / 2;
+                if (Math.abs(pos.x - tx) < tabSz / 2 && Math.abs(pos.y - ty) < tabSz / 2) {
+                    if (lbLevel !== lvIdx) {
+                        lbLevel = lvIdx;
+                        loadLeaderboard(lvIdx);
+                    }
+                    return;
+                }
+            }
+
+            // Click outside the panel closes it
+            if (pos.x < panelX || pos.x > panelX + panelW || pos.y < panelY || pos.y > panelY + panelH) {
+                lbOpen = false;
+            }
+            return;
+        }
+        // While the slide animation is running, swallow clicks so the player
+        // can't accidentally trigger the underlying screen.
+        if (lbOpen || lbAnimT > 0.05) return;
+
         // ─── MENU VIEW clicks ───────────────────────
         if (currentView === "menu" && scrollTarget === 0) {
             if (Math.abs(pos.x - btnX) < btnW / 2 && Math.abs(pos.y - btnStartY) < btnH / 2) {
@@ -1105,8 +1670,6 @@ export function menuScene(k, params = {}) {
 
         // ─── LEVEL SELECT VIEW clicks ───────────────
         if (currentView === "levelSelect") {
-            if (noteRip) return; // rip animation playing
-
             const sy = scrollY;
             const lsY = -scrollDist + sy;
             const lsCw = W - FW * 2;
@@ -1116,55 +1679,48 @@ export function menuScene(k, params = {}) {
             const usableH = contentH - pad * 2 - topPad;
             const titleSz = Math.min(28, W * 0.028);
             const titleY = FW + pad + topPad + lsY;
-            const cols = 5;
-            const rows = 3;
-            const topArea = titleSz + 24;
-            const bottomArea = 50;
-            const noteGap = 10;
-            const noteW = Math.floor((usableW * 0.88 - (cols - 1) * noteGap) / cols);
-            const noteH = Math.floor(((usableH - topArea - bottomArea) * 0.88 - (rows - 1) * noteGap) / rows);
+            const SHOWN_LEVELS = 8;
+            const cols = 4;
+            const rows = 2;
+            const topArea = titleSz + 28;
+            const bottomArea = 60;
+            const noteGap = 18;
+            const noteW = Math.floor((usableW * 0.86 - (cols - 1) * noteGap) / cols);
+            const noteH = Math.floor(((usableH - topArea - bottomArea) * 0.92 - (rows - 1) * noteGap) / rows);
             const gridW = cols * noteW + (cols - 1) * noteGap;
             const gridStartX = W / 2 - gridW / 2;
             const gridStartY = titleY + topArea;
 
-            // HOME button (centered at bottom)
+            // HOME (left) + LEADERBOARD (right) buttons
             const homeY = gridStartY + rows * (noteH + noteGap) + 36;
-            const hbX = W / 2;
-            if (Math.abs(pos.x - hbX) < 80 && Math.abs(pos.y - homeY) < 20) {
+            const homeBtnX = W / 2 - 100;
+            const lbBtnX   = W / 2 + 100;
+            if (Math.abs(pos.x - homeBtnX) < 70 && Math.abs(pos.y - homeY) < 18) {
                 scrollTarget = 0;
                 lsSelectedIdx = -1;
                 return;
             }
+            if (Math.abs(pos.x - lbBtnX) < 90 && Math.abs(pos.y - homeY) < 18) {
+                // Open leaderboard modal — default to first unlocked level
+                lbOpen = true;
+                let firstUnlocked = 0;
+                for (let i = 0; i < Math.min(8, LEVELS.length); i++) {
+                    if (isUnlocked(i)) { firstUnlocked = i; break; }
+                }
+                lbLevel = firstUnlocked;
+                loadLeaderboard(firstUnlocked);
+                return;
+            }
 
-            // Sticky notes — click to rip and enter level
-            for (let i = 0; i < LEVELS.length; i++) {
+            // Wooden cards — click to enter level immediately
+            const totalToShow = Math.min(SHOWN_LEVELS, LEVELS.length);
+            for (let i = 0; i < totalToShow; i++) {
                 const r = Math.floor(i / cols);
                 const c2 = i % cols;
                 const cx = gridStartX + c2 * (noteW + noteGap) + noteW / 2;
                 const cy = gridStartY + r * (noteH + noteGap) + noteH / 2;
                 if (Math.abs(pos.x - cx) < noteW / 2 && Math.abs(pos.y - cy) < noteH / 2) {
-                    if (isUnlocked(i)) {
-                        // Start rip animation
-                        const pieces = [];
-                        for (let p = 0; p < 8; p++) {
-                            pieces.push({
-                                x: cx + (Math.random() - 0.5) * noteW * 0.6,
-                                y: cy - noteH / 2 + Math.random() * 6,
-                                vx: (Math.random() - 0.5) * 120,
-                                vy: -40 - Math.random() * 80,
-                                sz: 3 + Math.random() * 5,
-                                life: 0.3 + Math.random() * 0.3,
-                            });
-                        }
-                        noteRip = {
-                            idx: i, cx, cy, w: noteW, h: noteH, t: 0,
-                            vy: 30 + Math.random() * 20,
-                            driftX: (Math.random() - 0.5) * 60,
-                            rot: 0,
-                            rotSpd: (Math.random() - 0.5) * 4,
-                            pieces,
-                        };
-                    }
+                    if (isUnlocked(i)) k.go("game", { levelIdx: i });
                     return;
                 }
             }

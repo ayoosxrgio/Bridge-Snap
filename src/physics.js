@@ -330,15 +330,27 @@ export function physicsTick(state) {
             }
         }
 
-        // 1. Fatigue stress — unsupported roads under vehicle load
+        // 1. Fatigue stress — unsupported roads under vehicle load.
+        //
+        // Accumulates per frame while the vehicle's load is on this member.
+        // To stay invariant under road segmentation (one long segment vs. a
+        // chain of short ones spanning the same distance), scale the rate by
+        // mat.maxLength / m.rest. A short segment sees the vehicle for fewer
+        // frames, so it has to fatigue faster per frame for the total over
+        // a single crossing to come out the same. Without this scaling, the
+        // player could split a road into many tiny pieces and trivially
+        // bypass fatigue (each member's per-frame increment was equal but
+        // each spent less time under the load).
         if (mat.isRoad && !m._driveable) {
             const vForce = Math.max(m.n1._extFY || 0, m.n2._extFY || 0);
             if (vForce > 0) {
-                // Heavier vehicles → faster fatigue.  Scale so:
+                // Heavier vehicles → faster fatigue.  Scale so a full-length
+                // (mat.maxLength) segment matches the original rates:
                 //   bicycle (force ~4): +0.003/frame → ~5.5s to break
                 //   car     (force ~20): +0.015/frame → ~1.1s to break
                 //   bus     (force ~120): +0.09/frame → ~0.2s to break
-                m._fatigue = (m._fatigue || 0) + vForce * 0.00075;
+                const lengthScale = m.rest > 0 ? mat.maxLength / m.rest : 1;
+                m._fatigue = (m._fatigue || 0) + vForce * 0.00075 * lengthScale;
             }
         }
 
@@ -508,6 +520,14 @@ export function vehicleTick(state, lvl, lvlDef) {
                 roadY = lvl.rY - APPROACH_SURFACE_OFFSET + t * t * 14;
                 roadAngle = -t * 0.55;
             }
+
+            // Free-standing mid-land platform (level 6). Acts like a cliff —
+            // top surface is drivable when no plank carries this x.
+            const ml = state._midLand;
+            if (roadY === null && ml && v.x >= ml.x1 && v.x <= ml.x2) {
+                roadY = ml.y - APPROACH_SURFACE_OFFSET;
+                roadAngle = 0;
+            }
         }
 
         const carBottom = v.y + v.cfg.h * 0.5;
@@ -517,7 +537,22 @@ export function vehicleTick(state, lvl, lvlDef) {
         if (onSurface) {
             v._falling = false;
             v._wasOnSurface = true;
-            const spd = v.cfg.speed * 1.2;
+            v._onBridge = !!bestMember;
+            let spd = v.cfg.speed * 1.2;
+            // Convoy following — match the leader's pace when within reach,
+            // and stop short if too close so a faster follower never overruns
+            // a slower leader. Only active before the leader has finished.
+            if (v._followBehind != null) {
+                const leader = state.vehicles[v._followBehind];
+                if (leader && leader.active && !leader._falling && !leader.finished) {
+                    const ds = dir;
+                    const gap = (leader.x - v.x) * ds - (leader.cfg.w * 0.5 + v.cfg.w * 0.5);
+                    const minGap = v._followGap ?? 30;
+                    const leaderSpd = leader.cfg.speed * 1.2;
+                    if (gap < minGap)            spd = 0;
+                    else if (gap < minGap + 25)  spd = Math.min(spd, leaderSpd);
+                }
+            }
             v.x += dir * spd * Math.cos(roadAngle);
             const targetY = roadY - v.cfg.h * 0.5;
             v.y = v.y * 0.5 + targetY * 0.5;
@@ -610,6 +645,12 @@ export function vehicleTick(state, lvl, lvlDef) {
         if (multi && typeof lvl._finishRightX === "number") {
             finishRX = lvl._finishRightX;
             finishLX = lvl._finishLeftX;
+        }
+        // Per-vehicle override: each multi-vehicle has its own flag slot, so
+        // it stops at its own flag instead of every car piling up at slot 0.
+        if (typeof v._finishX === "number") {
+            if (goalSide === "R") finishRX = v._finishX;
+            else                  finishLX = v._finishX;
         }
         // Mark _passedFlag the first time the vehicle clears the flag x. Used
         // both as the release trigger for waiting sequel vehicles and as the

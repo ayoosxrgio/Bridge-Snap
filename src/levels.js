@@ -103,37 +103,62 @@ export const LEVELS = [
     // ═══ CHAPTER 2: INTRODUCING STEEL ═══════════════
     {
         id:       "steelintro",
-        name:     "IRON WILL",
-        concept:  "STEEL",
-        gimmick:  "steel",
-        difficulty: 2,
-        vType:    "sports_car",
-        gap:      360,
+        name:     "TRUSSED UP",
+        concept:  "TRUSS",
+        gimmick:  "heavy",
+        difficulty: 3,
+        vType:    "bus",
+        gap:      720,
         hDiff:    0,
-        budget:   12000,
-        terrain:  "canyon",
-        extraAnchors: [],
+        budget:   24000,
+        terrain:  "cliff",
+        // A second anchor one grid BELOW each cliff edge gives the player
+        // a place to plant the lower chord of a truss — triangulating
+        // above and below the road is what makes long thin spans hold
+        // a heavy bus.
+        extraAnchors: [
+            { side: "L", dx: 0, dy: 60 },
+            { side: "R", dx: 0, dy: 60 },
+        ],
+        vStartXOffset: -120,
         multiVehicle: null,
-        materials: ["wood_road", "wood_beam", "steel", "rope"],
-        hint:     "You now have STEEL beams. They're expensive but far stronger. Try using steel only where stress is highest — the center and bottom of your truss.",
-        lesson:   "Steel is 4× stronger than wood but costs more. Smart engineers use the strongest material only where STRESS peaks, not everywhere. This is called MATERIAL OPTIMIZATION.",
+        materials: ["wood_road", "wood_beam", "rope"],
+        hint:     "Wide flat gap, heavy bus. Each cliff has a SECOND anchor one grid below the road — those are for the LOWER chord of a truss. Triangulate above and below the road and a thin span carries way more weight than a plain plank.",
+        lesson:   "A TRUSS bridge breaks load across many short members arranged in triangles. The DEEPER the truss (the gap between its upper and lower chord), the stronger it is — that's why railway bridges have those tall iron lattices.",
     },
     {
         id:       "steepfall",
-        name:     "STEEP FALL",
-        concept:  "THRUST + STEEL",
+        name:     "UP AND OVER",
+        concept:  "STEPPED CLIMB",
         gimmick:  "slope",
         difficulty: 3,
-        vType:    "jeep",
-        gap:      432,
-        hDiff:    180,
-        budget:   15000,
+        vType:    "flatbed",
+        gap:      612,
+        hDiff:    -252,                  // right cliff sits 252 ABOVE left — steep staircase
+        budget:   22000,
         terrain:  "cliff",
-        extraAnchors: [],
-        multiVehicle: null,
-        materials: ["wood_road", "wood_beam", "steel", "rope"],
-        hint:     "This steep slope creates massive thrust. Steel at the key stress points will prevent buckling where wood would snap.",
-        lesson:   "Steep slopes multiply THRUST forces. When wood isn't strong enough, steel reinforcement at critical joints prevents BUCKLING — when a beam crumples under compression.",
+        // Free-standing land platform between two gaps: 192 wide, sitting
+        // 108 above the left cliff. Bridge across to it, drive across,
+        // then bridge over the second gap (with a low rock pier) up to
+        // the much higher right cliff.
+        midLand: { dx: 0, halfW: 96, dy: -108 },
+        extraAnchors: [
+            { side: "MID", dx: 204, dy: -120 },    // rock pier in the second gap — only slightly above the platform
+        ],
+        // Heavy flatbed leads, light motorbike trails behind. Both head
+        // right; spaced starts so they don't pile up at the finish flags.
+        // Convoy: flatbed leads, bicycle stays behind it (followBehind throttles
+        // the faster bike to the truck's pace). Bicycle takes the inner flag
+        // (slot 0) so the leading flatbed can drive past it to the outer flag.
+        multiVehicle: [
+            { vType: "bicycle", label: "B", flag: "blue", color: "#7a5cb8",
+              startXOffset: -210, followBehind: 1, followGap: 8 },
+            { vType: "flatbed", label: "A", flag: "red",  color: "#8a4a2a",
+              startXOffset: -90 },
+        ],
+        materials: ["wood_road", "wood_beam", "rope"],
+        hint:     "Two gaps! Bridge to the left edge of the mid land, drive across, then bridge over the second gap (with a rock pier) up to the higher right cliff. Flatbed is heavy, motorbike is light.",
+        lesson:   "Real terrain steps up in stages. Bridges often climb onto a midpoint platform and continue from there, breaking one steep ramp into shorter sections that each carry less load.",
     },
 
     // ═══ CHAPTER 3: CABLES & ROPE ═══════════════════
@@ -173,7 +198,7 @@ export const LEVELS = [
             { side: "R", dx: 0, dy: -108 },
         ],
         multiVehicle: null,
-        materials: ["wood_road", "wood_beam", "steel", "rope", "cable"],
+        materials: ["wood_road", "wood_beam", "rope"],
         hint:     "Combine steel cables from above with a stiff truss deck below. Cables take tension, the truss resists bending — together they span farther.",
         lesson:   "A true SUSPENSION bridge combines cables (tension), a stiff deck (bending resistance), and anchorages. This system lets bridges span enormous distances!",
     },
@@ -197,7 +222,7 @@ export const LEVELS = [
             { side: "R", dx: 0, dy: 216 },
         ],
         multiVehicle: null,
-        materials: ["wood_road", "reinforced_road", "wood_beam", "steel", "rope"],
+        materials: ["wood_road", "wood_beam", "rope"],
         hint:     "Use the wall anchors BELOW to build vertical piers up to road level. A delivery van is crossing — use reinforced road for the heaviest spans!",
         lesson:   "PIERS are vertical supports built from below. They break a long span into shorter sections, each easier to bridge. This is how most real highway bridges work!",
     },
@@ -214,7 +239,7 @@ export const LEVELS = [
         terrain:  "canyon",
         extraAnchors: [],
         multiVehicle: null,
-        materials: ["wood_road", "reinforced_road", "wood_beam", "steel", "rope", "cable"],
+        materials: ["wood_road", "wood_beam", "rope"],
         hint:     "No piers this time — span the full gap for a heavy camper van. Reinforced road + steel beams at critical spots.",
         lesson:   "When you can't build piers, the structure itself must be stronger. REINFORCEMENT means adding material where forces concentrate — usually at the center and supports.",
     },
@@ -253,7 +278,7 @@ export const LEVELS = [
             { side: "R", dx: 0, dy: 144 },
         ],
         multiVehicle: null,
-        materials: ["wood_road", "reinforced_road", "stone_road", "wood_beam", "steel", "rope", "cable"],
+        materials: ["wood_road", "wood_beam", "rope"],
         hint:     "Steep slope + deep gorge + heavy bus. Use stone road for the bus, wall anchors for piers, and steel where stress is worst.",
         lesson:   "Real bridges often face MULTIPLE challenges at once: slopes, heavy loads, deep valleys. The best engineers combine piers, trusses, cables, and material choices.",
     },
@@ -275,7 +300,7 @@ export const LEVELS = [
             { vType: "jeep",       startXOffset: -72,  label: "A", color: "#e890a0" },
             { vType: "sports_car", startXOffset: -144, label: "B", color: "#d4b020" },
         ],
-        materials: ["wood_road", "reinforced_road", "wood_beam", "steel", "rope", "cable"],
+        materials: ["wood_road", "wood_beam", "rope"],
         hint:     "Two vehicles cross at the same time! Your bridge must hold both simultaneously.",
         lesson:   "Real bridges carry MANY vehicles at once. When multiple loads are present, forces ADD UP. Your structure needs enough redundancy that no single member is a weak link.",
     },
@@ -296,7 +321,7 @@ export const LEVELS = [
             { side: "MID", dx:  108, dy: 216 },
         ],
         multiVehicle: null,
-        materials: ["wood_road", "reinforced_road", "stone_road", "wood_beam", "steel", "rope", "cable"],
+        materials: ["wood_road", "wood_beam", "rope"],
         hint:     "A flatbed truck — the heaviest vehicle. Build piers from the valley floor and use stone road with a full steel truss.",
         lesson:   "Heavy transport bridges are over-engineered on purpose — trucks are heavy and can't steer around problems. REDUNDANCY (extra strength beyond the minimum) saves lives.",
     },
@@ -322,7 +347,7 @@ export const LEVELS = [
             { vType: "camper",    startXOffset: -180, label: "B", color: "#5a9a5a" },
             { vType: "sports_car", startXOffset: -288, label: "C", color: "#d4b020" },
         ],
-        materials: ["wood_road", "reinforced_road", "stone_road", "wood_beam", "steel", "rope", "cable"],
+        materials: ["wood_road", "wood_beam", "rope"],
         hint:     "Sloped gorge, three vehicles, anchors above and below. Combine piers, suspension cables, steel reinforcement, and the right road type for each section.",
         lesson:   "You've mastered bridge engineering! Every real bridge is a puzzle: terrain, loads, materials, and budget. The best engineers find elegant solutions that balance ALL constraints.",
     },

@@ -1,23 +1,21 @@
 // ═══════════════════════════════════════════════════════
-//  Leaderboard — placeholder backend
+//  Leaderboard — portal-first with synthetic fallback
 //
-//  Async-first API so the swap to Supabase later is just a
-//  body change inside submitScore() and getLeaderboard().
+//  When running inside the portal iframe (auth + Supabase available),
+//  getLeaderboard / submitScore round-trip through the postMessage bridge
+//  defined in S26-CSE-335-dev/src/components/game-page/player/GameEmbed.tsx.
+//  The portal route /api/game-scores/[slug] joins game_scores rows with
+//  user_profiles to return real display names.
 //
-//  Today (placeholder):
-//    • Player's best run per level → localStorage.
-//    • Synthetic rivals → deterministic per-level pool seeded
-//      by levelId hash, so the "field" stays consistent
-//      across sessions but feels realistic.
-//
-//  Tomorrow (Supabase): drop in calls against a `scores` table
-//    keyed by (user_id, level_id) ordered by budget_used asc.
+//  Standalone (npm run dev / no parent frame), we fall back to the old
+//  synthetic-field generator so dev runs still feel populated.
 // ═══════════════════════════════════════════════════════
+
+import { fetchPortalLeaderboard, submitPortalScore, isInPortal } from "./portalGameData.js";
 
 const STORAGE_KEY = "bridgesnap_leaderboard";
 
-// Names sampled into the synthetic field. Mix of engineering /
-// builder vibes so the leaderboard reads themed, not random.
+// ─── Synthetic field (standalone fallback only) ─────────
 const SYNTHETIC_NAMES = [
     "Ironheart", "TrussNinja", "BridgeMaster", "SteelDrifter",
     "BeamDream", "PixelEngineer", "Roadworks", "RopeWalker",
@@ -27,15 +25,9 @@ const SYNTHETIC_NAMES = [
     "Foreman", "Surveyor", "Drafty", "Plumbline",
 ];
 
-// ─── Deterministic RNG ─────────────────────────────────
-// Same levelId always produces the same synthetic field — players
-// can compare runs against a stable reference, and dev reloads
-// don't shuffle "the competition" each time.
 function hashStr(str) {
     let h = 5381;
-    for (let i = 0; i < str.length; i++) {
-        h = (h * 33) ^ str.charCodeAt(i);
-    }
+    for (let i = 0; i < str.length; i++) h = (h * 33) ^ str.charCodeAt(i);
     return h >>> 0;
 }
 
@@ -47,23 +39,15 @@ function lcg(seed) {
     };
 }
 
-// ─── Synthetic field ───────────────────────────────────
-// Distribution: ~10% top-tier (90-97% efficient), ~75% mid
-// (55-85%), ~15% low (30-55%). Skews right — most players are
-// average, a small elite is very budget-efficient.
 function generateSynthetic(levelId, budget, count = 80) {
     const rand = lcg(hashStr(levelId));
     const players = [];
     for (let i = 0; i < count; i++) {
         const r = rand();
         let efficiency;
-        if (r < 0.10) {
-            efficiency = 0.90 + rand() * 0.07;
-        } else if (r < 0.85) {
-            efficiency = 0.55 + rand() * 0.30;
-        } else {
-            efficiency = 0.30 + rand() * 0.25;
-        }
+        if (r < 0.10) efficiency = 0.90 + rand() * 0.07;
+        else if (r < 0.85) efficiency = 0.55 + rand() * 0.30;
+        else efficiency = 0.30 + rand() * 0.25;
         const budgetUsed = Math.max(100, Math.round(budget * (1 - efficiency)));
         const nameIdx = Math.floor(rand() * SYNTHETIC_NAMES.length);
         const tag = Math.floor(rand() * 999).toString().padStart(3, "0");
@@ -76,12 +60,11 @@ function generateSynthetic(levelId, budget, count = 80) {
     return players;
 }
 
-// ─── localStorage helpers ──────────────────────────────
+// ─── Local "best run" cache (used both online and offline) ─
 function readScores() {
     try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; }
     catch { return {}; }
 }
-
 function writeScores(s) {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); }
     catch {}
@@ -90,12 +73,12 @@ function writeScores(s) {
 // ─── Public API ────────────────────────────────────────
 
 /**
- * Submit a level-completion score. Stores only the player's PERSONAL BEST
- * (lowest budgetUsed) — matches how a real leaderboard would dedupe.
+ * Submit a level-completion score. Always updates the local PB cache; when
+ * inside the portal also pushes to the cross-user leaderboard.
  *
  * Returns { isPB, prevBest } so the UI can flag a new personal record.
  */
-export async function submitScore({ levelId, budgetUsed, budget, playerName = "You" }) {
+export async function submitScore({ levelId, budgetUsed, budget, playerName = "You", grade = null }) {
     const scores = readScores();
     const prev = scores[levelId];
     const isPB = !prev || budgetUsed < prev.budgetUsed;
@@ -103,24 +86,42 @@ export async function submitScore({ levelId, budgetUsed, budget, playerName = "Y
         scores[levelId] = { budgetUsed, budget, playerName, ts: Date.now() };
         writeScores(scores);
     }
+
+    // Push to cross-user board when authenticated. Server rejects
+    // non-improvements so it's safe to send every completion.
+    if (isInPortal()) {
+        submitPortalScore(levelId, budgetUsed, grade).catch(() => {});
+    }
+
     return { isPB, prevBest: prev ? prev.budgetUsed : null };
 }
 
 /**
- * Fetch the leaderboard for `levelId`. Returns:
- *   {
- *     top:            [{ playerName, budgetUsed, isYou }],   // top 5 entries
- *     userRank:       number | null,                          // 1-indexed
- *     userPercentile: number | null,                          // 0..100, higher = better
- *     totalPlayers:   number,
- *     userEntry:      { playerName, budgetUsed, isYou } | null,
- *   }
- *
- * `currentRun` is optional — used as a fallback when computing the synthetic
- * field's reference budget (so we can show a leaderboard before the player's
- * own best is even saved).
+ * Fetch the leaderboard for `levelId`. Tries the portal first; falls back
+ * to the synthetic field when running standalone or if the bridge times
+ * out. Same return shape regardless of source so the UI doesn't care.
  */
 export async function getLeaderboard(levelId, currentRun = null) {
+    if (isInPortal()) {
+        const remote = await fetchPortalLeaderboard(levelId, { limit: 10 });
+        if (remote && remote.ok) {
+            return {
+                top: remote.top || [],
+                userRank: remote.userRank ?? null,
+                userPercentile: remote.userPercentile ?? null,
+                totalPlayers: remote.totalPlayers ?? 0,
+                userEntry: remote.userEntry || null,
+                source: "portal",
+            };
+        }
+        // Portal answered but with an error — fall through to synthetic so
+        // the UI isn't blank.
+    }
+
+    return getLeaderboardSynthetic(levelId, currentRun);
+}
+
+function getLeaderboardSynthetic(levelId, currentRun) {
     const scores = readScores();
     const userBest = scores[levelId];
     const budget = (currentRun && currentRun.budget) || (userBest && userBest.budget) || 10000;
@@ -152,10 +153,11 @@ export async function getLeaderboard(levelId, currentRun = null) {
         : null;
 
     return {
-        top: all.slice(0, 5),
+        top: all.slice(0, 10),
         userRank,
         userPercentile,
         totalPlayers,
         userEntry,
+        source: "synthetic",
     };
 }

@@ -119,7 +119,7 @@ export const MATERIALS = {
         breakForce:  450,
         price:       35,
         width:       6,
-        maxLength:   108,      // 3 grid cells
+        maxLength:   72,       // 2 grid cells — matches road so triangles close cleanly
         isRoad:      false,
         tensionOnly: false,
         desc:        "Wooden beam — cheap structural support",
@@ -133,7 +133,7 @@ export const MATERIALS = {
         breakForce:  1200,
         price:       450,
         width:       5,
-        maxLength:   144,      // 4 grid cells
+        maxLength:   72,       // 2 grid cells — matches road so triangles close cleanly
         isRoad:      false,
         tensionOnly: false,
         desc:        "Steel I-beam — very strong and rigid, but expensive",
@@ -189,11 +189,14 @@ export const VEHICLES = {
         name: "BICYCLE",
         label: null,
         mass: 10,
-        w: 22, h: 20,
+        w: 32, h: 26,
         speed: 1.5,
         color: "#7a5cb8",
         wheels: 2,
         sprite: "veh_bicycle",
+        // Sprite has transparent margin under the wheels — nudge it down so
+        // the bike sits on the road instead of floating above it.
+        spriteYOffset: 7,
     },
     car: {
         name: "COMPACT CAR",
@@ -285,7 +288,7 @@ export const VEHICLES = {
         name: "SCHOOL BUS",
         label: "BUS",
         mass: 300,
-        w: 80, h: 28,
+        w: 68, h: 26,
         speed: 0.9,
         color: "#d4a020",
         wheels: 4,
@@ -295,11 +298,16 @@ export const VEHICLES = {
         name: "FLATBED TRUCK",
         label: "FLAT",
         mass: 400,
-        w: 90, h: 30,
+        w: 50, h: 24,
         speed: 0.8,
         color: "#8a4a2a",
         wheels: 4,
         sprite: "veh_flatbed",
+        // Lift the sprite so the wheels sit cleanly on the road instead of
+        // sinking into it (negative = up). Bridge planks are thinner than
+        // the cliff asphalt so a heavier lift looks better there.
+        spriteYOffset:       -7,
+        spriteYOffsetBridge: -12,
     },
     boat_trailer: {
         name: "BOAT TRAILER",

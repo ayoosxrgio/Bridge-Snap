@@ -5,6 +5,7 @@ import { solveBridge } from "../aiHelper.js";
 import { completeLevel, getCompleted } from "../progression.js";
 import { onLevelStart, onBridgeFailed, onBridgeSuccess, onLevelComplete, onHintRequest, onRecapRequest } from "../assistantBridge.js";
 import { submitScore, getLeaderboard } from "../leaderboard.js";
+import { pickFailCaption, pickWinCaption } from "../captions.js";
 
 export function gameScene(k, { levelIdx }) {
     const lvlDef = LEVELS[levelIdx];
@@ -56,17 +57,25 @@ export function gameScene(k, { levelIdx }) {
     const lvl = { gap: lvlDef.gap, hDiff: lvlDef.hDiff, lX, rX, lY, rY, midX, terrain: lvlDef.terrain, vType: lvlDef.vType, budget: lvlDef.budget };
 
     function getScale() { return k.width() / (lvl.gap + PAD_X * 2); }
+    // Vertical anchor — what fraction of the canvas height the cliff line
+    // sits at. Default 0.62 keeps cliffs in the lower half so the bridge
+    // build area gets the upper portion of the screen. A level can override
+    // this (e.g. 0.42) when it wants more room BELOW the cliff for a tall
+    // mid-gap obstacle.
+    const CLIFF_Y_FRAC = lvlDef.cliffScreenAnchor != null ? lvlDef.cliffScreenAnchor : 0.62;
+    function getOffY() {
+        const sc = getScale();
+        return (k.height() * CLIFF_Y_FRAC) / sc - WORLD_MID_Y;
+    }
     function toScreen(wx, wy) {
         const sc = getScale();
         const offX = PAD_X - ANCHOR_L_X;
-        const offY = (k.height() * 0.62) / sc - WORLD_MID_Y;
-        return k.vec2((wx + offX) * sc, (wy + offY) * sc);
+        return k.vec2((wx + offX) * sc, (wy + getOffY()) * sc);
     }
     function toWorld(sx, sy) {
         const sc = getScale();
         const offX = PAD_X - ANCHOR_L_X;
-        const offY = (k.height() * 0.62) / sc - WORLD_MID_Y;
-        return { x: sx / sc - offX, y: sy / sc - offY };
+        return { x: sx / sc - offX, y: sy / sc - getOffY() };
     }
 
     // ─── Game state ─────────────────────────────────
@@ -107,6 +116,11 @@ export function gameScene(k, { levelIdx }) {
         dragStart: null,     // node we're dragging from
         dragging: false,
         lineMode: false,      // line fill: drag to auto-place segments along a straight line
+        // Polybridge-style auto-extend: after placing a road, remember the end
+        // node + direction vector so the next click near the predicted next
+        // endpoint extends the chain by one segment. Cleared on tool/material
+        // change, undo, sim toggle, etc. Shape: { node, dx, dy }.
+        lastRoadEnd: null,
         archMode: false,      // arch tool: click A → click B → drag apex handle → click off to commit
         // ── Select tool ────────────────────────
         selectMode: false,
@@ -152,6 +166,10 @@ export function gameScene(k, { levelIdx }) {
         aiChoiceIdx: -1,     // index of the option the player picked (for feedback coloring)
         aiOptionRects: [],   // click-targets rebuilt every frame
         aiNextRect: null,    // "Next" / "Build!" button rect
+        // Animation state for the helper
+        aiTyped: 0,          // chars of the current explanation revealed so far
+        aiHighlightTimer: 0, // seconds remaining on the post-build glow
+        aiHighlightMembers: [], // members placed by the most recent "Build & Next"
         // Hint — closed by default; player opens it via the "?" button when needed
         hintOpen: false,
         // Lesson panel
@@ -199,6 +217,22 @@ export function gameScene(k, { levelIdx }) {
     state.nodes.push(new Node(lX, lY, true));
     state.nodes.push(new Node(rX, rY, true));
 
+    // Mid-land platform — free-standing piece of terrain between two gaps.
+    // Adds two fixed anchors at the platform's top corners; the renderer
+    // and collider system pick up state._midLand to draw / collide a solid
+    // dirt-and-road body underneath those anchors.
+    if (lvlDef.midLand) {
+        const ml = lvlDef.midLand;
+        const cx = midX + (ml.dx || 0);
+        const ly = lY + (ml.dy || 0);
+        const xL = Math.round((cx - ml.halfW) / GRID) * GRID;
+        const xR = Math.round((cx + ml.halfW) / GRID) * GRID;
+        const yT = Math.round(ly / GRID) * GRID;
+        state.nodes.push(new Node(xL, yT, true));
+        state.nodes.push(new Node(xR, yT, true));
+        state._midLand = { x1: xL, x2: xR, y: yT };
+    }
+
     (lvlDef.extraAnchors || []).forEach(a => {
         let nx, ny;
         if (a.side === "L") { nx = lX + a.dx; ny = lY + a.dy; }
@@ -218,6 +252,12 @@ export function gameScene(k, { levelIdx }) {
         const surfaceLeft  = lY - ROAD_SURFACE;
         const surfaceRight = rY - ROAD_SURFACE;
         if (lvlDef.multiVehicle) {
+            // Track flag-slot index per side so each vehicle's finish X lines
+            // up with its own flag (mirrors the nextR/nextL stepping in
+            // drawFlags). Without this every vehicle stops at slot-0's flag
+            // and the lineup looks wrong on multi-flag levels.
+            let nextRSlot = 0, nextLSlot = 0;
+            const FLAG_STEP = 70;        // must match drawFlags spacing
             state.vehicles = lvlDef.multiVehicle.map((mv, i) => {
                 const base = VEHICLES[mv.vType];
                 const cfg = { ...base, color: mv.color || base.color, name: mv.label };
@@ -227,6 +267,14 @@ export function gameScene(k, { levelIdx }) {
                 const offset = mv.startXOffset ?? (startSide === "R" ?  55 : -55);
                 const spawnX = startSide === "R" ? rX + offset : lX + offset;
                 const spawnY = (startSide === "R" ? surfaceRight : surfaceLeft) - base.h * 0.5;
+                let finishX;
+                if (goalSide === "L") {
+                    finishX = lX - FLAG_INLAND_L - nextLSlot * FLAG_STEP - 8;
+                    nextLSlot++;
+                } else {
+                    finishX = rX + FLAG_INLAND_R + nextRSlot * FLAG_STEP + 8;
+                    nextRSlot++;
+                }
                 return {
                     cfg, x: spawnX, y: spawnY,
                     active: true, finished: false,
@@ -235,9 +283,14 @@ export function gameScene(k, { levelIdx }) {
                     label: mv.label,
                     _dir: dir,
                     _goalSide: goalSide,
+                    _finishX: finishX,
                     _waitFor: typeof mv.startAfter === "number" ? mv.startAfter : null,
                     _passOnly: !!mv.passOnly,    // drives past flag, finishes off-screen
                     _passedFlag: false,
+                    // Convoy follow — index of the leader to stay behind, plus
+                    // minimum gap (world units) between leader and this car.
+                    _followBehind: typeof mv.followBehind === "number" ? mv.followBehind : null,
+                    _followGap:    mv.followGap ?? 30,
                 };
             });
         } else {
@@ -758,8 +811,8 @@ export function gameScene(k, { levelIdx }) {
     // ~1.4× from the toolbar tools' default scale.
     function drawGridIcon(cx, cy, col) {
         const c = colorOf(col);
-        const half = 14;
-        const lw = 2.2;
+        const half = 11;
+        const lw = 1.9;
         // 3×3 grid: 4 horizontals + 4 verticals
         for (let i = 0; i <= 3; i++) {
             const t = -half + (i / 3) * (half * 2);
@@ -772,20 +825,16 @@ export function gameScene(k, { levelIdx }) {
     // reads as "snap is locked", and the active outline reinforces state.
     function drawSnapIcon(cx, cy, col) {
         const c = colorOf(col);
-        // Body — sized to roughly match the grid icon's footprint so the
-        // three sidebar icons feel visually balanced.
-        const bodyW = 22, bodyH = 17;
+        const bodyW = 18, bodyH = 14;
         const bodyTop = cy - 2;
         k.drawRect({
             pos: k.vec2(cx - bodyW / 2, bodyTop),
             width: bodyW, height: bodyH,
-            color: c, anchor: "topleft", radius: 2.4,
+            color: c, anchor: "topleft", radius: 2,
         });
-        // Shackle — thick U arc above the body. Drawn as a chain of segments
-        // with round caps so the curve stays solid at thickness.
-        const shackleR = 7.2;
+        const shackleR = 6;
         const shackleY = bodyTop;
-        const lw = 3;
+        const lw = 2.5;
         let prev = null;
         const segs = 22;
         for (let i = 0; i <= segs; i++) {
@@ -796,11 +845,9 @@ export function gameScene(k, { levelIdx }) {
             k.drawCircle({ pos: k.vec2(x, y), radius: lw / 2, color: c });
             prev = k.vec2(x, y);
         }
-        // Keyhole punched into the body — a circle + downward stem in the
-        // outline color, so it reads as a hole regardless of icon state.
         const khColor = colorOf("#3a2110");
-        k.drawCircle({ pos: k.vec2(cx, bodyTop + 6), radius: 1.9, color: khColor });
-        k.drawRect({ pos: k.vec2(cx - 0.9, bodyTop + 7), width: 1.8, height: 5, color: khColor, anchor: "topleft" });
+        k.drawCircle({ pos: k.vec2(cx, bodyTop + 5), radius: 1.6, color: khColor });
+        k.drawRect({ pos: k.vec2(cx - 0.8, bodyTop + 6), width: 1.6, height: 4, color: khColor, anchor: "topleft" });
     }
 
     // Stress icon: classic trapezoidal weight with a circular ring loop on
@@ -809,11 +856,10 @@ export function gameScene(k, { levelIdx }) {
     // visual weight so the three sidebar icons read at the same scale.
     function drawStressIcon(cx, cy, col) {
         const c = colorOf(col);
-        // Trapezoid body — wider at the bottom.
-        const topW = 18;
-        const botW = 28;
-        const bodyTop = cy - 2;
-        const bodyBot = cy + 14;
+        const topW = 14;
+        const botW = 22;
+        const bodyTop = cy - 1;
+        const bodyBot = cy + 12;
         k.drawPolygon({
             pts: [
                 k.vec2(cx - topW / 2, bodyTop),
@@ -823,13 +869,11 @@ export function gameScene(k, { levelIdx }) {
             ],
             color: c,
         });
-        // Ring loop on top — outlined circle so the wood shows through the
-        // hole, like the reference image.
-        const loopR = 6.5;
-        const loopCy = bodyTop - loopR + 3;         // overlaps the body slightly
+        const loopR = 5.2;
+        const loopCy = bodyTop - loopR + 2.6;
         k.drawCircle({
             pos: k.vec2(cx, loopCy), radius: loopR,
-            fill: false, outline: { width: 3, color: c },
+            fill: false, outline: { width: 2.4, color: c },
         });
     }
 
@@ -1221,6 +1265,12 @@ export function gameScene(k, { levelIdx }) {
         // Right table surface
         { x1: rX, y1: rY, x2: rX + 600, y2: rY + TABLE_COL_H },
     ];
+    // Mid-land platform — a solid block vehicles drive across, same height
+    // as a cliff approach so wheels read flush with the surface.
+    if (state._midLand) {
+        const ml = state._midLand;
+        state._terrainColliders.push({ x1: ml.x1, y1: ml.y, x2: ml.x2, y2: ml.y + TABLE_COL_H });
+    }
     // Mid-gap rock piers — extra solid colliders so a collapsing bridge can
     // actually rest on / slide off the rock instead of clipping through it.
     if (lvlDef.extraAnchors) {
@@ -1313,7 +1363,7 @@ export function gameScene(k, { levelIdx }) {
             const memberCount = state.members.filter(m => !m.builtin).length;
             const sav = lvl.budget - cost;
             const grade = sav > lvl.budget * 0.4 ? "S" : sav > lvl.budget * 0.2 ? "A" : sav > 0 ? "B" : "C";
-            completeLevel(levelIdx, grade);
+            completeLevel(levelIdx, grade, cost);
             const vName = lvlDef.multiVehicle ? "Both vehicles" : VEHICLES[lvl.vType].name;
             onBridgeSuccess({ summary: `${vName} crossed. Cost: $${cost}, Grade: ${grade}, ${memberCount} members` });
             onLevelComplete({ summary: `Level ${lvlDef.name} complete — grade ${grade}` });
@@ -1321,13 +1371,14 @@ export function gameScene(k, { levelIdx }) {
             // here and stash on the modal once it opens — UI handles the
             // "loading" case if the fetch hasn't completed by show-time.
             const lbPromise = (async () => {
-                const sub = await submitScore({ levelId: lvlDef.id, budgetUsed: cost, budget: lvl.budget });
+                const sub = await submitScore({ levelId: lvlDef.id, budgetUsed: cost, budget: lvl.budget, grade });
                 const lb = await getLeaderboard(lvlDef.id, { budget: lvl.budget, budgetUsed: cost });
                 return { ...lb, isPB: sub.isPB, prevBest: sub.prevBest };
             })().catch(() => null);
             setTimeout(() => {
                 state.modal = {
-                    win: true, title: "MISSION COMPLETE!", desc: `${vName} crossed safely!`,
+                    win: true, title: "MISSION COMPLETE!",
+                    desc: pickWinCaption(lvlDef.id, vName),
                     cost, grade, openTime: k.time(),
                     leaderboard: null,                  // populated when promise resolves
                 };
@@ -1343,7 +1394,7 @@ export function gameScene(k, { levelIdx }) {
             });
             state.shakeMag = 5;
             setTimeout(() => {
-                state.modal = { win: false, title: "BRIDGE FAILED", desc: "Add triangular supports or reinforce stressed members.", openTime: k.time() };
+                state.modal = { win: false, title: "BRIDGE FAILED", desc: pickFailCaption(lvlDef.id), openTime: k.time() };
             }, 1000);
         }
     }
@@ -1447,6 +1498,23 @@ export function gameScene(k, { levelIdx }) {
         // Select mode — marquee selection & move
         if (state.selectMode) {
             const sc = getScale();
+            // Single-node drag: clicking right on a free joint moves just
+            // that point — beams stay attached but aren't "selected", so
+            // the player can shift one corner without lugging the whole
+            // truss around.
+            const nodeHitR = 9 / sc;
+            const nodeHit = state.nodes.find(n =>
+                !n.fixed && !n.builtin && !n._chainNode
+                && Math.hypot(n.x - wp.x, n.y - wp.y) < nodeHitR);
+            if (nodeHit) {
+                state.selectedMembers = new Set();
+                state.selectMoving = true;
+                state.selectMoveStart = { x: wp.x, y: wp.y };
+                state.selectMoveOrig = new Map([[nodeHit, {
+                    x: nodeHit.x, y: nodeHit.y, rx: nodeHit.rx, ry: nodeHit.ry,
+                }]]);
+                return;
+            }
             // If there's already a selection AND the cursor is on one of the
             // selected members, start a MOVE. Otherwise start a new MARQUEE.
             const hitSelected = state.selectedMembers.size > 0 && [...state.selectedMembers].some(m =>
@@ -1538,6 +1606,44 @@ export function gameScene(k, { levelIdx }) {
             if (arch) applyArch(arch);
             resetArchState();
             return;
+        }
+
+        // Polybridge-style auto-extend — if the player has just placed a road
+        // and clicks near where the next colinear segment would land, drop a
+        // matching segment automatically. Lets you spam-click a straight run
+        // without having to drag each piece.
+        if (state.lastRoadEnd && state.mode === "build") {
+            const mat = MATERIALS[state.selectedMat];
+            if (mat && mat.isRoad) {
+                const lr = state.lastRoadEnd;
+                if (state.nodes.includes(lr.node) && !lr.node._chainNode) {
+                    const px = lr.node.x + lr.dx;
+                    const py = lr.node.y + lr.dy;
+                    // Click must land within roughly half a segment of the
+                    // predicted endpoint. Use the user's snapped target so
+                    // grid-snapped clicks line up cleanly.
+                    const distSq = (sn.x - px) * (sn.x - px) + (sn.y - py) * (sn.y - py);
+                    const threshSq = (Math.hypot(lr.dx, lr.dy) * 0.6) * (Math.hypot(lr.dx, lr.dy) * 0.6);
+                    if (distSq <= threshSq && px >= lX && px <= rX) {
+                        const roadsOnStart = state.members.filter(m => MATERIALS[m.type].isRoad && (m.n1 === lr.node || m.n2 === lr.node)).length;
+                        const existingEnd = state.nodes.find(n => n.x === px && n.y === py);
+                        const roadsOnEnd = existingEnd
+                            ? state.members.filter(m => MATERIALS[m.type].isRoad && (m.n1 === existingEnd || m.n2 === existingEnd)).length
+                            : 0;
+                        const dup = existingEnd && state.members.some(m =>
+                            (m.n1 === lr.node && m.n2 === existingEnd) || (m.n2 === lr.node && m.n1 === existingEnd));
+                        if (roadsOnStart < 2 && roadsOnEnd < 2 && !dup) {
+                            const en = findOrCreate(px, py);
+                            const created = placeMemberOrChain(lr.node, en, state.selectedMat);
+                            if (created.length > 0) {
+                                pushUndoAction(created);
+                                state.lastRoadEnd = { node: en, dx: lr.dx, dy: lr.dy };
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Start dragging from existing node
@@ -1782,6 +1888,11 @@ export function gameScene(k, { levelIdx }) {
                 if (!exists) {
                     const created = placeMemberOrChain(st, en, state.selectedMat);
                     for (const m of created) added.push(m);
+                    // Remember this road's vector so the next click can extend
+                    // colinearly (Polybridge auto-extend).
+                    if (mat.isRoad && created.length > 0) {
+                        state.lastRoadEnd = { node: en, dx: en.x - st.x, dy: en.y - st.y };
+                    }
                 }
             }
             pushUndoAction(added);
@@ -1798,6 +1909,7 @@ export function gameScene(k, { levelIdx }) {
             // otherwise pick the base — match what the slot shows visually.
             const upgradeKey = upgradesUnlocked ? MATERIAL_UPGRADES[matKey] : null;
             state.selectedMat = (upgradeKey && state.matExpanded.has(matKey)) ? upgradeKey : matKey;
+            state.lastRoadEnd = null;       // switching material ends the chain
         });
     }
     const resetArchState = () => {
@@ -1869,6 +1981,9 @@ export function gameScene(k, { levelIdx }) {
         state.archMode = false;
         state.selectMode = false;
         state.selectedMembers = new Set();
+        // Switching tool/material breaks the auto-extend chain so the player
+        // doesn't accidentally extend an old chain after picking a new tool.
+        state.lastRoadEnd = null;
         resetArchState();
         clearSelectState();
     }
@@ -2249,6 +2364,10 @@ export function gameScene(k, { levelIdx }) {
         if (state.mode !== "build") return;
         const action = state.undoStack.pop();
         if (!action) return;
+        // Undo breaks the auto-extend chain — the "last placed" road may have
+        // just been removed, and even if not, continuing a chain across an
+        // undo is more confusing than helpful.
+        state.lastRoadEnd = null;
 
         if (action.deleted) {
             // Restore a previously-deleted member + any orphan nodes that went with it
@@ -2385,6 +2504,7 @@ export function gameScene(k, { levelIdx }) {
 
     function toggleSim() {
         state.finishCalled = false;
+        state.lastRoadEnd = null;       // sim/build switch ends the chain
         if (state.mode === "build") {
             const cost = calcCost(state.members);
             if (cost > lvl.budget) {
@@ -2489,24 +2609,25 @@ export function gameScene(k, { levelIdx }) {
         const toolbarBot = tb.h + tb.pad;
 
         // Mounting bar — its right end sits on the wall (the canvas's right
-        // edge). The sign hangs from the bar's LEFT end.
-        const barH = 7;
+        // edge). The sign hangs from the bar's LEFT end. Scaled down ~18%
+        // from the original size so it stays out of the build view.
+        const barH = 6;
         const barRight = W;                       // attaches at the right edge
-        const barY = toolbarBot + 22;             // below the toolbar with a small gap
+        const barY = toolbarBot + 20;             // below the toolbar with a small gap
 
         // Sign hangs below the bar via two short ropes.
-        const ropeLen = 12;
-        const signW = 168, signH = 56;
+        const ropeLen = 10;
+        const signW = 138, signH = 46;
         const signTop = barY + barH + ropeLen;
 
         // 3 icon buttons in a row inside the sign.
-        const iconBtnW = 46, iconBtnH = 44;
-        const iconGap  = 5;
+        const iconBtnW = 38, iconBtnH = 36;
+        const iconGap  = 4;
         const iconRowW = 3 * iconBtnW + 2 * iconGap;
 
         // Bar slightly overhangs the sign on the wall side so the chains read
         // as hanging below the protruding tip of the bar.
-        const barOverhang = 14;
+        const barOverhang = 12;
         const barFullLength = signW + barOverhang;
 
         // Animation: the entire assembly translates left from a hidden
@@ -2748,6 +2869,7 @@ export function gameScene(k, { levelIdx }) {
                     state.matLastClick = { key: baseKey, time: now };
                 }
                 state.delMode = false;
+                state.lastRoadEnd = null;       // toolbar pick ends the chain
                 return true;
             }
         }
@@ -2875,8 +2997,10 @@ export function gameScene(k, { levelIdx }) {
         state.aiPanelOpen = true;
         state.aiResult = null;
         state.aiStepIdx = 0;
-        state.aiPhase = "question";
-        state.aiChoiceIdx = -1;
+        state.aiPhase = "step";
+        state.aiTyped = 0;
+        state.aiHighlightTimer = 0;
+        state.aiHighlightMembers = [];
         onRecapRequest();
 
         // Clear player's bridge so the lesson builds its own from scratch
@@ -2888,9 +3012,10 @@ export function gameScene(k, { levelIdx }) {
         state.aiResult = result;
     }
 
-    // Place the members for the current lesson step into the world.
+    // Place the members for the current lesson step into the world. Returns
+    // the array of newly created members so the caller can highlight them.
     function buildLessonStep(step) {
-        if (!step?.members) return;
+        if (!step?.members) return [];
         const added = [];
         for (const mb of step.members) {
             const x1 = Math.round(mb.x1 / GRID) * GRID;
@@ -2909,23 +3034,13 @@ export function gameScene(k, { levelIdx }) {
             }
         }
         pushUndoAction(added);
+        return added;
     }
 
-    // Handle a click on an option button or the Next button.
+    // Click on the "Build & Next" / "Close" button. The teaching panel has
+    // just one click target per state (no quiz options to pick).
     function handleAiPanelClick(mx, my) {
         if (!state.aiPanelOpen || !state.aiResult?.steps) return false;
-        // Option click only when waiting for an answer
-        if (state.aiPhase === "question") {
-            for (let i = 0; i < state.aiOptionRects.length; i++) {
-                const r = state.aiOptionRects[i];
-                if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
-                    state.aiChoiceIdx = i;
-                    state.aiPhase = "feedback";
-                    return true;
-                }
-            }
-        }
-        // Next button (either "Build!" after feedback, or "Next question" / "Done")
         if (state.aiNextRect) {
             const r = state.aiNextRect;
             if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
@@ -2939,20 +3054,24 @@ export function gameScene(k, { levelIdx }) {
     function advanceLesson() {
         const lesson = state.aiResult;
         if (!lesson?.steps) return;
-        const step = lesson.steps[state.aiStepIdx];
 
-        if (state.aiPhase === "feedback") {
-            // Build the pieces for this step, then move to the next question
-            buildLessonStep(step);
-            state.aiStepIdx += 1;
-            state.aiChoiceIdx = -1;
-            if (state.aiStepIdx >= lesson.steps.length) {
-                state.aiPhase = "done";
-            } else {
-                state.aiPhase = "question";
-            }
-        } else if (state.aiPhase === "done") {
+        if (state.aiPhase === "done") {
             state.aiPanelOpen = false;
+            return;
+        }
+
+        // Build the pieces for the current step, capture them for the
+        // post-build glow, then move on.
+        const stepNow = lesson.steps[state.aiStepIdx];
+        const added = buildLessonStep(stepNow);
+        state.aiHighlightMembers = added;
+        state.aiHighlightTimer = added.length > 0 ? 1.6 : 0;
+
+        state.aiStepIdx += 1;
+        if (state.aiStepIdx >= lesson.steps.length) {
+            state.aiPhase = "done";
+        } else {
+            state.aiPhase = "step";
         }
     }
 
@@ -3161,6 +3280,14 @@ export function gameScene(k, { levelIdx }) {
             if (state.shakeMag > 0.05) state.shakeMag *= 0.80;
             else state.shakeMag = 0;
 
+            // AI helper post-build glow decay — the members the AI just
+            // placed pulse for ~1.6s after a "Build & Next" so the player
+            // sees what changed.
+            if (state.aiHighlightTimer > 0) {
+                state.aiHighlightTimer = Math.max(0, state.aiHighlightTimer - (k.dt() || 1/60));
+                if (state.aiHighlightTimer === 0) state.aiHighlightMembers = [];
+            }
+
             state.flagWave += 0.05;
         }
         }
@@ -3193,6 +3320,7 @@ export function gameScene(k, { levelIdx }) {
             drawSelectHalo(sc, "roads");
             drawMembers(sc, "roads");
             drawAnchorDots(sc);   // drawn after roads so dots are never buried under planks
+            drawAutoExtendGhost(sc);
             drawGhostBeam(sc);
             drawFlags(sc);        // flags behind vehicles
             drawVehicles(sc);
@@ -3207,6 +3335,9 @@ export function gameScene(k, { levelIdx }) {
             // Yellow node handles render LAST among the bridge stack so beam
             // line caps and grain marks can't peek through the handle.
             drawNodes(sc);
+            // AI helper post-build glow — pulses around the members the AI
+            // just placed so the player can see WHAT changed.
+            drawAiBuildHighlight(sc);
             // Arch preview on top of structural so apex handle is always visible
             drawArchPreview(sc);
             // Select-tool marquee rectangle — drawn on top of everything so it's always visible
@@ -3360,6 +3491,14 @@ export function gameScene(k, { levelIdx }) {
         // Draw right ground
         drawGround(rX, rX + 600, rY, sc, "right");
 
+        // Mid-land platform — free-standing dirt-and-road segment between
+        // two gaps. Shadow drawn on both inner edges since both sides face
+        // gaps.
+        if (state._midLand) {
+            const ml = state._midLand;
+            drawGround(ml.x1, ml.x2, ml.y, sc, "both");
+        }
+
         // Cliff tower masts — extra anchors on the cliff surface above cliff top.
         for (const n of state.nodes) {
             if (!n.fixed || n.builtin) continue;
@@ -3367,13 +3506,15 @@ export function gameScene(k, { levelIdx }) {
             else if (n.x > rX && n.y < rY) drawCliffTower(n.x, n.y, rY, sc);
         }
 
-        // Mid-gap rock piers — anchors with x strictly between the two cliffs
-        // get a visible rock/pillar underneath them. Drawn BEFORE the anchor
-        // dots so the red dot reads as sitting on top of the rock. Visible in
-        // all modes since the rock is part of the level geometry.
+        // Mid-gap rock piers — vertical stone pillars rising from below
+        // for each MID anchor (e.g. Stepping Stone, Deep Valley).
+        const ml = state._midLand;
         for (const n of state.nodes) {
             if (!n.fixed || n.builtin) continue;
-            if (n.x <= lX || n.x >= rX) continue;  // only MID anchors get a pier
+            if (n.x <= lX || n.x >= rX) continue;
+            // Skip the platform's corner anchors — they sit on the mid-land
+            // body, not on a stone pier.
+            if (ml && n.y === ml.y && (n.x === ml.x1 || n.x === ml.x2)) continue;
             drawMidPier(n.x, n.y, sc);
         }
 
@@ -3392,8 +3533,8 @@ export function gameScene(k, { levelIdx }) {
                 const p = toScreen(n.x, n.y);
                 const onCliffTop = (n.x === lX && n.y === lY) || (n.x === rX && n.y === rY);
                 const onMidPier  = n.x > lX && n.x < rX;
-                const onTower    = !onCliffTop && !onMidPier && n.y < Math.min(lY, rY);
-                const isPrimary  = onCliffTop || onMidPier || onTower;
+                const onSideWall = !onCliffTop && !onMidPier;        // tower above OR truss support below
+                const isPrimary  = onCliffTop || onMidPier || onSideWall;
                 const baseR = isPrimary ? sc * 4.5 : sc * 3.5;
 
                 const phase = (n.x * 0.013 + n.y * 0.017);
@@ -3450,7 +3591,6 @@ export function gameScene(k, { levelIdx }) {
         }
     }
 
-    // Draw a stone pillar rising out of the water to support a mid-gap anchor.
     // Greyscale stone palette so the rock reads as a distinct element from the
     // dirt/cliff approach tables.
     function drawMidPier(ax, ay, sc) {
@@ -3690,8 +3830,17 @@ export function gameScene(k, { levelIdx }) {
         }
 
         // ── Cliff inner edge shadow ──
-        const edgeX = side === "left" ? roadTop.x + w - 2 : roadTop.x;
-        k.drawRect({ pos: k.vec2(edgeX, roadBot.y + grassH), width: 3, height: darkDirtH + lightDirtH + remainH, color: colorOf("#010101"), anchor: "topleft", opacity: 0.12 });
+        // "left" cliff approach faces a gap on the right → shadow on right.
+        // "right" approach faces a gap on the left → shadow on left.
+        // "both" is for free-standing mid-land — gaps on both sides.
+        const shadowH = darkDirtH + lightDirtH + remainH;
+        const shadowY = roadBot.y + grassH;
+        if (side === "left" || side === "both") {
+            k.drawRect({ pos: k.vec2(roadTop.x + w - 2, shadowY), width: 3, height: shadowH, color: colorOf("#010101"), anchor: "topleft", opacity: 0.12 });
+        }
+        if (side === "right" || side === "both") {
+            k.drawRect({ pos: k.vec2(roadTop.x, shadowY), width: 3, height: shadowH, color: colorOf("#010101"), anchor: "topleft", opacity: 0.12 });
+        }
     }
 
     // ─── Water in the gap (sim/end mode only) ────────
@@ -4283,10 +4432,36 @@ export function gameScene(k, { levelIdx }) {
         const p1 = toScreen(st.x, st.y);
         const p2 = toScreen(sn.x, sn.y);
 
-        // Range circle (only for straight mode)
+        // Range circle (only for straight mode) — dashed white perimeter
+        // that rotates so dashes drift right→left across the top, giving
+        // the build radius a subtle "live" feel.
         if (!state.lineMode) {
             const ringR = mat.maxLength * sc;
-            k.drawCircle({ pos: p1, radius: ringR, fill: false, outline: { width: 1, color: colorOf(ok ? C.accent : C.danger) }, opacity: 0.15 });
+            const ringCol = colorOf(ok ? "#ffffff" : C.danger);
+            const dashLen = 8;       // arc length per dash (screen px)
+            const gapLen  = 6;       // arc length per gap (screen px)
+            const period  = dashLen + gapLen;
+            const segCount = Math.max(24, Math.round((2 * Math.PI * ringR) / 4));
+            // Phase advances clockwise; subtracting flips the visual flow so
+            // dashes travel counter-clockwise (right→left across the top).
+            const phase = -k.time() * 30;
+            for (let i = 0; i < segCount; i++) {
+                const t1 = i / segCount;
+                const t2 = (i + 1) / segCount;
+                const a1 = t1 * Math.PI * 2;
+                const a2 = t2 * Math.PI * 2;
+                // Distance along perimeter to this segment's midpoint
+                const arcMid = ((t1 + t2) / 2) * 2 * Math.PI * ringR;
+                const m = ((arcMid + phase) % period + period) % period;
+                if (m > dashLen) continue;        // in the gap
+                k.drawLine({
+                    p1: k.vec2(p1.x + Math.cos(a1) * ringR, p1.y + Math.sin(a1) * ringR),
+                    p2: k.vec2(p1.x + Math.cos(a2) * ringR, p1.y + Math.sin(a2) * ringR),
+                    width: 1.2,
+                    color: ringCol,
+                    opacity: 0.55,
+                });
+            }
         }
 
         // Ghost beam — line fill preview or single segment
@@ -4340,6 +4515,43 @@ export function gameScene(k, { levelIdx }) {
         }
     }
 
+    // ─── Auto-extend preview ─────────────────────────
+    // When the last placed road has set up the chain, show a faint ghost of
+    // where the next click would drop the segment. Pulses gently so it's
+    // clearly hint-only, not part of the bridge.
+    function drawAutoExtendGhost(sc) {
+        if (state.mode !== "build") return;
+        if (state.dragging) return;                     // active drag overrides
+        if (state.delMode || state.archMode || state.selectMode || state.lineMode) return;
+        const lr = state.lastRoadEnd;
+        if (!lr) return;
+        const mat = MATERIALS[state.selectedMat];
+        if (!mat || !mat.isRoad) return;
+        if (!state.nodes.includes(lr.node)) { state.lastRoadEnd = null; return; }
+
+        const px = lr.node.x + lr.dx;
+        const py = lr.node.y + lr.dy;
+        if (px < lX || px > rX) return;
+
+        const p1 = toScreen(lr.node.x, lr.node.y);
+        const p2 = toScreen(px, py);
+
+        const pulse = 0.5 + 0.25 * Math.sin(k.time() * 3.5);
+        // Ghost line in the material color
+        k.drawLine({
+            p1, p2,
+            width: mat.width * sc * 0.5,
+            color: colorOf(mat.color),
+            opacity: 0.25 * pulse + 0.18,
+        });
+        // Endpoint marker — hollow accent ring so the click target is obvious
+        k.drawCircle({
+            pos: p2, radius: 7,
+            fill: false, outline: { width: 1.6, color: colorOf(C.accent) },
+            opacity: 0.45 + 0.35 * pulse,
+        });
+    }
+
     // ─── Select tool halo — matches the arch tool look. Layered rendering:
     // call with "roads" before the road draw pass and with "structural" before
     // the structural pass. The endpoint dots piggyback on the structural pass
@@ -4357,8 +4569,21 @@ export function gameScene(k, { levelIdx }) {
             visible = new Set(state.selectedMembers);
             for (const m of preview) visible.add(m);
         }
-        if (!visible || visible.size === 0) return;
         const haloCol = colorOf(C.accent);
+        // Single-node drag (no members selected): show a blue outline on the
+        // joint being moved so the player gets the same visual cue they'd get
+        // from a marquee selection.
+        const singleNode = (!visible || visible.size === 0)
+            && state.selectMoving && state.selectMoveOrig
+            && state.selectMoveOrig.size === 1;
+        if (singleNode && layer === "structural") {
+            for (const n of state.selectMoveOrig.keys()) {
+                const sp = toScreen(n.x, n.y);
+                k.drawCircle({ pos: sp, radius: 10, fill: false, outline: { width: 2.4, color: haloCol }, opacity: 0.95 });
+                k.drawCircle({ pos: sp, radius: 14, fill: false, outline: { width: 1.4, color: haloCol }, opacity: 0.45 });
+            }
+        }
+        if (!visible || visible.size === 0) return;
         for (const m of visible) {
             if (m.broken) continue;
             const isRoad = MATERIALS[m.type].isRoad;
@@ -4642,6 +4867,10 @@ export function gameScene(k, { levelIdx }) {
 
             const spriteKey = v.cfg.sprite;
             const vAngle = v.angle || 0;
+            const yOffWorld = v._onBridge && v.cfg.spriteYOffsetBridge != null
+                ? v.cfg.spriteYOffsetBridge
+                : (v.cfg.spriteYOffset || 0);
+            const spriteYOff = yOffWorld * sc;
             if (spriteKey) {
                 const sprW = hw * 4;
                 const submerged = !!v._splashed;
@@ -4651,7 +4880,7 @@ export function gameScene(k, { levelIdx }) {
                 const dir = v._dir || 1;
                 k.drawSprite({
                     sprite: spriteKey,
-                    pos: k.vec2(px, drawY - hh * 0.3),
+                    pos: k.vec2(px, drawY - hh * 0.3 + spriteYOff),
                     width: sprW,
                     height: sprW,
                     anchor: "center",
@@ -4668,7 +4897,7 @@ export function gameScene(k, { levelIdx }) {
             // visually related. Color is rolled once at scene init and on
             // every reset (via rerollLabelColors), not animated each frame.
             if (v.label && !v._splashed) {
-                const letterY = drawY - hh * 3.2;
+                const letterY = drawY - hh * 4.2 + spriteYOff;
                 const now = k.time();
                 const bob  = Math.sin(now * 3.0) * 1.5;
                 const tilt = Math.sin(now * 2.1) * 4;
@@ -4862,10 +5091,10 @@ export function gameScene(k, { levelIdx }) {
                 const goalSide = v?._goalSide || mv.goalSide || (mv.dir === -1 ? "L" : "R");
                 const sprite = flagSpriteFor(mv);
                 if (goalSide === "L") {
-                    drawOneFlag(lX - FLAG_INLAND_L - nextL * 30, baseYL, mv.label, triggered, sc, "L", i, sprite);
+                    drawOneFlag(lX - FLAG_INLAND_L - nextL * 70, baseYL, mv.label, triggered, sc, "L", i, sprite);
                     nextL++;
                 } else {
-                    drawOneFlag(rX + FLAG_INLAND_R + nextR * 30, baseYR, mv.label, triggered, sc, "R", i, sprite);
+                    drawOneFlag(rX + FLAG_INLAND_R + nextR * 70, baseYR, mv.label, triggered, sc, "R", i, sprite);
                     nextR++;
                 }
             });
@@ -5249,6 +5478,7 @@ export function gameScene(k, { levelIdx }) {
             { key: "beam",   title: "SUPPORT", text: "BEAMS hold the road up from below. Cars can't drive on them, but without support the road will sag and snap." },
             { key: "tools",  title: "TOOLS",   text: "Your tools live up here. Poke around. Each one does something useful." },
             { key: "help",   title: "STUCK?",  text: "Tap the hanging sign for help. The question mark shows a quick hint. The robot opens an AI tutor that teaches engineering alongside your build." },
+            { key: "options", title: "OPTIONS", text: "Sign on the right toggles the GRID, GRID-SNAP for free placement, and the green/yellow/red STRESS colors that show during sim. Use whichever helps you build." },
             { key: "goal",   title: "THE GOAL", text: "The car starts on the left and needs to reach the flag on the right. Get it across the gap safely." },
             { key: "play",   title: "PLAY",    text: "Ready? Hit the play button to run the simulation. If the car makes it across, you win." },
         ],
@@ -5305,6 +5535,17 @@ export function gameScene(k, { levelIdx }) {
                 y: signTopY,
                 w: (tb.hintBtn.x + tb.hintBtn.w) - tb.aiBtn.x + 44,
                 h: (signBottomY - signTopY) + 20,
+            };
+        }
+        if (key === "options") {
+            // Spotlight the right-edge hanging sign + a bit of the bar above
+            // it so the player sees how the toggles are mounted.
+            const sb = getSidebar();
+            return {
+                x: sb.signLeft - 8,
+                y: sb.barY - 6,
+                w: sb.signW + 16,
+                h: (sb.signTop + sb.signH) - sb.barY + 12,
             };
         }
         if (key === "goal") {
@@ -5605,21 +5846,71 @@ export function gameScene(k, { levelIdx }) {
         }
     }
 
-    // ─── AI panel (Socratic tutor — styled like the hint sticky note) ──
+    // ─── Pulsing glow around the members the AI just placed ─────────
+    // Uses the same vocabulary as the tutorial's spotlight ring: a couple of
+    // outline rings stacked at decreasing opacity, breathing on a sine.
+    function drawAiBuildHighlight(sc) {
+        if (state.aiHighlightTimer <= 0 || !state.aiHighlightMembers?.length) return;
+        const t = k.time();
+        const fade = Math.min(1, state.aiHighlightTimer / 1.6);
+        const pulse = 0.5 + 0.5 * Math.sin(t * 5);
+        const haloCol = colorOf("#ffd479");
+        for (const m of state.aiHighlightMembers) {
+            if (!m || m.broken) continue;
+            const p1 = toScreen(m.n1.x, m.n1.y);
+            const p2 = toScreen(m.n2.x, m.n2.y);
+            const mat = MATERIALS[m.type];
+            const baseW = (mat?.width || 6) * sc + 4;
+            // Three fattening lines for a soft glow
+            for (let g = 3; g >= 1; g--) {
+                k.drawLine({
+                    p1, p2,
+                    width: baseW + g * 4,
+                    color: haloCol,
+                    opacity: fade * (0.18 + 0.22 * pulse) / g,
+                });
+            }
+            // Endpoint accent dots
+            for (const p of [p1, p2]) {
+                k.drawCircle({
+                    pos: p, radius: 7 + pulse * 1.5,
+                    fill: false,
+                    outline: { width: 2, color: haloCol },
+                    opacity: fade * (0.45 + 0.35 * pulse),
+                });
+            }
+        }
+    }
+
+    // ─── AI helper panel — typed-out coach with dim backdrop ───────────
+    // Visual vocabulary borrowed from the tutorial overlay so it reads as
+    // "instructor talking to you" rather than a passive sidebar:
+    //   • full-screen dim backdrop (slightly less than the tutorial so the
+    //     bridge is still visible — the lesson is teaching about it)
+    //   • centered wooden card with a robot avatar
+    //   • title + explanation type out at ~60 chars/sec with a blinking caret
+    //   • CLICK or press the button to fast-forward typing, click again to
+    //     build & advance
     function drawAiPanel() {
-        // Reset click targets every frame — rebuilt below if panel is open
         state.aiOptionRects = [];
         state.aiNextRect = null;
         if (!state.aiPanelOpen) return;
 
-        const panelW = Math.min(460, k.width() * 0.5);
-        const padX = 18;
-        const px = 10;
-        const py = 110;
+        const W = k.width();
+        const H = k.height();
+        const t = k.time();
+        const lesson = state.aiResult;
+        const hasSteps = lesson && Array.isArray(lesson.steps);
 
-        // Estimate how many wrapped lines of text fit in `width` and the
-        // total pixel height that takes. PatrickHand averages ~5.8 px per
-        // character at the sizes we use; lineHeight = fontSize + lineSpacing.
+        // Dim backdrop
+        k.drawRect({ pos: k.vec2(0, 0), width: W, height: H, color: colorOf("#010101"), opacity: 0.32, anchor: "topleft" });
+
+        // Panel sized for legibility — fixed wide card centered horizontally,
+        // anchored a bit above bottom so the spotlit members below stay visible.
+        const panelW = Math.min(560, W * 0.62);
+        const padX = 22;
+        const padY = 18;
+
         const estLines = (text, width) => {
             const cpl = Math.max(8, Math.floor((width - 4) / 5.8));
             return Math.max(1, Math.ceil((text || "").length / cpl));
@@ -5627,151 +5918,155 @@ export function gameScene(k, { levelIdx }) {
         const estHeight = (text, size, lineSpacing, width) =>
             estLines(text, width) * (size + lineSpacing);
 
-        // Compute panel height based on actual content length so long AI
-        // questions/options/explanations don't get clipped.
-        const lesson = state.aiResult;
-        const hasSteps = lesson && Array.isArray(lesson.steps);
-        let panelH = 170;
-        // Per-step layout cache so the draw passes below can reuse the heights
-        // we computed for sizing.
-        let layout = null;
-
-        if (hasSteps) {
-            const step = lesson.steps[state.aiStepIdx];
-            if (state.aiPhase === "question" && step) {
-                const qW = panelW - padX * 2;
-                const qH = estHeight(step.question, 17, 4, qW);
-                const optTextW = panelW - padX * 2 - 48;
-                const optHs = step.options.map(o => Math.max(36, estHeight(o, 16, 3, optTextW) + 18));
-                const optsTotal = optHs.reduce((a, b) => a + b, 0) + Math.max(0, optHs.length - 1) * 8;
-                // header(12) + concept/step row(22) + gap(20) + question + gap + options + bottom pad
-                panelH = 12 + 22 + 20 + qH + 12 + optsTotal + 18;
-                layout = { qH, optHs, optsTotal };
-            } else if (state.aiPhase === "feedback" && step) {
-                const w = panelW - padX * 2;
-                const pickedLabel = `${String.fromCharCode(65 + state.aiChoiceIdx)}: ${step.options[state.aiChoiceIdx] || ""}`;
-                const pickedH = estHeight(pickedLabel, 15, 3, w);
-                const explanation = state.aiChoiceIdx === step.correct ? (step.explainCorrect || "") : (step.explainWrong || "");
-                const explH = estHeight(explanation, 16, 4, w);
-                // header + banner + picked + explanation + button + paddings
-                panelH = 12 + 22 + 22 + 16 + pickedH + 16 + explH + 56;
-                layout = { pickedH, explH };
-            } else if (state.aiPhase === "done") {
-                const w = panelW - padX * 2;
-                const sumH = estHeight(lesson.summary || "", 16, 4, w);
-                panelH = 12 + 22 + 22 + 16 + sumH + 56;
-                layout = { sumH };
-            }
-        } else if (state.aiResult?.error) {
-            panelH = 12 + 24 + estHeight(state.aiResult.error, 16, 3, panelW - padX * 2) + 24;
-        } else if (state.aiResult?.explanation) {
-            panelH = 12 + 24 + 24 + estHeight(state.aiResult.explanation, 16, 4, panelW - padX * 2) + 20;
-        }
-
-        // Sticky-note background with tape strip (match the HINT panel)
-        k.drawRect({ pos: k.vec2(px + 2, py + 2), width: panelW, height: panelH, color: colorOf("#000000"), opacity: 0.1, anchor: "topleft", radius: 2 });
-        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: colorOf("#fff9c4"), anchor: "topleft", radius: 1 });
-        k.drawRect({ pos: k.vec2(px + panelW / 2 - 20, py - 5), width: 40, height: 12, color: colorOf(C.tape), anchor: "topleft", opacity: 0.55 });
-
-        k.drawText({ text: "AI TUTOR", pos: k.vec2(px + padX, py + 12), size: 10, font: "PressStart2P", color: colorOf(C.markerBlue) });
+        let panelH = 180;
+        let titleH = 0, explH = 0;
 
         if (state.aiLoading) {
-            k.drawText({ text: "Thinking...", pos: k.vec2(px + padX, py + 44), size: 18, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.6 });
+            panelH = 130;
+        } else if (hasSteps) {
+            const step = lesson.steps[state.aiStepIdx];
+            const innerW = panelW - padX * 2 - 64; // 64 leaves room for robot avatar
+            if (state.aiPhase === "step" && step) {
+                titleH = estHeight(step.title || "Step", 22, 4, innerW);
+                explH  = estHeight(step.explanation || "", 18, 5, innerW);
+                panelH = padY + 38 + titleH + 10 + explH + 60 + padY;
+            } else if (state.aiPhase === "done") {
+                const sumH = estHeight(lesson.summary || "", 18, 5, innerW);
+                panelH = padY + 38 + 28 + sumH + 60 + padY;
+            }
+        } else if (state.aiResult?.error) {
+            panelH = padY + 38 + estHeight(state.aiResult.error, 18, 5, panelW - padX * 2) + padY + 12;
+        } else if (state.aiResult?.explanation) {
+            panelH = padY + 38 + 28 + estHeight(state.aiResult.explanation, 18, 5, panelW - padX * 2) + padY + 12;
+        }
+
+        const px = Math.round((W - panelW) / 2);
+        // Position toward the top so the bridge area below stays visible.
+        const py = 60;
+
+        // ── Wooden-card frame (matches modal/leaderboard styling) ──
+        k.drawRect({ pos: k.vec2(px + 4, py + 6), width: panelW, height: panelH, color: colorOf("#000000"), opacity: 0.4, anchor: "topleft", radius: 6 });
+        k.drawRect({ pos: k.vec2(px - 3, py - 3), width: panelW + 6, height: panelH + 6, color: colorOf("#5a3210"), anchor: "topleft", radius: 6 });
+        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: colorOf("#fff5d0"), anchor: "topleft", radius: 5 });
+        // Top gold highlight
+        k.drawRect({ pos: k.vec2(px + 8, py + 6), width: panelW - 16, height: 4, color: colorOf("#ffe9a8"), opacity: 0.5, anchor: "topleft", radius: 2 });
+        // Tape strip
+        k.drawRect({ pos: k.vec2(px + panelW / 2 - 28, py - 8), width: 56, height: 14, color: colorOf(C.tape), anchor: "topleft", opacity: 0.65 });
+
+        // Robot avatar bobbing in the corner — gives the panel a "coach" feel
+        const avX = px + 32;
+        const avY = py + 36 + Math.sin(t * 2.4) * 2;
+        // Soft glow behind the avatar (so it pops against the cream)
+        k.drawCircle({ pos: k.vec2(avX, avY + 2), radius: 19, color: colorOf(C.markerBlue), opacity: 0.18 });
+        drawRobotIcon(avX, avY, C.markerBlue);
+
+        // Header — "AI HELPER" + step counter
+        k.drawText({ text: "AI HELPER", pos: k.vec2(px + padX + 50, py + padY), size: 11, font: "PressStart2P", color: colorOf(C.markerBlue) });
+        if (hasSteps) {
+            const totalSteps = lesson.steps.length;
+            k.drawText({
+                text: `Step ${Math.min(state.aiStepIdx + 1, totalSteps)} / ${totalSteps}`,
+                pos: k.vec2(px + panelW - padX, py + padY),
+                size: 11, font: "PressStart2P", color: colorOf(C.pencil), opacity: 0.55, anchor: "topright",
+            });
+        }
+
+        // Loading state — typing dots
+        if (state.aiLoading) {
+            const dots = ".".repeat(1 + (Math.floor(t * 3) % 3));
+            k.drawText({
+                text: "Thinking" + dots,
+                pos: k.vec2(px + padX + 50, py + padY + 32),
+                size: 22, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.7,
+            });
             return;
         }
 
         if (state.aiResult?.error) {
-            k.drawText({ text: state.aiResult.error, pos: k.vec2(px + padX, py + 44), size: 16, font: "PatrickHand", color: colorOf(C.danger), width: panelW - padX * 2, lineSpacing: 3 });
+            k.drawText({ text: state.aiResult.error, pos: k.vec2(px + padX + 50, py + padY + 32), size: 18, font: "PatrickHand", color: colorOf(C.danger), width: panelW - padX * 2 - 50, lineSpacing: 4 });
             return;
         }
 
-        // Fallback: level-not-beaten tip
         if (!hasSteps && state.aiResult?.explanation) {
             if (state.aiResult.concept) {
-                k.drawText({ text: `Concept: ${state.aiResult.concept}`, pos: k.vec2(px + padX, py + 38), size: 16, font: "PatrickHand", color: colorOf(C.markerGreen) });
+                k.drawText({ text: state.aiResult.concept, pos: k.vec2(px + padX + 50, py + padY + 28), size: 18, font: "PatrickHand", color: colorOf(C.markerGreen) });
             }
-            k.drawText({ text: state.aiResult.explanation, pos: k.vec2(px + padX, py + 62), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            k.drawText({ text: state.aiResult.explanation, pos: k.vec2(px + padX + 50, py + padY + 56), size: 18, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2 - 50, lineSpacing: 5 });
             return;
         }
 
         if (!hasSteps) {
             const beaten = getCompleted().includes(levelIdx);
-            const tip = beaten
-                ? "Click the AI button to start an\ninteractive lesson!"
-                : "Beat this level first to unlock\nthe AI tutor!";
-            k.drawText({ text: tip, pos: k.vec2(px + padX, py + 44), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4, opacity: 0.5 });
+            const tip = beaten ? "Click the AI button to start." : "Beat this level first to unlock the AI helper!";
+            k.drawText({ text: tip, pos: k.vec2(px + padX + 50, py + padY + 32), size: 18, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.6, width: panelW - padX * 2 - 50, lineSpacing: 4 });
             return;
         }
 
-        // ── Lesson UI ──
         const step = lesson.steps[state.aiStepIdx];
-        const totalSteps = lesson.steps.length;
 
-        if (lesson.concept) {
-            k.drawText({ text: lesson.concept, pos: k.vec2(px + padX, py + 34), size: 16, font: "PatrickHand", color: colorOf(C.markerGreen) });
-        }
-        k.drawText({
-            text: `Step ${Math.min(state.aiStepIdx + 1, totalSteps)} / ${totalSteps}`,
-            pos: k.vec2(px + panelW - padX, py + 34),
-            size: 14, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.6, anchor: "topright",
-        });
+        if (state.aiPhase === "step" && step) {
+            const titleStr = step.title || "Step";
+            const explStr  = step.explanation || "";
 
-        if (state.aiPhase === "question" && step) {
-            // Question text — top of the body region, just under the header row.
-            const questionY = py + 12 + 22 + 20;
-            k.drawText({ text: step.question, pos: k.vec2(px + padX, questionY), size: 17, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            const innerX = px + padX + 50;
+            const innerW = panelW - padX * 2 - 60;
 
-            // Options stacked under the question, each sized to its own text.
-            let optY = questionY + layout.qH + 12;
-            for (let i = 0; i < step.options.length; i++) {
-                const optHi = layout.optHs[i];
-                const rect = { x: px + padX, y: optY, w: panelW - padX * 2, h: optHi };
-                state.aiOptionRects.push(rect);
-                k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, color: colorOf("#fffdea"), anchor: "topleft", radius: 2 });
-                k.drawRect({ pos: k.vec2(rect.x, rect.y), width: rect.w, height: rect.h, fill: false, outline: { width: 1.5, color: colorOf(C.markerBlue) }, anchor: "topleft", radius: 2, opacity: 0.7 });
-                k.drawText({ text: String.fromCharCode(65 + i), pos: k.vec2(rect.x + 12, rect.y + rect.h / 2), size: 14, font: "PressStart2P", color: colorOf(C.markerBlue), anchor: "left" });
-                k.drawText({ text: step.options[i], pos: k.vec2(rect.x + 40, rect.y + rect.h / 2), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: rect.w - 50, anchor: "left", lineSpacing: 3 });
-                optY += optHi + 8;
-            }
-            return;
-        }
+            // Title — chunky marker-blue with a hand-written feel
+            const titleY = py + padY + 28;
+            k.drawText({ text: titleStr, pos: k.vec2(innerX, titleY), size: 22, font: "PatrickHand", color: colorOf(C.markerBlue), width: innerW, lineSpacing: 4 });
 
-        if (state.aiPhase === "feedback" && step) {
-            const correct = state.aiChoiceIdx === step.correct;
-            const bannerColor = correct ? C.markerGreen : C.markerRed;
+            // Gold highlight underline beneath the title — focal cue
+            const titleStrW = Math.min(innerW, titleStr.length * 11);
+            k.drawRect({
+                pos: k.vec2(innerX, titleY + titleH + 1),
+                width: titleStrW,
+                height: 3,
+                color: colorOf("#ffd479"),
+                opacity: 0.85,
+                anchor: "topleft", radius: 1,
+            });
 
-            const bannerY = py + 12 + 22 + 22;
-            k.drawText({ text: correct ? "RIGHT!" : "NOT QUITE", pos: k.vec2(px + padX, bannerY), size: 12, font: "PressStart2P", color: colorOf(bannerColor) });
+            // Explanation — bigger, more readable than before
+            const explY = titleY + titleH + 14;
+            k.drawText({ text: explStr, pos: k.vec2(innerX, explY), size: 18, font: "PatrickHand", color: colorOf(C.pencil), width: innerW, lineSpacing: 5 });
 
-            const pickedLabel = `${String.fromCharCode(65 + state.aiChoiceIdx)}: ${step.options[state.aiChoiceIdx]}`;
-            const pickedY = bannerY + 24;
-            k.drawText({ text: pickedLabel, pos: k.vec2(px + padX, pickedY), size: 15, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.7, width: panelW - padX * 2, lineSpacing: 3 });
-
-            const explanation = correct ? (step.explainCorrect || "") : (step.explainWrong || "");
-            const explY = pickedY + layout.pickedH + 12;
-            k.drawText({ text: explanation, pos: k.vec2(px + padX, explY), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
-
-            const btnW = 160, btnH = 32;
+            // Build button with a soft pulsing halo
+            const btnW = 180, btnH = 36;
             const btnX = px + panelW - btnW - padX;
-            const btnY = py + panelH - btnH - 12;
+            const btnY = py + panelH - btnH - padY;
             state.aiNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
             const isLast = state.aiStepIdx === lesson.steps.length - 1;
-            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: colorOf(C.markerBlue), anchor: "topleft", radius: 3 });
-            k.drawText({ text: isLast ? "Build & Finish!" : "Build & Next", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2), size: 11, font: "PressStart2P", color: colorOf("#ffffff"), anchor: "center" });
+            const btnPulse = 0.5 + 0.5 * Math.sin(t * 4);
+            k.drawRect({
+                pos: k.vec2(btnX - 4, btnY - 4),
+                width: btnW + 8, height: btnH + 8,
+                color: colorOf(C.markerBlue),
+                opacity: 0.18 + 0.22 * btnPulse,
+                anchor: "topleft", radius: 6,
+            });
+            k.drawRect({ pos: k.vec2(btnX + 1, btnY + 2), width: btnW, height: btnH, color: colorOf("#000000"), opacity: 0.3, anchor: "topleft", radius: 4 });
+            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: colorOf(C.markerBlue), anchor: "topleft", radius: 4 });
+            const btnLabel = isLast ? "Build & Finish!" : "Build & Next";
+            k.drawText({ text: btnLabel, pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2 + 1), size: 12, font: "PressStart2P", color: colorOf("#ffffff"), anchor: "center" });
             return;
         }
 
         if (state.aiPhase === "done") {
-            const bannerY = py + 12 + 22 + 22;
-            k.drawText({ text: "LESSON COMPLETE!", pos: k.vec2(px + padX, bannerY), size: 12, font: "PressStart2P", color: colorOf(C.markerGreen) });
-            k.drawText({ text: lesson.summary || "Great work — hit PLAY to see the bridge in action.", pos: k.vec2(px + padX, bannerY + 28), size: 16, font: "PatrickHand", color: colorOf(C.pencil), width: panelW - padX * 2, lineSpacing: 4 });
+            const innerX = px + padX + 50;
+            const innerW = panelW - padX * 2 - 60;
+            const bannerY = py + padY + 28;
+            k.drawText({ text: "LESSON COMPLETE", pos: k.vec2(innerX, bannerY), size: 13, font: "PressStart2P", color: colorOf(C.markerGreen) });
+            k.drawText({ text: lesson.summary || "Great work — hit PLAY to see the bridge in action.", pos: k.vec2(innerX, bannerY + 32), size: 18, font: "PatrickHand", color: colorOf(C.pencil), width: innerW, lineSpacing: 5 });
 
-            const btnW = 100, btnH = 30;
+            const btnW = 130, btnH = 34;
             const btnX = px + panelW - btnW - padX;
-            const btnY = py + panelH - btnH - 12;
+            const btnY = py + panelH - btnH - padY;
             state.aiNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
-            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: colorOf(C.markerGreen), anchor: "topleft", radius: 3 });
-            k.drawText({ text: "Close", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2), size: 11, font: "PressStart2P", color: colorOf("#ffffff"), anchor: "center" });
+            const pulse = 0.5 + 0.5 * Math.sin(t * 3.5);
+            k.drawRect({ pos: k.vec2(btnX - 4, btnY - 4), width: btnW + 8, height: btnH + 8, color: colorOf(C.markerGreen), opacity: 0.18 + 0.22 * pulse, anchor: "topleft", radius: 6 });
+            k.drawRect({ pos: k.vec2(btnX + 1, btnY + 2), width: btnW, height: btnH, color: colorOf("#000000"), opacity: 0.3, anchor: "topleft", radius: 4 });
+            k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: colorOf(C.markerGreen), anchor: "topleft", radius: 4 });
+            k.drawText({ text: "Close", pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2 + 1), size: 13, font: "PressStart2P", color: colorOf("#ffffff"), anchor: "center" });
         }
     }
 
@@ -5796,19 +6091,28 @@ export function gameScene(k, { levelIdx }) {
         const isWin = state.modal.win === true;
         const hasLeaderboard = isWin;
 
-        // Wider, taller card so the leaderboard has room for top 5 + user.
-        const mw = Math.min(720, W * 0.88);
-        const mh = hasLeaderboard ? 440 : 300;
+        // Wider, taller card on win (leaderboard takes the right side);
+        // compact on fail — title + 3 icons in 4 planks. Win was running
+        // a bit too tall and leaving empty space inside the leaderboard;
+        // 360 fits 6 rows (top 5 + you) snugly.
+        const mw = hasLeaderboard ? Math.min(720, W * 0.88) : 380;
+        const mh = hasLeaderboard ? 360 : 160;
         const mx = W / 2, my = H / 2;
         const hh = mh / 2;
 
         // Inner padding from the card's edge.
         const padX = 28;
         const padTop = 22;
-        const padBot = 26;
+        // Per-modal bottom padding. Win uses a generous gap so the icons
+        // sit higher (vertically pulled up off the bottom edge); fail
+        // tightens to push icons into the last plank.
+        const padBot = hasLeaderboard ? 50 : 12;
 
-        // Title centered along the top.
-        const titleY = -hh + padTop + 12;
+        // Title — centered vertically on the top plank for both modals.
+        // Plank height is mh / boardCount (5 boards on win, 4 on fail).
+        const boardCount = hasLeaderboard ? 5 : 4;
+        const boardH = mh / boardCount;
+        const titleY = -hh + boardH / 2;
 
         // Two columns when win; single centered column otherwise.
         const colGap = 24;
@@ -5863,12 +6167,13 @@ export function gameScene(k, { levelIdx }) {
         const L = getModalLayout();
         const { mx, my, mw, mh, hh, beaten, isWin, hasLeaderboard } = L;
 
-        // Soft layered drop shadow
+        // Soft layered drop shadow — minimal radius so it tracks the
+        // near-square corners of the plank stack.
         for (let s = 1; s <= 4; s++) {
             k.drawRect({
                 pos: k.vec2(mx + s, my + s + 1),
                 width: mw + s, height: mh + s,
-                color: cFn("#000000"), anchor: "center", opacity: 0.07, radius: 6,
+                color: cFn("#000000"), anchor: "center", opacity: 0.07, radius: 2,
             });
         }
 
@@ -5878,14 +6183,18 @@ export function gameScene(k, { levelIdx }) {
         const cardBot = my + hh;
 
         // ── Wooden boards body ──
-        // The modal is composed of horizontal planks stacked vertically with
-        // dark seam lines between them, so it reads as a real wooden sign
-        // rather than a flat painted rectangle. Each plank gets its own
-        // subtle grain pattern, drift offset, and (occasionally) a knot.
-        const boardCount = 5;
+        // Horizontal planks stacked vertically with dark seam lines between
+        // them. Corners stay nearly square (radius 2) so the modal reads as
+        // a stack of cut boards, not a rounded rectangle. Grain runs the
+        // full width so each plank looks like a single piece of timber.
+        // Fail uses one fewer plank so the planks themselves don't shrink.
+        const boardCount = isWin ? 5 : 4;
         const boardH = mh / boardCount;
-        // Slight palette variation per board so they don't look identical.
         const boardTints = ["#d37e3d", "#cf7833", "#d68040", "#cb7531", "#d57e3a"];
+        // Cracks for fail modals — deterministic per modal so they don't
+        // animate. Each crack is a list of (x, y) jitter offsets along a
+        // vertical run that crosses one plank.
+        const showCracks = !isWin;
         for (let i = 0; i < boardCount; i++) {
             const by = cardTop + i * boardH;
             const tint = boardTints[i % boardTints.length];
@@ -5906,19 +6215,21 @@ export function gameScene(k, { levelIdx }) {
                     color: cFn("#3a2110"), opacity: 0.55, anchor: "topleft",
                 });
             }
-            // Wood grain — horizontal streaks at offset rows so adjacent
-            // boards have visibly different grain patterns.
+            // Wood grain — drawn as thin full-width rects rather than lines
+            // so the streaks reach exactly to the modal's edges (1px lines
+            // were tapering off under anti-aliasing).
             const grainOff = (i * 5) % 11;
             for (let g = 0; g < 4; g++) {
                 const gy = by + 8 + g * 16 + grainOff;
                 if (gy > by + boardH - 6) break;
-                k.drawLine({
-                    p1: k.vec2(cardLeft + 12, gy),
-                    p2: k.vec2(cardRight - 12, gy + 1),
-                    width: 0.6, color: cFn("#8e4924"), opacity: 0.16,
+                k.drawRect({
+                    pos: k.vec2(cardLeft, gy),
+                    width: mw, height: 0.9,
+                    color: cFn("#8e4924"), opacity: 0.22,
+                    anchor: "topleft",
                 });
             }
-            // A knot every other plank, alternating sides.
+            // Knots — every other plank, alternating sides.
             if (i === 1 || i === 3) {
                 const knotX = i === 1 ? cardLeft + mw * 0.18 : cardRight - mw * 0.22;
                 const knotY = by + boardH * 0.5;
@@ -5930,21 +6241,112 @@ export function gameScene(k, { levelIdx }) {
                     opacity: 0.5,
                 });
             }
+            // Random scars + nail holes on every modal. Deterministic from
+            // a seed (m.openTime) so they stay put while the modal is up,
+            // but vary between sessions / wins / fails. More visible than
+            // the previous "subtle" pass — the user wanted them to read.
+            {
+                const seed = ((m.openTime || 1) * 1000 | 0) ^ (i * 0x9E3779B1) ^ (isWin ? 0xA17 : 0xB42);
+                let s = seed >>> 0 || 1;
+                const rand = () => {
+                    s = (s * 1664525 + 1013904223) >>> 0;
+                    return s / 0xFFFFFFFF;
+                };
+                // Scars — 1 to 3 per plank, varying length and position.
+                const scarCount = 1 + Math.floor(rand() * 3);
+                for (let sc = 0; sc < scarCount; sc++) {
+                    const scarX = cardLeft + mw * (0.05 + rand() * 0.85);
+                    const scarLen = 14 + rand() * 38;
+                    const scarY = by + boardH * (0.18 + rand() * 0.7);
+                    const tilt = (rand() - 0.5) * 1.5;
+                    k.drawLine({
+                        p1: k.vec2(scarX, scarY),
+                        p2: k.vec2(scarX + scarLen, scarY + tilt),
+                        width: 1.2, color: cFn("#3a2110"), opacity: 0.6 + rand() * 0.2,
+                    });
+                    // Lighter inner edge for depth
+                    k.drawLine({
+                        p1: k.vec2(scarX, scarY + 1.3),
+                        p2: k.vec2(scarX + scarLen * (0.4 + rand() * 0.5), scarY + 1.3 + tilt * 0.7),
+                        width: 0.7, color: cFn("#5e351a"), opacity: 0.45,
+                    });
+                }
+                // Nail holes — 1 to 3 per plank, scattered.
+                const nailCount = 1 + Math.floor(rand() * 3);
+                for (let n = 0; n < nailCount; n++) {
+                    const nx = cardLeft + mw * (0.05 + rand() * 0.9);
+                    const ny = by + boardH * (0.2 + rand() * 0.6);
+                    const nr = 1.6 + rand() * 1.0;
+                    // Outer ring (slight bevel)
+                    k.drawCircle({ pos: k.vec2(nx, ny), radius: nr + 0.6, color: cFn("#7d4519"), opacity: 0.55 });
+                    // Hole — dark center
+                    k.drawCircle({ pos: k.vec2(nx, ny), radius: nr, color: cFn("#1a0e05"), opacity: 0.78 });
+                    // Tiny inner highlight on one side, sells the depth
+                    k.drawCircle({ pos: k.vec2(nx - nr * 0.35, ny - nr * 0.35), radius: nr * 0.35, color: cFn("#5e351a"), opacity: 0.5 });
+                }
+            }
+
+            // Fail-state damage — splintered chips along the bottom seam
+            // and a jagged crack snaking across one plank. Deterministic
+            // per board so it's stable while the modal is up.
+            if (showCracks && (i === 0 || i === 2)) {
+                // Splinters poking down from the bottom seam — small dark
+                // triangles that look like wood chipping off.
+                const splintCount = 4;
+                for (let s = 0; s < splintCount; s++) {
+                    const sx = cardLeft + mw * (0.18 + s * 0.22) + Math.sin(i * 9.7 + s * 3.1) * 8;
+                    const sy = by + boardH - 2;
+                    const sw = 4 + Math.sin(i * 4.3 + s * 7.1) * 1.5;
+                    const sh = 4 + Math.sin(i * 6.9 + s * 2.3) * 1.8;
+                    k.drawTriangle({
+                        p1: k.vec2(sx - sw, sy),
+                        p2: k.vec2(sx + sw, sy),
+                        p3: k.vec2(sx + Math.sin(s * 5.3) * 2, sy + sh),
+                        color: cFn("#3a2110"), opacity: 0.6,
+                    });
+                }
+            }
+            if (showCracks && i === 1) {
+                // A jagged crack zigzagging vertically across this plank.
+                const crackTop = by + 4;
+                const crackBot = by + boardH - 4;
+                const baseX = cardLeft + mw * 0.62;
+                const segs = 7;
+                let prevX = baseX, prevY = crackTop;
+                for (let s = 1; s <= segs; s++) {
+                    const t = s / segs;
+                    // Pseudo-random jitter, deterministic on segment index.
+                    const jx = baseX + Math.sin(s * 12.91) * 7;
+                    const jy = crackTop + (crackBot - crackTop) * t;
+                    k.drawLine({
+                        p1: k.vec2(prevX, prevY), p2: k.vec2(jx, jy),
+                        width: 1.6, color: cFn("#1a0e05"), opacity: 0.78,
+                    });
+                    // Subtle inner highlight, half-width, makes the crack
+                    // read as having depth instead of being a flat line.
+                    k.drawLine({
+                        p1: k.vec2(prevX + 0.6, prevY), p2: k.vec2(jx + 0.6, jy),
+                        width: 0.6, color: cFn("#8e4924"), opacity: 0.5,
+                    });
+                    prevX = jx; prevY = jy;
+                }
+            }
         }
-        // Outer outline that wraps the whole card (planks share this).
+        // Outer outline — square-ish corners to match the plank stack.
         k.drawRect({
             pos: k.vec2(mx, my), width: mw, height: mh,
             fill: false, outline: { width: 1.6, color: cFn("#3a2110") },
-            anchor: "center", radius: 6, opacity: 0.7,
+            anchor: "center", radius: 2, opacity: 0.75,
         });
 
-        // ── Title — pixel font, marker-style coloring ──
-        // openTime drives a bounce-in scale + a left-to-right underline draw.
+        // ── Title ──
+        // Win: green title with green underline (success cue).
+        // Fail: title carved into the wood — dark fill + faint cream
+        // highlight just below the strokes for a chiseled look. The red
+        // marker color clashed with the wooden body.
         const elapsed0 = m.openTime != null ? Math.max(0, k.time() - m.openTime) : 2;
-        const titleColor = isWin ? C.markerGreen : C.markerRed;
         const titleY = my + L.titleY;
         const titleSz = 18;
-        // easeOutBack — overshoots slightly for a satisfying pop.
         const easeBack = (x) => {
             if (x >= 1) return 1;
             const c1 = 1.7, c3 = c1 + 1;
@@ -5953,60 +6355,213 @@ export function gameScene(k, { levelIdx }) {
         const titleAnimDur = 0.35;
         const titleT = Math.min(1, elapsed0 / titleAnimDur);
         const titleScale = Math.max(0, easeBack(titleT));
-        // Idle hover: gentle vertical bob once settled.
         const titleBob = titleT >= 1 ? Math.sin(k.time() * 1.4) * 0.6 : 0;
+
+        // ── Hot-iron branding ─────────────────────────────────
+        // Both win and fail use the same brand-and-cool animation: the
+        // title pretends to be branded into the wood with a glowing iron
+        // rod, then cools down to its final color. Win cools to bright
+        // green (success cue); fail cools to dark carved brown.
+        const lerpHex = (a, b, t) => {
+            const ar = parseInt(a.slice(1, 3), 16), ag = parseInt(a.slice(3, 5), 16), ab = parseInt(a.slice(5, 7), 16);
+            const br = parseInt(b.slice(1, 3), 16), bg = parseInt(b.slice(3, 5), 16), bb = parseInt(b.slice(5, 7), 16);
+            const r = Math.round(ar + (br - ar) * t);
+            const g = Math.round(ag + (bg - ag) * t);
+            const bl = Math.round(ab + (bb - ab) * t);
+            return "#" + [r, g, bl].map(c => c.toString(16).padStart(2, "0")).join("");
+        };
+        const burnDur = 1.6;
+        const burnT = Math.min(1, elapsed0 / burnDur);
+        // Color stops: shared red-hot start, both modals cool to the same
+        // carved brown — the wood absorbs the heat the same way regardless
+        // of whether you won or lost. The green title was reading as
+        // disconnected from the wooden theme.
+        const STOPS = ["#e60a0a", "#b81a0c", "#7a2510", "#3a2110"];
+        let burnColor;
+        if (burnT < 0.35) {
+            burnColor = lerpHex(STOPS[0], STOPS[1], burnT / 0.35);
+        } else if (burnT < 0.70) {
+            burnColor = lerpHex(STOPS[1], STOPS[2], (burnT - 0.35) / 0.35);
+        } else {
+            burnColor = lerpHex(STOPS[2], STOPS[3], (burnT - 0.70) / 0.30);
+        }
+        // Subtle flicker while still hot.
+        const flicker = burnT < 0.45 ? Math.sin(k.time() * 28) * 0.06 : 0;
+
         k.pushTransform();
         k.pushTranslate(mx, titleY + titleBob);
         k.pushScale(titleScale, titleScale);
-        k.drawText({ text: m.title, pos: k.vec2(2, 2), size: titleSz, font: "PressStart2P", color: cFn("#1a0e05"), anchor: "center", opacity: 0.40 });
-        k.drawText({ text: m.title, pos: k.vec2(0, 0), size: titleSz, font: "PressStart2P", color: cFn(titleColor), anchor: "center" });
-        k.popTransform();
-        // Underline — strokes in left-to-right after the title settles.
-        const underlineW = m.title.length * (titleSz * 0.75);
-        const underlineT = Math.max(0, Math.min(1, (elapsed0 - 0.25) / 0.35));
-        if (underlineT > 0) {
-            k.drawLine({
-                p1: k.vec2(mx - underlineW / 2, titleY + titleSz + titleBob),
-                p2: k.vec2(mx - underlineW / 2 + underlineW * underlineT, titleY + titleSz + 1 + titleBob),
-                width: 2.5, color: cFn(titleColor), opacity: 0.85,
+
+        // Hot glow behind the text — fades out as it cools. Uses orange
+        // tones regardless of final color; that's the iron radiating heat,
+        // independent of what color the brand cools to.
+        const glowOpacity = Math.max(0, 1 - burnT * 1.4);
+        if (glowOpacity > 0.02) {
+            for (let p = 0; p < 4; p++) {
+                const oc = lerpHex("#ff7a14", "#ffd166", p / 3);
+                k.drawText({
+                    text: m.title, pos: k.vec2(0, 0),
+                    size: titleSz + p * 1.3, font: "PressStart2P",
+                    color: cFn(oc), anchor: "center",
+                    opacity: glowOpacity * (0.18 - p * 0.025),
+                });
+            }
+        }
+        // Carved cream highlight (the routed-out edge of the brand) fades
+        // in as the iron cools — gives both win and fail engravings the
+        // same finished look at the end of the animation.
+        const carvedHighlightOp = Math.max(0, Math.min(1, (burnT - 0.55) / 0.40)) * 0.45;
+        if (carvedHighlightOp > 0.01) {
+            k.drawText({
+                text: m.title, pos: k.vec2(1, 2),
+                size: titleSz, font: "PressStart2P",
+                color: cFn("#fff8e0"), opacity: carvedHighlightOp,
+                anchor: "center",
             });
         }
+        // Main letter face — lerped from hot to final.
+        k.drawText({
+            text: m.title, pos: k.vec2(0, 0),
+            size: titleSz, font: "PressStart2P",
+            color: cFn(burnColor),
+            opacity: 1 - flicker * 0.5,
+            anchor: "center",
+        });
+        k.popTransform();
 
-        // ── LEFT COLUMN: cost + grade (no description; dropped) ──
+        // ── Embers / sparks rising off the brand ─────────────────
+        // Deterministic per-ember cycle based on absolute time + a phase
+        // offset. Embers spawn at the title's lower edge, drift up + a
+        // touch sideways, and fade out. Emission intensity decays with
+        // burnT so the sparks die down as the iron cools. Fires for both
+        // win and fail — same hot-iron branding.
+        {
+            const titleW = m.title.length * (titleSz * 0.65);
+            const emberCount = 14;
+            const emitStrength = Math.max(0, 1 - burnT * 0.85);
+            if (emitStrength > 0.05) {
+                const t = k.time();
+                for (let e = 0; e < emberCount; e++) {
+                    const cycle = 0.55 + (e % 3) * 0.13;
+                    const seedPhase = (e * 0.713) % 1;
+                    const phase = ((t + seedPhase) % cycle) / cycle;     // 0 → 1 within cycle
+                    const xOffset = Math.sin(e * 17.31) * titleW * 0.5;
+                    const xDrift = Math.sin(e * 4.7 + phase * 6) * 4;
+                    const yRise  = -phase * 26;
+                    const ex = mx + xOffset + xDrift;
+                    const ey = titleY + titleBob + titleSz * 0.4 + yRise;
+                    // Color: bright yellow at spawn, fading to red, then transparent
+                    const colT = phase;
+                    let c = colT < 0.45
+                        ? "#fff1a0"             // hot bright spark
+                        : colT < 0.75 ? "#ff9a2a" : "#c43818";
+                    const op = (1 - phase) * 0.85 * emitStrength;
+                    const r = 1.4 + (1 - phase) * 1.5;
+                    k.drawCircle({ pos: k.vec2(ex, ey), radius: r, color: cFn(c), opacity: op });
+                    // Small bright core for the closest sparks
+                    if (phase < 0.4) {
+                        k.drawCircle({
+                            pos: k.vec2(ex, ey), radius: r * 0.5,
+                            color: cFn("#ffffff"), opacity: op * 0.85,
+                        });
+                    }
+                }
+                // Occasional puff — thicker, slower particles every few embers.
+                for (let p = 0; p < 4; p++) {
+                    const cycle = 1.2;
+                    const seedPhase = (p * 0.31) % 1;
+                    const t2 = k.time();
+                    const phase = ((t2 + seedPhase) % cycle) / cycle;
+                    const xOffset = Math.sin(p * 9.13) * titleW * 0.35;
+                    const yRise  = -phase * 36;
+                    const ex = mx + xOffset;
+                    const ey = titleY + titleBob + titleSz * 0.3 + yRise;
+                    const op = (1 - phase) * 0.4 * emitStrength;
+                    const r = 2.2 + phase * 2.5;
+                    k.drawCircle({ pos: k.vec2(ex, ey), radius: r, color: cFn("#888888"), opacity: op });
+                }
+            }
+        }
+
+        // ── Fail-modal subtitle ─────────────────────────────
+        // Short flavor line in the plank below the title — fades in just
+        // as the brand finishes cooling so it doesn't fight the burn.
+        // Same fake-bold trick (triple draw at 0.5px offsets) so the thin
+        // PatrickHand strokes read at icon scale.
+        if (!isWin && m.desc) {
+            const descT = Math.max(0, Math.min(1, (elapsed0 - 0.6) / 0.4));
+            const descScreenY = my + L.titleY + 38;
+            k.drawText({
+                text: m.desc, pos: k.vec2(mx + 1, descScreenY + 2),
+                size: 20, font: "PatrickHand",
+                color: cFn("#1a0e05"), opacity: 0.5 * descT,
+                anchor: "center", width: mw - 60, align: "center",
+            });
+            for (const ox of [-0.5, 0, 0.5]) {
+                k.drawText({
+                    text: m.desc, pos: k.vec2(mx + ox, descScreenY),
+                    size: 20, font: "PatrickHand",
+                    color: cFn("#fff8e0"), opacity: 0.95 * descT,
+                    anchor: "center", width: mw - 60, align: "center",
+                });
+            }
+        }
+
+        // ── LEFT COLUMN: cost + flavor line + grade ──
         const colTopY = my + L.colTopY;
         const leftCx = mx + (L.leftColCx || (L.leftColX + L.leftColW / 2));
-
-        // Cost — big readable number stacked above the grade medallion.
         const elapsed = m.openTime != null ? Math.max(0, k.time() - m.openTime) : 2;
+
         if (m.cost != null) {
             // Faint "COST" header in pixel font, then the value in a bigger
             // PressStart2P below it for a "stamped" look that matches the
             // wood theme.
             k.drawText({
                 text: "COST",
-                pos: k.vec2(leftCx, colTopY + 12),
+                pos: k.vec2(leftCx, colTopY + 8),
                 size: 9, font: "PressStart2P",
                 color: cFn("#fff8e0"), opacity: 0.65,
                 anchor: "center",
             });
             k.drawText({
                 text: `$${m.cost.toLocaleString()}`,
-                pos: k.vec2(leftCx + 2, colTopY + 36),
+                pos: k.vec2(leftCx + 2, colTopY + 32),
                 size: 16, font: "PressStart2P",
                 color: cFn("#1a0e05"), opacity: 0.40,
                 anchor: "center",
             });
             k.drawText({
                 text: `$${m.cost.toLocaleString()}`,
-                pos: k.vec2(leftCx, colTopY + 34),
+                pos: k.vec2(leftCx, colTopY + 30),
                 size: 16, font: "PressStart2P",
                 color: cFn("#fffce6"),
                 anchor: "center",
             });
         }
+        // Flavor subtitle between cost and grade — short message, fades in.
+        // Bolded by drawing the cream pass twice with a sub-pixel offset
+        // so the strokes thicken (PatrickHand is otherwise pretty thin).
+        if (isWin && m.desc) {
+            const subT = Math.max(0, Math.min(1, (elapsed - 0.4) / 0.4));
+            const subY = colTopY + 56;
+            k.drawText({
+                text: m.desc, pos: k.vec2(leftCx + 1, subY + 2),
+                size: 19, font: "PatrickHand",
+                color: cFn("#1a0e05"), opacity: 0.5 * subT,
+                anchor: "center", width: L.leftColW - 16, align: "center",
+            });
+            for (const ox of [-0.5, 0, 0.5]) {
+                k.drawText({
+                    text: m.desc, pos: k.vec2(leftCx + ox, subY),
+                    size: 19, font: "PatrickHand",
+                    color: cFn("#fff8e0"), opacity: 0.95 * subT,
+                    anchor: "center", width: L.leftColW - 16, align: "center",
+                });
+            }
+        }
         if (m.grade != null) {
-            // Grade medallion sits below the cost line, centered in the column.
-            drawGrade(leftCx, colTopY + 88, m.grade, elapsed);
+            // Grade medallion sits below the subtitle, centered in the column.
+            drawGrade(leftCx, colTopY + 102, m.grade, elapsed);
         }
 
         // ── RIGHT COLUMN: leaderboard panel (recessed inset) ──
@@ -6079,8 +6634,8 @@ export function gameScene(k, { levelIdx }) {
                 if (!userInTop5 && lb.userEntry && lb.userRank) {
                     rows.push({ ...lb.userEntry, _rank: lb.userRank, _separated: true });
                 }
-                const rowsStartY = headerY + (lb.isPB ? 52 : 40);
-                const rowH = 30;
+                const rowsStartY = headerY + (lb.isPB ? 44 : 36);
+                const rowH = 28;
                 const rowL = panelX + 14;
                 const rowR = panelX + panelW - 14;
                 const rowMidName = panelX + 44;
@@ -6292,16 +6847,17 @@ export function gameScene(k, { levelIdx }) {
         }
 
         // ── Bottom icon-button row ──
-        // Each action gets a wooden plate with an icon centered + a label
-        // below. Hover scales them up; the primary action (next-level / try
-        // again) draws with a green tint to anchor the eye.
+        // Just the icons — no plate, no label. Hover scales the icon up
+        // and brightens it; the primary action (next-level / try-again)
+        // is gold-tinted with a soft pulsing halo behind it so it reads
+        // as "click here" without needing a frame.
         const mpos = k.mousePos();
         const dt = k.dt() || 1 / 60;
         const ICONS = {
-            menu:   { fn: drawMenuIcon,    label: "MENU"      },
-            replay: { fn: (cx, cy, col) => drawCurvedArrow(cx, cy + 1, 11, Math.PI * 0.85, Math.PI * 2.85, col, 2.6), label: m.win ? "REPLAY" : "TRY AGAIN" },
-            ai:     { fn: drawRobotIcon,   label: "AI TUTOR"  },
-            next:   { fn: drawNextArrow,   label: "NEXT"      },
+            menu:   { fn: drawMenuIcon  },
+            replay: { fn: (cx, cy, col) => drawCurvedArrow(cx, cy + 1, 11, Math.PI * 0.85, Math.PI * 2.45, col, 2.6) },
+            ai:     { fn: drawRobotIcon },
+            next:   { fn: drawNextArrow },
         };
         const PRIMARY_KEY = isWin ? "next" : "replay";
 
@@ -6323,61 +6879,35 @@ export function gameScene(k, { levelIdx }) {
             const h = state.toolHover[hoverKey];
             const isPrimary = action === PRIMARY_KEY;
 
-            // Plate — primary uses a brighter wood + gold rim; others use
-            // toolbar-toned wood with a brown rim.
-            const plateColor = isPrimary ? "#e89c4a" : "#b86a2c";
-            const rimColor   = isPrimary ? "#3a2110" : "#3a2110";
-            const scale = (isPrimary ? 1.08 : 1) + h * 0.12;
+            // Primary gets a soft pulsing halo behind it — "look here".
+            if (isPrimary) {
+                const pulse = 0.65 + 0.35 * Math.sin(k.time() * 3);
+                const haloR = btn.w * 0.55 * (1 + h * 0.1);
+                k.drawCircle({
+                    pos: k.vec2(bx, by + 1), radius: haloR,
+                    color: cFn("#ffd479"),
+                    opacity: 0.22 * pulse,
+                });
+            }
+
+            // Bigger than the toolbar icons since there's no plate to
+            // compete with. Primary is gold to anchor the eye. Drawn
+            // twice — a dark shadow pass underneath, then the colored
+            // icon on top — for tactile depth on the wood.
+            const baseScale = isPrimary ? 1.55 : 1.45;
+            const scale = baseScale + h * 0.18;
+            const iconColor = isPrimary ? "#ffd479" : "#fff8e0";
+
+            k.pushTransform();
+            k.pushTranslate(bx + 1.5, by + 2.5);
+            k.pushScale(scale, scale);
+            meta.fn(0, 0, "#1a0e05");
+            k.popTransform();
 
             k.pushTransform();
             k.pushTranslate(bx, by);
             k.pushScale(scale, scale);
-
-            // Drop shadow
-            k.drawRect({
-                pos: k.vec2(1, 2), width: btn.w, height: btn.h,
-                color: cFn("#000000"), opacity: 0.32,
-                anchor: "center", radius: 6,
-            });
-            // Body
-            k.drawRect({
-                pos: k.vec2(0, 0), width: btn.w, height: btn.h,
-                color: cFn(plateColor), anchor: "center", radius: 6,
-            });
-            // Top highlight + bottom shadow
-            k.drawRect({
-                pos: k.vec2(-btn.w / 2, -btn.h / 2),
-                width: btn.w, height: 1.4,
-                color: cFn("#ffffff"), opacity: 0.28, anchor: "topleft",
-            });
-            k.drawRect({
-                pos: k.vec2(-btn.w / 2, btn.h / 2 - 3),
-                width: btn.w, height: 3,
-                color: cFn("#8e4924"), anchor: "topleft", opacity: 0.85,
-            });
-            // Outline
-            k.drawRect({
-                pos: k.vec2(0, 0), width: btn.w, height: btn.h,
-                fill: false, outline: { width: 1.4, color: cFn(rimColor) },
-                anchor: "center", radius: 6, opacity: 0.6,
-            });
-            // Gold rim for primary
-            if (isPrimary) {
-                k.drawRect({
-                    pos: k.vec2(0, 0), width: btn.w + 2, height: btn.h + 2,
-                    fill: false, outline: { width: 1.6, color: cFn("#ffd479") },
-                    anchor: "center", radius: 7, opacity: 0.55 + h * 0.45,
-                });
-            }
-            // Icon — centered, drawn in cream. No label; the icon is the
-            // button (Poly Bridge style), and the bigger plate makes the
-            // affordance unmissable on its own. Nested scale bumps the
-            // icon drawing up ~28% so it fills the larger plate.
-            k.pushTransform();
-            k.pushScale(1.28, 1.28);
-            meta.fn(0, 0, "#fff8e0");
-            k.popTransform();
-
+            meta.fn(0, 0, iconColor);
             k.popTransform();
         }
     }
