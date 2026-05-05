@@ -35,34 +35,18 @@ async function localAIRequest(payload) {
     return await res.json();
 }
 
-let _requestId = 0;
-function portalAIRequest(payload) {
-    return new Promise((resolve, reject) => {
-        const requestId = ++_requestId;
-
-        function handler(event) {
-            const d = event.data;
-            if (d?.source === "bridge-snap" && d?.requestId === requestId) {
-                window.removeEventListener("message", handler);
-                if (d.error) reject(new Error(d.error));
-                else resolve(d.payload);
-            }
-        }
-
-        window.addEventListener("message", handler);
-        window.parent.postMessage({
-            source: "bridge-snap",
-            type: "PORTAL_AI_REQUEST",
-            requestId,
-            payload,
-        }, "*");
-
-        // GPT-4o on long prompts can take a while; give the portal time to respond.
-        setTimeout(() => {
-            window.removeEventListener("message", handler);
-            reject(new Error("AI request timed out"));
-        }, 60000);
+async function portalAIRequest(payload) {
+    const res = await fetch("/api/ai/openai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
     });
+    if (!res.ok) {
+        let detail = "";
+        try { detail = (await res.json())?.error || ""; } catch {}
+        throw new Error(`Portal proxy ${res.status}${detail ? ": " + detail : ""}`);
+    }
+    return await res.json();
 }
 
 // ─── Prompt — TEACHING-MODE helper ────────────────────────
