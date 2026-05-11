@@ -195,52 +195,111 @@ function buildCoachPrompt(lvl, lvlDef, digest) {
     const vehicleMass = lvlDef.multiVehicle
         ? lvlDef.multiVehicle.map(mv => mv.vType).join(" + ")
         : lvlDef.vType;
-    const triangulationFact = digest.wellTriangulated
-        ? `WELL TRIANGULATED — ${digest.triangleCount} triangle(s) for ${digest.interiorDeckNodes} interior deck node(s). DO NOT suggest "add triangulation" — they already have it.`
-        : `UNDER TRIANGULATED — only ${digest.triangleCount} triangle(s) for ${digest.interiorDeckNodes} interior deck node(s). Triangulation is a valid focus.`;
-    const supportFact = digest.unsupportedDeckNodes === 0
-        ? `Every interior deck node has a structural beam attached — DO NOT suggest "add support under the deck", they have it.`
-        : `${digest.unsupportedDeckNodes} of ${digest.interiorDeckNodes} interior deck nodes have NO beam attached — those will sag.`;
-    const chordFact = `Top chord (above deck): ${digest.hasTopChord ? "PRESENT" : "absent"}. Bottom chord (below deck): ${digest.hasBottomChord ? "PRESENT" : "absent"}.`;
-    const floatingFact = digest.floatingStructuralMembers === 0
-        ? `All structural members trace back to a cliff anchor — no floating chains.`
-        : `${digest.floatingStructuralMembers} structural member(s) don't trace back to any anchor (a floating chain) — those don't carry real load.`;
 
-    return `You are a bridge-engineering coach reviewing a STUDENT's in-progress bridge. Be specific and grounded — NEVER recommend something they already have. The structural facts below were computed from their actual bridge, not just guessed.
+    // Build prioritized list of structural facts. Order matters — we want
+    // the most impactful issues at the top so the LLM addresses those first.
+    const facts = [];
+    const forbidden = [];
 
-## Level: "${lvlDef.name}"
-- Concept being taught: ${lvlDef.concept}
-- Vehicle(s) that will cross: ${vehicleMass}
-- Gap: ${lvl.gap} units, height drop: ${lvl.hDiff}
-- Budget: $${lvl.budget}
-- Recommended archetype for this level: ${digest.archetype}
-  (${slots.deck}; ${slots.primary}${slots.connectors ? "; " + slots.connectors : ""})
+    if (!digest.roadConnected) {
+        facts.push("CRITICAL: the road does not yet span from the left anchor to the right anchor — there's a gap somewhere in the deck. Vehicles can't cross.");
+    }
+    if (digest.mechanismDeficit > 0) {
+        facts.push(`CRITICAL: by Maxwell rigidity count, this structure has ${digest.mechanismDeficit} unconstrained mechanism mode(s) (it needs ${digest.mechanismDeficit} more bracing member(s) to be truly rigid). Under load it will deform without straining the beams — the road will take all the load and snap. Look for cells that are rectangles instead of triangles.`);
+    }
+    if (digest.floatingStructuralMembers > 0) {
+        facts.push(`${digest.floatingStructuralMembers} structural member(s) don't trace back to any cliff anchor through OTHER structural members (a floating chain) — those barely carry load.`);
+    }
+    if (digest.unsupportedDeckNodes > 0) {
+        facts.push(`${digest.unsupportedDeckNodes} of ${digest.interiorDeckNodes} interior deck nodes have NO beam attached — those will sag and crack the road around them.`);
+    } else if (digest.interiorDeckNodes > 0) {
+        forbidden.push("'add support under the deck' — every interior deck node already has a beam attached");
+    }
+    if (digest.wellTriangulated) {
+        forbidden.push(`'add triangulation' — they already have ${digest.triangleCount} triangle(s) for ${digest.interiorDeckNodes} interior deck node(s), which is well-triangulated`);
+    } else if (digest.triangleCount < digest.interiorDeckNodes / 2 && digest.interiorDeckNodes > 0) {
+        facts.push(`only ${digest.triangleCount} triangle(s) for ${digest.interiorDeckNodes} interior deck node(s) — under-triangulated. Adding diagonals to form triangles is a valid focus.`);
+    }
 
-## Student's current build — STRUCTURAL ANALYSIS
-- Members placed: ${digest.materialsUsed}
-- Total members: ${digest.memberCount} (${digest.nonRoadCount} structural)
-- Cost so far: $${digest.totalCost} of $${digest.budget}
-- Road continuity (left anchor → right anchor): ${digest.roadConnected ? "COMPLETE" : "INCOMPLETE — gap in the deck"}
-- Triangulation: ${triangulationFact}
-- Deck support: ${supportFact}
-- Chords: ${chordFact}
-- Anchorage: ${floatingFact}
+    // Level-specific compliance with the recommended archetype.
+    if (digest.hasMidPier && !digest.usesPier) {
+        facts.push("This level has a MID-GAP ROCK PIER that the student is ignoring. The intended design uses it as a vertical support point — without it, the gap is much too long for a single span.");
+    }
+    if (digest.hasHighTowers && !digest.usesHighAnchor) {
+        facts.push("This level has HIGH TOWER ANCHORS above each cliff that the student is ignoring. The intended design hangs the deck from those towers via cables — without using them, the design is missing the point of the level.");
+    }
+    if (digest.hasHighTowers && digest.usesHighAnchor && !digest.usesTension) {
+        facts.push("The student is using the high tower anchors but only with beams — the intended design uses ROPE/CABLE (tension members) since those are what suspension cables are in real life.");
+    }
 
-## What to DO and NOT DO
-- Read each fact above. If a fact says "DO NOT suggest X", do NOT suggest X. The bridge already has it.
-- Pick tips that address things the bridge IS missing or weak on. If everything looks good, say so honestly and offer one fine-tuning tip (cost optimization, material upgrade for heavy vehicle, etc.) — don't invent problems.
-- For a level where the recommended archetype is "truss" but the student built something else (e.g. floating-apex chain with no bottom chord), gently steer them toward the correct anatomy.
-- Reference the SPECIFIC counts/facts above ("you have 8 triangles for 4 interior deck nodes — solid") instead of generic advice.
+    if (digest.archetype === "beam_pier" && digest.hasMidPier && digest.usesPier && !digest.hasBottomChord) {
+        facts.push("The pier is used, but there's no bottom chord on either side — a two-span continuous truss puts a bottom chord on each half-span, anchored at the cliff AND at the pier.");
+    }
+    if (digest.archetype === "truss" && !digest.hasBottomChord && digest.interiorDeckNodes > 0) {
+        facts.push("The recommended design is a Pratt truss with a BOTTOM CHORD running below the deck anchor-to-anchor. The student has no bottom chord — they're missing the most important member of the truss.");
+    }
+    if (digest.archetype === "truss_above" && !digest.hasTopChord && digest.interiorDeckNodes > 0) {
+        facts.push("The recommended design is a through-truss with a TOP CHORD running above the deck. The student has no top chord.");
+    }
+    if (digest.archetype === "tied_arch" && !digest.hasTopChord) {
+        facts.push("The recommended design is a tied arch / bowstring truss: an arched member rising ABOVE the deck. The student doesn't have one yet.");
+    }
+    if (digest.archetype === "arch_deck" && !digest.hasBottomChord) {
+        facts.push("The recommended design is a deck arch: an arched member curving DOWN below the deck. The student doesn't have one yet.");
+    }
+    if (digest.archetype === "suspension" && !digest.usesTension) {
+        facts.push("The recommended design is a suspension bridge: a draped CABLE between the two towers, with hangers dropping down to the deck. The student isn't using rope/cable yet.");
+    }
+    if (digest.archetype === "cable_stayed" && !digest.usesTension) {
+        facts.push("The recommended design is a cable-stayed bridge: straight rope/cable stays fanning out from each tower to the deck. The student isn't using rope/cable yet.");
+    }
+
+    // Budget-related observations.
+    if (digest.budgetPct > 0.95 && digest.roadConnected) {
+        facts.push(`Cost is at ${Math.round(digest.budgetPct * 100)}% of budget — very little room to add reinforcement. Consider downgrading any over-spec'd materials.`);
+    } else if (digest.budgetPct < 0.4 && digest.roadConnected && digest.mechanismDeficit === 0) {
+        facts.push(`Cost is only ${Math.round(digest.budgetPct * 100)}% of budget — they have lots of room for stronger materials on critical members if the bridge feels marginal.`);
+    }
+
+    const factSection = facts.length
+        ? facts.map((f, i) => `${i + 1}. ${f}`).join("\n")
+        : "(no critical issues detected — the bridge looks structurally sound)";
+    const forbiddenSection = forbidden.length
+        ? "FORBIDDEN tips (the bridge already satisfies these):\n" + forbidden.map(f => `  - DO NOT say ${f}`).join("\n")
+        : "";
+
+    return `You are a bridge-engineering coach reviewing a STUDENT's in-progress bridge. Your tips must reference the PROBLEMS LIST below — those are the actual structural issues computed from their bridge. If the problems list is empty, the bridge is fine and you should say so.
+
+## This level: "${lvlDef.name}"
+- Concept being taught: ${lvlDef.concept} — "${lvlDef.lesson || ""}"
+- Vehicle(s): ${vehicleMass}
+- Recommended archetype: ${digest.archetype}
+  How it works: ${slots.deck}; ${slots.primary}${slots.connectors ? "; " + slots.connectors : ""}
+
+## Student's build — quick stats
+- Members: ${digest.memberCount} (${digest.nonRoadCount} structural). Cost: $${digest.totalCost} of $${digest.budget}.
+- Road continuous: ${digest.roadConnected ? "yes" : "no"}. Top chord: ${digest.hasTopChord ? "yes" : "no"}. Bottom chord: ${digest.hasBottomChord ? "yes" : "no"}.
+
+## PROBLEMS LIST (ordered most-impactful first)
+${factSection}
+
+${forbiddenSection}
+
+## Output rules
+- Pick the top 1–3 problems above. Write a tip for EACH. Skip any problem the student has already solved.
+- If the problems list says "no critical issues", output ONE tip with title "Looking good" and a sentence about what they did well, plus optionally one fine-tuning suggestion (cost efficiency, heavier-material upgrade).
+- NEVER write a tip that contradicts a "DO NOT say" line above.
+- Tips must NAME the specific issue from the list — don't paraphrase into platitudes.
+- Use real engineering terms (compression, tension, load path, triangulation, bottom chord, mechanism, etc.) and explain on first use.
+- 1–3 sentences per tip. No coordinates, no material keys ("wood_road"), no generic advice.
 
 ## Output format — JSON only
 {
-  "summary": "One sentence on the overall state of their build.",
+  "summary": "One sentence overall.",
   "tips": [
-    { "title": "2-4 word focus label", "explanation": "1-3 sentences. Reference what they actually have using the facts above. Use real engineering terms. No coordinates, no material keys, no platitudes." }
+    { "title": "2-4 word focus label", "explanation": "1-3 sentences referencing a specific problem from the list above." }
   ]
 }
-
-Output 1–3 tips, most impactful first. If the bridge looks good, output 1 tip ("Looking good") and nothing else.
 
 Variation seed: ${Math.floor(Math.random() * 1000)}.`;
 }

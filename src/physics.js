@@ -411,17 +411,18 @@ export function physicsTick(state) {
         // 4. Mechanism fatigue — non-road members in an under-triangulated
         // structure accumulate damage when the bridge is loaded. Maxwell-
         // Cremona says a 2D pin-jointed truss with ≥2 fixed anchors needs
-        // M ≥ 2*N_free structural members to be rigid; below that it has
+        // M ≥ 2*N - R structural members to be rigid; below that it has
         // mechanism modes that let the structure deform without straining
         // members. In a floating-apex chain those beams pretend to be
         // load-bearing but actually translate as a unit; this rule makes
         // them visibly fatigue and break instead.
+        //
+        // Rate is aggressive enough that a 4-5s vehicle crossing fully
+        // collapses an under-triangulated bridge — and once any member
+        // breaks, mechDeficit climbs, so the cascade accelerates.
         if (!mat.isRoad && mechDeficit > 0 && vehicleOnBridge) {
-            // Both endpoints fixed → member is part of a triangulated panel
-            // anchored at both ends, even if the OTHER half of the bridge
-            // has a mechanism. Don't penalize.
             if (!(m.n1.fixed && m.n2.fixed)) {
-                m._fatigue = (m._fatigue || 0) + 0.0015 * mechDeficit;
+                m._fatigue = (m._fatigue || 0) + 0.004 * mechDeficit;
             }
         }
 
@@ -449,6 +450,19 @@ export function physicsTick(state) {
             x: (worstMember.n1.x + worstMember.n2.x) / 2,
             y: (worstMember.n1.y + worstMember.n2.y) / 2,
         });
+
+        // Mechanism-cascade shock — when a member breaks in a non-rigid
+        // structure, every other "suspect" member gets a fatigue bump so
+        // the floating-apex chain visibly collapses instead of holding up
+        // the bridge after the road fails.
+        if (mechDeficit > 0) {
+            for (const m of state.members) {
+                if (m.broken || m === worstMember) continue;
+                if (MATERIALS[m.type].isRoad) continue;
+                if (m.n1.fixed && m.n2.fixed) continue;
+                m._fatigue = (m._fatigue || 0) + 0.35;
+            }
+        }
 
         // ── Kick halves outward for a clean split ──
         // Stronger kick at the tips (far from anchors), zero at anchors.

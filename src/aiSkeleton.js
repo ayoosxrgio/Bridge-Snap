@@ -798,16 +798,58 @@ export function buildPlayerDigest(lvl, lvlDef, players) {
         else if (midY > deckY + 1) hasBottomChord = true;
     }
 
-    const archetype = generateSkeleton(lvl, lvlDef).archetype;
+    const recommended = generateSkeleton(lvl, lvlDef);
     const wellTriangulated = interiorDeckNodes === 0
         ? true
         : triangleCount >= Math.max(1, interiorDeckNodes - 1);
 
+    // Maxwell-Cremona rigidity check on the player's bridge — same formula
+    // used by the physics tick. Counts the player against what a real truss
+    // would need.
+    const usedNodes = new Set();
+    let fixedCount = 0;
+    for (const m of placed) { usedNodes.add(m.n1); usedNodes.add(m.n2); }
+    for (const n of usedNodes) if (n.fixed) fixedCount++;
+    const N = usedNodes.size;
+    const requiredMembers = Math.max(0, 2 * N - 2 * fixedCount);
+    const mechanismDeficit = Math.max(0, requiredMembers - placed.length);
+
+    // Level-specific structural cues — does the player's bridge include
+    // the headline element of the recommended archetype?
+    const anchors = getAnchors(lvl, lvlDef);
+    const hasMidPier = anchors.some(a => a.side === "MID");
+    const hasHighTowers = anchors.some(a => (a.side === "L" || a.side === "R") && a.y < lvl.lY);
+    const tensionKey = pickTensionKey(lvlDef);
+
+    let usesPier = false;
+    if (hasMidPier) {
+        const pier = anchors.find(a => a.side === "MID");
+        usesPier = placed.some(m =>
+            (m.n1.x === pier.x && m.n1.y === pier.y) ||
+            (m.n2.x === pier.x && m.n2.y === pier.y)
+        );
+    }
+    let usesHighAnchor = false;
+    if (hasHighTowers) {
+        const highs = anchors.filter(a => (a.side === "L" || a.side === "R") && a.y < lvl.lY);
+        usesHighAnchor = placed.some(m =>
+            highs.some(h => (m.n1.x === h.x && m.n1.y === h.y) ||
+                            (m.n2.x === h.x && m.n2.y === h.y))
+        );
+    }
+    let usesTension = false;
+    if (tensionKey) {
+        usesTension = placed.some(m => MATERIALS[m.type]?.tensionOnly);
+    }
+
+    const budgetPct = lvl.budget > 0 ? totalCost / lvl.budget : 0;
+
     return {
-        archetype,
+        archetype: recommended.archetype,
         materialsUsed: matStr,
         totalCost,
         budget: lvl.budget,
+        budgetPct,
         roadConnected,
         memberCount: placed.length,
         nonRoadCount: placed.filter(m => !MATERIALS[m.type]?.isRoad).length,
@@ -819,5 +861,13 @@ export function buildPlayerDigest(lvl, lvlDef, players) {
         interiorDeckNodes,
         unsupportedDeckNodes,
         floatingStructuralMembers,
+        // rigidity (Maxwell-Cremona)
+        mechanismDeficit,
+        // level-specific compliance with the recommended archetype
+        hasMidPier,
+        hasHighTowers,
+        usesPier,
+        usesHighAnchor,
+        usesTension,
     };
 }
