@@ -172,7 +172,6 @@ export function gameScene(k, { levelIdx }) {
         aiHighlightMembers: [], // members placed by the most recent "Build & Next"
         // Hint — closed by default; player opens it via the "?" button when needed
         hintOpen: false,
-        controlsOpen: false,
         // Lesson panel
         lessonOpen: false,
         // Splash effects
@@ -1107,28 +1106,10 @@ export function gameScene(k, { levelIdx }) {
         // (No hardware — the rope just terminates at the wood. Cleaner read.)
 
         // Buttons — rendered inside the rotation so they swing with the sign
-        drawPaperIconBtn(tb.aiBtn,       drawRobotIcon,    state.aiPanelOpen,  "ai");
-        drawPaperIconBtn(tb.hintBtn,     drawQuestionIcon, state.hintOpen,     "hint");
-        drawPaperIconBtn(tb.controlsBtn, drawControlsIcon, state.controlsOpen, "controls");
+        drawPaperIconBtn(tb.aiBtn,   drawRobotIcon,    state.aiPanelOpen, "ai");
+        drawPaperIconBtn(tb.hintBtn, drawQuestionIcon, state.hintOpen,    "hint");
 
         k.popTransform();
-    }
-
-    // Three small horizontal bars stacked vertically — a "menu / list" glyph
-    // that reads as "open the controls cheat-sheet" without colliding with
-    // the question mark we already use for the level-specific hint button.
-    function drawControlsIcon(cx, cy, col) {
-        const c = colorOf(col);
-        const w = 12, h = 1.6, gap = 4;
-        for (let i = -1; i <= 1; i++) {
-            k.drawRect({
-                pos: k.vec2(cx, cy + i * gap),
-                width: w, height: h,
-                color: c,
-                anchor: "center",
-                radius: 0.8,
-            });
-        }
     }
 
     function drawMatIconFor(key, cx, cy, col) {
@@ -1423,17 +1404,6 @@ export function gameScene(k, { levelIdx }) {
     // ═══════════════════════════════════════════════════
     k.onMousePress(() => {
         const pos = k.mousePos();
-        // Controls panel is modal — any click closes it, except for clicks
-        // on the controls button itself (which would re-toggle).
-        if (state.controlsOpen) {
-            const tb = getToolbar();
-            const cb = tb.controlsBtn;
-            const onBtn = pos.x >= cb.x && pos.x <= cb.x + cb.w &&
-                          pos.y >= cb.y && pos.y <= cb.y + cb.h;
-            state.controlsOpen = false;
-            if (onBtn) return; // let the button click handler not re-open it
-            return;
-        }
         // Tutorial overlay normally swallows clicks (first click finishes
         // typing, next advances). EXCEPTION: when the current step has an
         // interactive gate (awaitExpand) AND the click lands inside the
@@ -2092,11 +2062,8 @@ export function gameScene(k, { levelIdx }) {
         }
         undoLast();
     });
-    k.onKeyPress("h", () => { state.controlsOpen = !state.controlsOpen; });
     k.onKeyPress("space", () => { toggleSim(); });
     k.onKeyPress("escape", () => {
-        // Close the controls panel if it's open before doing anything else.
-        if (state.controlsOpen) { state.controlsOpen = false; return; }
         // In select mode with an active selection, Escape clears it first
         // instead of jumping back to the menu.
         if (state.selectMode && state.selectedMembers && state.selectedMembers.size > 0) {
@@ -2659,9 +2626,8 @@ export function gameScene(k, { levelIdx }) {
             // of the way to keep the notebook area clear for the bridge build.
             // Hangs ~30px below the toolbar so the suspension ropes have a
             // visible length and can tilt convincingly during the swing.
-            aiBtn:       { x: 26,  y: pad + tbH + 32, w: 48, h: 36 },
-            hintBtn:     { x: 76,  y: pad + tbH + 32, w: 48, h: 36 },
-            controlsBtn: { x: 126, y: pad + tbH + 32, w: 48, h: 36 },
+            aiBtn:     { x: 26, y: pad + tbH + 32, w: 48, h: 36 },
+            hintBtn:   { x: 76, y: pad + tbH + 32, w: 48, h: 36 },
         };
     }
 
@@ -3048,13 +3014,6 @@ export function gameScene(k, { levelIdx }) {
         if (pos.x >= hb.x && pos.x <= hb.x + hb.w && y >= hb.y && y <= hb.y + hb.h) {
             state.hintOpen = !state.hintOpen;
             if (state.hintOpen) onHintRequest();
-            return true;
-        }
-
-        // Controls button — opens the keyboard / button cheat-sheet panel.
-        const cb = tb.controlsBtn;
-        if (pos.x >= cb.x && pos.x <= cb.x + cb.w && y >= cb.y && y <= cb.y + cb.h) {
-            state.controlsOpen = !state.controlsOpen;
             return true;
         }
 
@@ -3501,7 +3460,6 @@ export function gameScene(k, { levelIdx }) {
             drawSidebar();
             drawHintPanel();
             drawAiPanel();
-            drawControlsPanel();
             if (state.modal) drawModal();
             if (state.tutorialActive) drawTutorialOverlay();
         } catch(e) {
@@ -5699,117 +5657,6 @@ export function gameScene(k, { levelIdx }) {
         } else if (text) {
             k.drawText({ text, pos: k.vec2(cx, cy), size: 8, font: "PressStart2P", color: colorOf(iconColor), anchor: "center" });
         }
-    }
-
-    // ─── Hint panel ─────────────────────────────────
-    // Controls cheat-sheet — keyboard shortcuts + toolbar functions. Opens
-    // via the controls button (≡ icon) or by pressing H. Two-column layout
-    // for legibility.
-    function drawControlsPanel() {
-        if (!state.controlsOpen) return;
-        const W = k.width();
-        const H = k.height();
-        const t = k.time();
-
-        // Dim backdrop so the panel reads as a modal
-        k.drawRect({ pos: k.vec2(0, 0), width: W, height: H, color: colorOf("#010101"), opacity: 0.32, anchor: "topleft" });
-
-        const panelW = Math.min(560, W * 0.7);
-        const panelH = Math.min(440, H * 0.78);
-        const px = Math.round((W - panelW) / 2);
-        const py = Math.round((H - panelH) / 2);
-
-        // Wooden-card frame, same vocabulary as the AI panel.
-        k.drawRect({ pos: k.vec2(px + 4, py + 6), width: panelW, height: panelH, color: colorOf("#000000"), opacity: 0.4, anchor: "topleft", radius: 6 });
-        k.drawRect({ pos: k.vec2(px - 3, py - 3), width: panelW + 6, height: panelH + 6, color: colorOf("#5a3210"), anchor: "topleft", radius: 6 });
-        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: colorOf("#fff5d0"), anchor: "topleft", radius: 5 });
-        k.drawRect({ pos: k.vec2(px + 8, py + 6), width: panelW - 16, height: 4, color: colorOf("#ffe9a8"), opacity: 0.5, anchor: "topleft", radius: 2 });
-        k.drawRect({ pos: k.vec2(px + panelW / 2 - 28, py - 8), width: 56, height: 14, color: colorOf(C.tape), anchor: "topleft", opacity: 0.65 });
-
-        const padX = 22;
-        const padY = 18;
-
-        // Header
-        k.drawText({
-            text: "CONTROLS", pos: k.vec2(px + padX, py + padY),
-            size: 13, font: "PressStart2P", color: colorOf(C.markerBlue),
-        });
-        k.drawText({
-            text: "press H to close",
-            pos: k.vec2(px + panelW - padX, py + padY),
-            size: 9, font: "PressStart2P", color: colorOf(C.pencil),
-            opacity: 0.55, anchor: "topright",
-        });
-
-        // Two columns of rows: [keys, action]
-        const rows = [
-            ["1-5",         "select material slot"],
-            ["dbl-click",   "reveal stronger material tier"],
-            ["drag",        "place road / beam / cable"],
-            ["spam-click",  "extend last road in a chain"],
-            ["S",           "select tool (drag a box)"],
-            ["F",           "fill / line tool"],
-            ["C",           "arch / curve tool"],
-            ["D",           "delete mode (click to remove)"],
-            ["dbl-click 🗑", "CLEAR every placed member"],
-            ["Z",           "undo"],
-            ["Shift+Z",     "redo"],
-            ["Del / Bksp",  "delete selected"],
-            ["SPACE",       "play / stop the simulation"],
-            ["Esc",         "cancel current tool / close popups"],
-            ["H",           "open/close this panel"],
-            ["AI button",   "robot — show me a bridge or coach my build"],
-            ["? button",    "level hint (sticky note)"],
-        ];
-
-        const colW = (panelW - padX * 3) / 2;
-        const rowH = 18;
-        const headerH = 40;
-        const startY = py + padY + headerH;
-        const left = px + padX;
-        const right = left + colW + padX;
-        const half = Math.ceil(rows.length / 2);
-
-        const drawRow = (cellX, cellY, row, alt) => {
-            if (alt) {
-                k.drawRect({
-                    pos: k.vec2(cellX - 6, cellY - 2),
-                    width: colW + 12, height: rowH,
-                    color: colorOf("#000000"), opacity: 0.04,
-                    anchor: "topleft", radius: 2,
-                });
-            }
-            k.drawText({
-                text: row[0],
-                pos: k.vec2(cellX, cellY),
-                size: 9, font: "PressStart2P",
-                color: colorOf(C.markerBlue),
-            });
-            k.drawText({
-                text: row[1],
-                pos: k.vec2(cellX + 88, cellY + 1),
-                size: 14, font: "PatrickHand",
-                color: colorOf(C.pencil),
-                width: colW - 90,
-            });
-        };
-
-        for (let i = 0; i < half; i++) {
-            drawRow(left, startY + i * rowH, rows[i], i % 2 === 0);
-        }
-        for (let i = half; i < rows.length; i++) {
-            drawRow(right, startY + (i - half) * rowH, rows[i], (i - half) % 2 === 0);
-        }
-
-        // Footer hint
-        const pulse = 0.55 + 0.45 * Math.sin(t * 3);
-        k.drawText({
-            text: "click anywhere outside to close",
-            pos: k.vec2(px + panelW / 2, py + panelH - 16),
-            size: 9, font: "PressStart2P",
-            color: colorOf(C.pencil), opacity: pulse * 0.6,
-            anchor: "center",
-        });
     }
 
     function drawHintPanel() {
