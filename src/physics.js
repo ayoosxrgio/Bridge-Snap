@@ -301,15 +301,45 @@ export function physicsTick(state) {
     }
 
     // ── Stress measurement & breaking ────────────────
-    // Two stress sources:
+    // Three stress sources:
     //   1. Fatigue — unsupported roads accumulate stress over time under vehicle load.
-    //      Road stays rigid and flat, stress colors build up, then SNAP.
     //   2. Lambda — axial constraint force for overloaded trusses / cables.
-    //
-    // Fatigue is the primary gameplay mechanic:
-    //   - Car on unsupported wood road: breaks in ~1 second
-    //   - Bicycle on unsupported wood road: very slow fatigue (survives level 1)
-    //   - Any vehicle on supported road: no fatigue (beams do their job)
+    //   3. Mechanism — when the structure has Maxwell-Cremona mechanism modes
+    //      (M < 2*N_free in 2D with ≥2 fixed anchors), it can deform without
+    //      straining members. Apply slow fatigue to non-road members so the
+    //      design visibly fails — this is what catches "floating apex" chains
+    //      and other under-triangulated configurations.
+
+    // Maxwell-Cremona rigidity check: a 2D pin-jointed structure with R
+    // reaction DOFs (R = 2 × pinned anchors) is rigid iff M ≥ 2*N - R.
+    // Below that it has (2*N - R - M) mechanism modes — internal motions
+    // that don't strain any member. Floating-apex chains hit this exactly.
+    let mechDeficit = 0;
+    {
+        const used = new Set();
+        let M = 0;
+        for (const m of state.members) {
+            if (m.broken) continue;
+            M++;
+            used.add(m.n1);
+            used.add(m.n2);
+        }
+        let N = 0, fixedN = 0;
+        for (const n of used) {
+            N++;
+            if (n.fixed) fixedN++;
+        }
+        const R = 2 * fixedN;
+        const required = 2 * N - R;
+        mechDeficit = Math.max(0, required - M);
+    }
+    state._mechanismDeficit = mechDeficit;
+
+    // Is the bridge currently being loaded by a vehicle?
+    let vehicleOnBridge = false;
+    for (const n of state.nodes) {
+        if ((n._extFY || 0) > 0.1) { vehicleOnBridge = true; break; }
+    }
 
     let worstMember = null;
     let worstStress = 0;
@@ -376,6 +406,23 @@ export function physicsTick(state) {
             const lengthScale = m.rest > 0 ? mat.maxLength / m.rest : 1;
             const over = lambdaStress - 0.22;
             m._fatigue = (m._fatigue || 0) + over * 0.11 * lengthScale;
+        }
+
+        // 4. Mechanism fatigue — non-road members in an under-triangulated
+        // structure accumulate damage when the bridge is loaded. Maxwell-
+        // Cremona says a 2D pin-jointed truss with ≥2 fixed anchors needs
+        // M ≥ 2*N_free structural members to be rigid; below that it has
+        // mechanism modes that let the structure deform without straining
+        // members. In a floating-apex chain those beams pretend to be
+        // load-bearing but actually translate as a unit; this rule makes
+        // them visibly fatigue and break instead.
+        if (!mat.isRoad && mechDeficit > 0 && vehicleOnBridge) {
+            // Both endpoints fixed → member is part of a triangulated panel
+            // anchored at both ends, even if the OTHER half of the bridge
+            // has a mechanism. Don't penalize.
+            if (!(m.n1.fixed && m.n2.fixed)) {
+                m._fatigue = (m._fatigue || 0) + 0.0015 * mechDeficit;
+            }
         }
 
         const rawStress = Math.max(m._fatigue || 0, lambdaStress);
