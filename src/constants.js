@@ -71,8 +71,8 @@ export const MATERIALS = {
         key:         "wood_road",
         color:       "#b08540",
         colorDark:   "#7a5520",
-        compliance:  0.0005,
-        breakForce:  420,
+        compliance:  0.0003,
+        breakForce:  500,
         price:       120,
         width:       10,
         maxLength:   72,       // 2 grid cells
