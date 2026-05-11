@@ -250,6 +250,10 @@ export function menuScene(k, params = {}) {
     let lbData = null;
     let lbLoadingFor = -1;       // level idx currently being fetched (debounce)
 
+    // Credits modal state
+    let creditsOpen = false;
+    let creditsAnimT = 0;
+
     // ─── Settings state ──────────────────────────────
     const SETTINGS_KEY = "bridgesnap_settings";
     let settingsData = loadSettings();
@@ -594,6 +598,94 @@ export function menuScene(k, params = {}) {
         }
     }
 
+    // ─── Credits modal ───────────────────────────────
+    // Wooden card listing the people / projects that built Bridge Snap.
+    // Opens when the Credits button on the main menu is clicked; closes on
+    // any subsequent click.
+    function drawCreditsModal(W, H) {
+        if (creditsAnimT < 0.01) return;
+        const t = creditsAnimT;
+        const ease = t * t * (3 - 2 * t);
+
+        // Dim backdrop
+        k.drawRect({ pos: k.vec2(0, 0), width: W, height: H, color: col("#010101"), opacity: 0.55 * ease, anchor: "topleft" });
+
+        const panelW = Math.min(560, W * 0.78);
+        const panelH = Math.min(420, H * 0.78);
+        const px = Math.round((W - panelW) / 2);
+        // Slide in from the top for a pleasant entrance.
+        const py = Math.round((H - panelH) / 2 - (1 - ease) * 60);
+
+        // Wooden card frame
+        k.drawRect({ pos: k.vec2(px + 4, py + 6), width: panelW, height: panelH, color: col("#000000"), opacity: 0.45 * ease, anchor: "topleft", radius: 6 });
+        k.drawRect({ pos: k.vec2(px - 3, py - 3), width: panelW + 6, height: panelH + 6, color: col("#5a3210"), opacity: ease, anchor: "topleft", radius: 6 });
+        k.drawRect({ pos: k.vec2(px, py), width: panelW, height: panelH, color: col("#fff5d0"), opacity: ease, anchor: "topleft", radius: 5 });
+        k.drawRect({ pos: k.vec2(px + 8, py + 6), width: panelW - 16, height: 4, color: col("#ffe9a8"), opacity: 0.55 * ease, anchor: "topleft", radius: 2 });
+        // Tape strip
+        k.drawRect({ pos: k.vec2(px + panelW / 2 - 30, py - 9), width: 60, height: 14, color: col("#e6dcb4"), opacity: 0.7 * ease, anchor: "topleft" });
+
+        const padX = 30;
+        const padY = 24;
+
+        // Title
+        k.drawText({
+            text: "CREDITS",
+            pos: k.vec2(px + panelW / 2, py + padY + 6),
+            size: 22, font: "PressStart2P",
+            color: col("#2563eb"), opacity: ease,
+            anchor: "center",
+        });
+
+        // Body — labeled rows. Hand-written PatrickHand for the names so it
+        // reads "personal" rather than rigid corporate-credits.
+        const rows = [
+            ["DESIGN, CODE, LEVELS",  "Sergio Gonzalez Borbon (ayoosxrgio)"],
+            ["GITHUB",                "github.com/ayoosxrgio/bridge-snap"],
+            ["PORTAL INTEGRATION",    "etchre — moved the game into the web portal"],
+            ["VEHICLE SPRITES",       "itch.io creators (see Credits in source)"],
+            ["BACKGROUNDS & WATER",   "itch.io creators (see Credits in source)"],
+            ["SFX & MUSIC",           "—"],
+        ];
+
+        const rowStartY = py + padY + 56;
+        const rowH = 38;
+        for (let i = 0; i < rows.length; i++) {
+            const ry = rowStartY + i * rowH;
+            if (i % 2 === 0) {
+                k.drawRect({
+                    pos: k.vec2(px + padX - 8, ry - 6),
+                    width: panelW - (padX - 8) * 2,
+                    height: rowH - 4,
+                    color: col("#000000"), opacity: 0.04 * ease,
+                    anchor: "topleft", radius: 3,
+                });
+            }
+            k.drawText({
+                text: rows[i][0],
+                pos: k.vec2(px + padX, ry),
+                size: 10, font: "PressStart2P",
+                color: col("#5a3510"), opacity: 0.85 * ease,
+            });
+            k.drawText({
+                text: rows[i][1],
+                pos: k.vec2(px + padX, ry + 14),
+                size: 16, font: "PatrickHand",
+                color: col("#3a2010"), opacity: ease,
+            });
+        }
+
+        // Footer pulse
+        const time = k.time();
+        const pulse = 0.55 + 0.45 * Math.sin(time * 3);
+        k.drawText({
+            text: "click anywhere to close",
+            pos: k.vec2(px + panelW / 2, py + panelH - 18),
+            size: 9, font: "PressStart2P",
+            color: col("#3a2010"), opacity: pulse * 0.55 * ease,
+            anchor: "center",
+        });
+    }
+
     // ─── Main draw loop ──────────────────────────────
     k.onDraw(() => {
         const dt = k.dt();
@@ -660,6 +752,12 @@ export function menuScene(k, params = {}) {
         const lbTarget = lbOpen ? 1 : 0;
         lbAnimT += (lbTarget - lbAnimT) * Math.min(1, dt * 4.5);
         if (Math.abs(lbAnimT - lbTarget) < 0.005) lbAnimT = lbTarget;
+
+        // Same easing for the credits modal
+        const credTarget = creditsOpen ? 1 : 0;
+        creditsAnimT += (credTarget - creditsAnimT) * Math.min(1, dt * 6);
+        if (Math.abs(creditsAnimT - credTarget) < 0.005) creditsAnimT = credTarget;
+        if (currentView !== "menu" && creditsOpen) { creditsOpen = false; creditsAnimT = 0; }
         // If the player leaves level-select with the panel open, snap shut so
         // re-entering doesn't show a half-open panel
         if (currentView !== "levelSelect" && lbOpen) { lbOpen = false; lbAnimT = 0; }
@@ -1577,6 +1675,9 @@ export function menuScene(k, params = {}) {
 
         // Frame border on top (FIXED — doesn't slide, acts as mask)
         drawFrame(W, H);
+
+        // Credits modal on top of everything else
+        drawCreditsModal(W, H);
     });
 
     k.onMouseMove((pos) => {
@@ -1657,6 +1758,13 @@ export function menuScene(k, params = {}) {
         if (lbOpen || lbAnimT > 0.05) return;
 
         // ─── MENU VIEW clicks ───────────────────────
+        // Credits modal — any click closes it. Intercept before menu-button
+        // clicks so dismissing doesn't also trigger Start Game / Settings.
+        if (creditsOpen) {
+            creditsOpen = false;
+            return;
+        }
+
         if (currentView === "menu" && scrollTarget === 0) {
             if (Math.abs(pos.x - btnX) < btnW / 2 && Math.abs(pos.y - btnStartY) < btnH / 2) {
                 scrollTarget = scrollDist; // scroll up to level select
@@ -1664,6 +1772,10 @@ export function menuScene(k, params = {}) {
             }
             if (Math.abs(pos.x - btnX) < btnW / 2 && Math.abs(pos.y - (btnStartY + btnH + btnGap)) < btnH / 2) {
                 scrollTarget = -scrollDist; // scroll down to settings
+                return;
+            }
+            if (Math.abs(pos.x - btnX) < btnW / 2 && Math.abs(pos.y - (btnStartY + (btnH + btnGap) * 2)) < btnH / 2) {
+                creditsOpen = true;
                 return;
             }
         }
