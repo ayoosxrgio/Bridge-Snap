@@ -253,6 +253,7 @@ export function menuScene(k, params = {}) {
     // Credits modal state
     let creditsOpen = false;
     let creditsAnimT = 0;
+    let creditsOpenedAt = 0;       // wall-clock time the modal opened (for stagger)
 
     // ─── Settings state ──────────────────────────────
     const SETTINGS_KEY = "bridgesnap_settings";
@@ -627,61 +628,89 @@ export function menuScene(k, params = {}) {
         const padX = 30;
         const padY = 24;
 
-        // Title
-        k.drawText({
-            text: "CREDITS",
-            pos: k.vec2(px + panelW / 2, py + padY + 6),
-            size: 22, font: "PressStart2P",
-            color: col("#2563eb"), opacity: ease,
-            anchor: "center",
-        });
+        // Staggered drop-in — each row enters from above with a delay so
+        // the credits unroll like a film title sequence. Time-since-open
+        // drives the per-row progress.
+        const elapsed = Math.max(0, k.time() - creditsOpenedAt);
+        const STAGGER = 0.08;   // seconds between consecutive row entrances
+        const DROP    = 0.32;   // seconds for a single row's drop-in to finish
+        const rowProgress = (i) => {
+            const t0 = i * STAGGER;
+            const p = Math.max(0, Math.min(1, (elapsed - t0) / DROP));
+            // ease-out cubic so rows decelerate as they settle
+            return 1 - Math.pow(1 - p, 3);
+        };
+
+        // Title (row 0 in the stagger sequence)
+        {
+            const p = rowProgress(0);
+            const dy = (1 - p) * -24;
+            k.drawText({
+                text: "CREDITS",
+                pos: k.vec2(px + panelW / 2, py + padY + 6 + dy),
+                size: 22, font: "PressStart2P",
+                color: col("#2563eb"), opacity: ease * p,
+                anchor: "center",
+            });
+        }
 
         // Body — labeled rows. Hand-written PatrickHand for the names so it
         // reads "personal" rather than rigid corporate-credits.
         const rows = [
-            ["DESIGN, CODE, LEVELS",  "Sergio Gonzalez Borbon (ayoosxrgio)"],
-            ["GITHUB",                "github.com/ayoosxrgio/bridge-snap"],
-            ["PORTAL INTEGRATION",    "etchre — moved the game into the web portal"],
-            ["VEHICLE SPRITES",       "itch.io creators (see Credits in source)"],
-            ["BACKGROUNDS & WATER",   "itch.io creators (see Credits in source)"],
-            ["SFX & MUSIC",           "—"],
+            ["DESIGN, CODE, LEVELS",  "Sergio Gonzalez",   "github.com/ayoosxrgio"],
+            ["ADDITIONAL CODE",       "Ethan Reed",        "github.com/etchre"],
+            ["VEHICLE SPRITES",       "itch.io creators",  ""],
+            ["BACKGROUNDS & WATER",   "itch.io creators",  ""],
+            ["SFX & MUSIC",           "—",                 ""],
         ];
 
-        const rowStartY = py + padY + 56;
-        const rowH = 38;
+        const rowStartY = py + padY + 60;
+        const rowH = 50;
         for (let i = 0; i < rows.length; i++) {
+            const p = rowProgress(i + 1); // +1 because title used slot 0
+            if (p <= 0) continue;
+            const dy = (1 - p) * -18;
             const ry = rowStartY + i * rowH;
             if (i % 2 === 0) {
                 k.drawRect({
-                    pos: k.vec2(px + padX - 8, ry - 6),
+                    pos: k.vec2(px + padX - 8, ry - 8 + dy),
                     width: panelW - (padX - 8) * 2,
-                    height: rowH - 4,
-                    color: col("#000000"), opacity: 0.04 * ease,
+                    height: rowH - 6,
+                    color: col("#000000"), opacity: 0.04 * ease * p,
                     anchor: "topleft", radius: 3,
                 });
             }
             k.drawText({
                 text: rows[i][0],
-                pos: k.vec2(px + padX, ry),
+                pos: k.vec2(px + padX, ry + dy),
                 size: 10, font: "PressStart2P",
-                color: col("#5a3510"), opacity: 0.85 * ease,
+                color: col("#5a3510"), opacity: 0.85 * ease * p,
             });
             k.drawText({
                 text: rows[i][1],
-                pos: k.vec2(px + padX, ry + 14),
-                size: 16, font: "PatrickHand",
-                color: col("#3a2010"), opacity: ease,
+                pos: k.vec2(px + padX, ry + 14 + dy),
+                size: 18, font: "PatrickHand",
+                color: col("#3a2010"), opacity: ease * p,
             });
+            if (rows[i][2]) {
+                k.drawText({
+                    text: rows[i][2],
+                    pos: k.vec2(px + padX, ry + 32 + dy),
+                    size: 13, font: "PatrickHand",
+                    color: col("#5a3510"), opacity: 0.7 * ease * p,
+                });
+            }
         }
 
-        // Footer pulse
+        // Footer pulse — appears after all rows are in.
+        const footerP = rowProgress(rows.length + 2);
         const time = k.time();
         const pulse = 0.55 + 0.45 * Math.sin(time * 3);
         k.drawText({
             text: "click anywhere to close",
             pos: k.vec2(px + panelW / 2, py + panelH - 18),
             size: 9, font: "PressStart2P",
-            color: col("#3a2010"), opacity: pulse * 0.55 * ease,
+            color: col("#3a2010"), opacity: pulse * 0.55 * ease * footerP,
             anchor: "center",
         });
     }
@@ -1776,6 +1805,7 @@ export function menuScene(k, params = {}) {
             }
             if (Math.abs(pos.x - btnX) < btnW / 2 && Math.abs(pos.y - (btnStartY + (btnH + btnGap) * 2)) < btnH / 2) {
                 creditsOpen = true;
+                creditsOpenedAt = k.time();
                 return;
             }
         }
