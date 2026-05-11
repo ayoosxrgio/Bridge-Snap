@@ -1,7 +1,7 @@
 import { C, GRID, MATERIALS, MATERIAL_UPGRADES, VEHICLES, WORLD_MID_Y, ANCHOR_L_X, PAD_X, FLAG_INLAND_R, FLAG_INLAND_L, MULTI_FINISH_PAST_FLAG } from "../constants.js";
 import { LEVELS } from "../levels.js";
 import { Node, Member, Spark, snapToGrid, distToSegment, distToSegmentSq, isConnectedToAnchor, calcCost, physicsTick, vehicleTick, initPhysicsWorld, destroyPhysicsWorld } from "../physics.js";
-import { solveBridge } from "../aiHelper.js";
+import { solveBridgeShow, coachBuild } from "../aiHelper.js";
 import { completeLevel, getCompleted } from "../progression.js";
 import { onLevelStart, onBridgeFailed, onBridgeSuccess, onLevelComplete, onHintRequest, onRecapRequest } from "../assistantBridge.js";
 import { submitScore, getLeaderboard } from "../leaderboard.js";
@@ -1410,6 +1410,15 @@ export function gameScene(k, { levelIdx }) {
         // step's spotlight target, let it pass through so the player can
         // perform the action the tutorial is asking for.
         if (state.tutorialActive) {
+            // Skip-tutorial button — ends the whole sequence for this level.
+            const sr = state._tutSkipRect;
+            if (sr && pos.x >= sr.x && pos.x <= sr.x + sr.w &&
+                     pos.y >= sr.y && pos.y <= sr.y + sr.h) {
+                state.tutorialActive = false;
+                state.tutorialStep = TUTORIAL_STEPS.length;
+                state.tutorialTyped = 0;
+                return;
+            }
             const tStep = TUTORIAL_STEPS[state.tutorialStep];
             const tgtRaw = tStep ? getTutorialTarget(tStep.key) : null;
             const tgts = Array.isArray(tgtRaw) ? tgtRaw : (tgtRaw ? [tgtRaw] : []);
@@ -1447,8 +1456,8 @@ export function gameScene(k, { levelIdx }) {
                 resetToBuild();
                 return;
             }
-            // AI TUTOR — only when level has been beaten at least once
-            if (L.beaten && inBtn(L.buttons.ai)) {
+            // AI HELPER — always available now.
+            if (inBtn(L.buttons.ai)) {
                 resetToBuild();
                 handleAiClick();
                 return;
@@ -1608,23 +1617,29 @@ export function gameScene(k, { levelIdx }) {
             return;
         }
 
-        // Polybridge-style auto-extend — if the player has just placed a road
-        // and clicks near where the next colinear segment would land, drop a
-        // matching segment automatically. Lets you spam-click a straight run
-        // without having to drag each piece.
+        // Polybridge-style auto-extend — if the player has just placed a road,
+        // drop a matching colinear segment automatically. The click no longer
+        // has to land near the predicted endpoint, so the player can spam
+        // anywhere to chain segments. Exception: if the click hits a draggable
+        // node that ISN'T the chain head, defer to the drag-start path so a
+        // fresh chain can still be started from a different anchor.
         if (state.lastRoadEnd && state.mode === "build") {
             const mat = MATERIALS[state.selectedMat];
             if (mat && mat.isRoad) {
                 const lr = state.lastRoadEnd;
-                if (state.nodes.includes(lr.node) && !lr.node._chainNode) {
+                const clickedNode = state.nodes.find(n => n.x === sn.x && n.y === sn.y);
+                const clickStartsDrag = clickedNode && clickedNode !== lr.node &&
+                    (clickedNode.fixed || isConnectedToAnchor(state.nodes, state.members, clickedNode.x, clickedNode.y));
+                // Clicking on a different draggable anchor cancels the chain so
+                // the player can start fresh from there without one stale click
+                // auto-extending the previous run.
+                if (clickStartsDrag) {
+                    state.lastRoadEnd = null;
+                }
+                if (state.nodes.includes(lr.node) && !lr.node._chainNode && !clickStartsDrag) {
                     const px = lr.node.x + lr.dx;
                     const py = lr.node.y + lr.dy;
-                    // Click must land within roughly half a segment of the
-                    // predicted endpoint. Use the user's snapped target so
-                    // grid-snapped clicks line up cleanly.
-                    const distSq = (sn.x - px) * (sn.x - px) + (sn.y - py) * (sn.y - py);
-                    const threshSq = (Math.hypot(lr.dx, lr.dy) * 0.6) * (Math.hypot(lr.dx, lr.dy) * 0.6);
-                    if (distSq <= threshSq && px >= lX && px <= rX) {
+                    if (px >= lX && px <= rX) {
                         const roadsOnStart = state.members.filter(m => MATERIALS[m.type].isRoad && (m.n1 === lr.node || m.n2 === lr.node)).length;
                         const existingEnd = state.nodes.find(n => n.x === px && n.y === py);
                         const roadsOnEnd = existingEnd
@@ -2131,9 +2146,14 @@ export function gameScene(k, { levelIdx }) {
 
         // Segment count scales with arc length so each chord ≤ material maxLength.
         // Parabola arc length ≈ chord + (8/3)·bulge²/chord
+        // Tension-only materials (rope/cable) use a much smaller divisor so the
+        // player's arch reads as a smooth catenary instead of a flat-bottomed
+        // 4-segment V — real suspension cables hang in a curve, not a polyline.
         const mat = MATERIALS[state.selectedMat];
         const arcLen = chord + (8 / 3) * (bulge * bulge) / chord;
-        let segments = Math.max(2, Math.ceil(arcLen / (mat.maxLength * 0.9)));
+        const divisor = mat.tensionOnly ? 0.3 : 0.9;
+        const minSegments = mat.tensionOnly ? 6 : 2;
+        let segments = Math.max(minSegments, Math.ceil(arcLen / (mat.maxLength * divisor)));
 
         const buildPoints = (n) => {
             const pts = [];
@@ -2504,6 +2524,7 @@ export function gameScene(k, { levelIdx }) {
 
     function toggleSim() {
         state.finishCalled = false;
+        state.snapFailTimer = null;     // arm fresh on next snap
         state.lastRoadEnd = null;       // sim/build switch ends the chain
         if (state.mode === "build") {
             const cost = calcCost(state.members);
@@ -2974,27 +2995,21 @@ export function gameScene(k, { levelIdx }) {
         return y < tb.h + tb.pad * 2 + 40; // block clicks on toolbar area
     }
 
-    // ─── AI Tutor (Socratic lesson) ─────────────────
+    // ─── AI Tutor (two-mode helper) ─────────────────
+    // Click the AI button opens a picker with two modes:
+    //   • "Show me a bridge"  → builds an example bridge step-by-step
+    //   • "Coach my build"    → reads the player's bridge and gives tips
+    // The mode is stored on `state.aiMode`; null means the picker is visible.
     async function handleAiClick() {
         if (state.aiPanelOpen && !state.aiLoading) {
             state.aiPanelOpen = false;
+            state.aiMode = null;
             return;
         }
 
-        const levelBeaten = getCompleted().includes(levelIdx);
-        if (!levelBeaten) {
-            state.aiPanelOpen = true;
-            state.aiResult = {
-                explanation: "Beat this level first to unlock the AI tutor!",
-                concept: lvlDef.concept,
-            };
-            onRecapRequest();
-            return;
-        }
-
-        if (state.aiLoading) return;
-        state.aiLoading = true;
+        // Open the picker — don't fetch anything until the player chooses a mode.
         state.aiPanelOpen = true;
+        state.aiMode = null;
         state.aiResult = null;
         state.aiStepIdx = 0;
         state.aiPhase = "step";
@@ -3002,12 +3017,51 @@ export function gameScene(k, { levelIdx }) {
         state.aiHighlightTimer = 0;
         state.aiHighlightMembers = [];
         onRecapRequest();
+    }
 
-        // Clear player's bridge so the lesson builds its own from scratch
+    // Count of placed (non-builtin) structural members — gates the coach
+    // button so the player has something to coach about.
+    function placedStructuralCount() {
+        return state.members.filter(m =>
+            !m.builtin && !MATERIALS[m.type]?.isRoad
+        ).length;
+    }
+
+    async function runShowMode() {
+        if (state.aiLoading) return;
+        state.aiMode = "show";
+        state.aiLoading = true;
+        state.aiResult = null;
+        state.aiStepIdx = 0;
+        state.aiPhase = "step";
+        // Show mode wipes the player's bridge so the lesson builds from scratch.
         state.members = state.members.filter(m => m.builtin);
         state.nodes = state.nodes.filter(n => n.fixed || n.builtin);
+        const result = await solveBridgeShow(lvl, lvlDef);
+        state.aiLoading = false;
+        state.aiResult = result;
+    }
 
-        const result = await solveBridge(lvl, lvlDef);
+    async function runCoachMode() {
+        if (state.aiLoading) return;
+        if (placedStructuralCount() < 2) {
+            state.aiResult = {
+                explanation: "Place a few beams or supports first — the coach needs something to coach!",
+                concept: lvlDef.concept,
+            };
+            return;
+        }
+        state.aiMode = "coach";
+        state.aiLoading = true;
+        state.aiResult = null;
+        state.aiStepIdx = 0;
+        state.aiPhase = "step";
+        // Coach mode does NOT clear the bridge — the tips reference what the
+        // player already placed.
+        const result = await coachBuild(lvl, lvlDef, {
+            members: state.members,
+            nodes: state.nodes,
+        });
         state.aiLoading = false;
         state.aiResult = result;
     }
@@ -3017,11 +3071,25 @@ export function gameScene(k, { levelIdx }) {
     function buildLessonStep(step) {
         if (!step?.members) return [];
         const added = [];
+        // If the AI emitted a coordinate close to a fixed anchor (e.g. a mid
+        // pier whose x/y aren't on the player's grid), snap to that anchor
+        // exactly. Otherwise grid-snap. Without this, the bridge looks correct
+        // visually but never actually attaches to off-grid anchors.
+        const snapToAnchor = (x, y) => {
+            const gx = Math.round(x / GRID) * GRID;
+            const gy = Math.round(y / GRID) * GRID;
+            const tol = GRID;
+            for (const n of state.nodes) {
+                if (!n.fixed) continue;
+                if (Math.abs(n.x - x) <= tol && Math.abs(n.y - y) <= tol) {
+                    return [n.x, n.y];
+                }
+            }
+            return [gx, gy];
+        };
         for (const mb of step.members) {
-            const x1 = Math.round(mb.x1 / GRID) * GRID;
-            const y1 = Math.round(mb.y1 / GRID) * GRID;
-            const x2 = Math.round(mb.x2 / GRID) * GRID;
-            const y2 = Math.round(mb.y2 / GRID) * GRID;
+            const [x1, y1] = snapToAnchor(mb.x1, mb.y1);
+            const [x2, y2] = snapToAnchor(mb.x2, mb.y2);
             const type = mb.type in MATERIALS ? mb.type : "wood_beam";
             const n1 = findOrCreate(x1, y1);
             const n2 = findOrCreate(x2, y2);
@@ -3037,16 +3105,21 @@ export function gameScene(k, { levelIdx }) {
         return added;
     }
 
-    // Click on the "Build & Next" / "Close" button. The teaching panel has
-    // just one click target per state (no quiz options to pick).
+    // Click on the "Build & Next" / "Close" button — or, before a mode is
+    // picked, the "Show me a bridge" / "Coach my build" buttons.
     function handleAiPanelClick(mx, my) {
-        if (!state.aiPanelOpen || !state.aiResult?.steps) return false;
-        if (state.aiNextRect) {
-            const r = state.aiNextRect;
-            if (mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h) {
-                advanceLesson();
-                return true;
-            }
+        if (!state.aiPanelOpen) return false;
+        const hit = (r) => r && mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+
+        // Picker buttons (visible when no mode chosen yet & no inline message).
+        if (state.aiMode == null && !state.aiResult?.explanation) {
+            if (hit(state.aiShowRect))  { runShowMode();  return true; }
+            if (hit(state.aiCoachRect)) { runCoachMode(); return true; }
+        }
+        // Standard advance button (Build & Next / Next Tip / Close)
+        if (state.aiResult?.steps && hit(state.aiNextRect)) {
+            advanceLesson();
+            return true;
         }
         return false;
     }
@@ -3255,10 +3328,20 @@ export function gameScene(k, { levelIdx }) {
                 return p.life > 0;
             });
 
-            // Consume snap events from physics → spawn popup + confetti burst
+            // Consume snap events from physics → spawn popup + confetti burst.
+            // First snap also arms a short fail-countdown — the bridge has
+            // structurally failed, even if the vehicle hasn't fallen yet.
             if (state.snapEvents.length) {
                 for (const ev of state.snapEvents) spawnSnapVfx(ev.x, ev.y);
                 state.snapEvents.length = 0;
+                if (state.snapFailTimer == null) state.snapFailTimer = 1.2;
+            }
+            if (state.snapFailTimer != null && !state.finishCalled) {
+                state.snapFailTimer -= (k.dt() || 1/60) * state.simSpeed;
+                if (state.snapFailTimer <= 0) {
+                    state.snapFailTimer = null;
+                    endGame(false);
+                }
             }
 
             compactInPlace(state.snapPopups, (p) => {
@@ -3363,25 +3446,45 @@ export function gameScene(k, { levelIdx }) {
     });
 
     // ─── Background ───────────────────────────────
-    // Rotate backgrounds: different nature set every 2 levels
-    const BG_SETS = ["nature_2", "nature_3", "nature_4", "nature_5"];
-    const bgSet = BG_SETS[Math.floor(levelIdx / 2) % BG_SETS.length];
-    const BG_LAYERS = [
-        { sprite: `bg_${levelIdx}_1`,  speed: 0.01 },
-        { sprite: `bg_${levelIdx}_2`,  speed: 0.03 },
-        { sprite: `bg_${levelIdx}_3`,  speed: 0.06 },
-        { sprite: `bg_${levelIdx}_4`,  speed: 0.10 },
+    // One nature set per level. We have 8 nature folders shipped under
+    // public/assets/backgrounds; each level picks its own (mod 8 so anything
+    // past level 8 cycles back). Folders ship with different layer counts —
+    // the layer file numbers below match what's actually on disk.
+    const BG_LEVEL_SETS = [
+        { set: "nature_1", layers: [1, 2, 3, 5] },
+        { set: "nature_2", layers: [1, 2, 3, 4] },
+        { set: "nature_3", layers: [1, 2, 3, 4] },
+        { set: "nature_4", layers: [1, 2, 3, 4] },
+        { set: "nature_5", layers: [1, 2, 3, 4] },
+        { set: "nature_6", layers: [1, 2, 3] },
+        { set: "nature_7", layers: [1, 2] },
+        { set: "nature_8", layers: [1] },
     ];
+    // Parallax speeds far→near. Picked so single-layer sets don't feel static
+    // and four-layer sets keep the original feel.
+    const BG_SPEEDS_BY_COUNT = {
+        1: [0.06],
+        2: [0.02, 0.10],
+        3: [0.01, 0.05, 0.10],
+        4: [0.01, 0.03, 0.06, 0.10],
+    };
+    const bgCfg = BG_LEVEL_SETS[levelIdx % BG_LEVEL_SETS.length];
+    const bgSet = bgCfg.set;
+    const bgSpeeds = BG_SPEEDS_BY_COUNT[bgCfg.layers.length];
+    const BG_LAYERS = bgCfg.layers.map((fileNum, i) => ({
+        sprite: `bg_${levelIdx}_${i + 1}`,
+        speed: bgSpeeds[i],
+    }));
     let bgScroll = 0;
 
     const BASE = import.meta.env.BASE_URL;
 
     // Load background sprites for this level's set
     try {
-        k.loadSprite(`bg_${levelIdx}_1`, `${BASE}assets/backgrounds/${bgSet}/1.png`);
-        k.loadSprite(`bg_${levelIdx}_2`, `${BASE}assets/backgrounds/${bgSet}/2.png`);
-        k.loadSprite(`bg_${levelIdx}_3`, `${BASE}assets/backgrounds/${bgSet}/3.png`);
-        k.loadSprite(`bg_${levelIdx}_4`, `${BASE}assets/backgrounds/${bgSet}/4.png`);
+        for (let i = 0; i < bgCfg.layers.length; i++) {
+            k.loadSprite(`bg_${levelIdx}_${i + 1}`,
+                `${BASE}assets/backgrounds/${bgSet}/${bgCfg.layers[i]}.png`);
+        }
     } catch(e) {
         console.warn("Could not load background sprites:", e);
     }
@@ -5364,6 +5467,95 @@ export function gameScene(k, { levelIdx }) {
                     anchor: "center",
                 });
             }
+
+            // Hover tooltip — material name + a sample line at the actual
+            // color/width so the player can tell at a glance which one is
+            // road vs beam vs rope. Faded in by the existing hover easing.
+            if (h > 0.05) {
+                const ttCx = bx + tb.matBtnW / 2;
+                const ttW = 150;
+                const ttH = 64;
+                const ttX = Math.max(4, Math.min(W - ttW - 4, ttCx - ttW / 2));
+                const ttY = tb.h + tb.pad + 6;
+
+                // Drop shadow + sticky-note card.
+                k.drawRect({
+                    pos: k.vec2(ttX + 2, ttY + 3), width: ttW, height: ttH,
+                    color: colorOf("#000000"), opacity: 0.25 * h,
+                    anchor: "topleft", radius: 4,
+                });
+                k.drawRect({
+                    pos: k.vec2(ttX, ttY), width: ttW, height: ttH,
+                    color: colorOf("#fff5d0"), opacity: 0.96 * h,
+                    anchor: "topleft", radius: 4,
+                });
+                k.drawRect({
+                    pos: k.vec2(ttX, ttY), width: ttW, height: ttH,
+                    fill: false, outline: { width: 1, color: colorOf("#5a3418") },
+                    opacity: 0.65 * h,
+                    anchor: "topleft", radius: 4,
+                });
+
+                // Material name in marker-blue.
+                k.drawText({
+                    text: mat.label.toUpperCase(),
+                    pos: k.vec2(ttX + ttW / 2, ttY + 12),
+                    size: 9, font: "PressStart2P",
+                    color: colorOf(C.markerBlue),
+                    opacity: h,
+                    anchor: "center",
+                });
+
+                // Sample swatch — actual color & a width chosen for legibility.
+                // Tension-only materials draw as a dashed line; road materials
+                // get a chunkier slab; beams get a single line.
+                const sampY = ttY + 32;
+                const sampX1 = ttX + 12;
+                const sampX2 = ttX + ttW - 12;
+                const sampW = sampX2 - sampX1;
+                const lineW = mat.isRoad ? Math.max(6, mat.width)
+                            : mat.tensionOnly ? Math.max(3, mat.width)
+                            : Math.max(4, mat.width);
+                if (mat.tensionOnly) {
+                    const dash = 6;
+                    for (let dx = 0; dx < sampW; dx += dash * 2) {
+                        const x1 = sampX1 + dx;
+                        const x2 = Math.min(sampX1 + dx + dash, sampX2);
+                        k.drawLine({
+                            p1: k.vec2(x1, sampY), p2: k.vec2(x2, sampY),
+                            width: lineW, color: colorOf(mat.color),
+                            opacity: h,
+                        });
+                    }
+                } else {
+                    k.drawLine({
+                        p1: k.vec2(sampX1, sampY), p2: k.vec2(sampX2, sampY),
+                        width: lineW, color: colorOf(mat.color),
+                        opacity: h,
+                    });
+                    if (mat.colorDark) {
+                        k.drawLine({
+                            p1: k.vec2(sampX1, sampY + lineW / 2 - 1),
+                            p2: k.vec2(sampX2, sampY + lineW / 2 - 1),
+                            width: 1.5, color: colorOf(mat.colorDark),
+                            opacity: h * 0.75,
+                        });
+                    }
+                }
+
+                // Role caption — what this material does in plain English.
+                const role = mat.isRoad ? "Vehicles drive on this"
+                           : mat.tensionOnly ? "Cable — pulls only"
+                           : "Beam — push & pull";
+                k.drawText({
+                    text: role,
+                    pos: k.vec2(ttX + ttW / 2, ttY + ttH - 12),
+                    size: 12, font: "PatrickHand",
+                    color: colorOf(C.pencil),
+                    opacity: h * 0.85,
+                    anchor: "center",
+                });
+            }
         }
 
         // ─── Vertical divider between materials and tools ───
@@ -5844,6 +6036,43 @@ export function gameScene(k, { levelIdx }) {
                 anchor: "botright",
             });
         }
+
+        // Skip-tutorial link — bottom-left of the panel, always available so
+        // returning players can dismiss the sequence at any step. Plain red
+        // text that pulses and grows slightly while hovered.
+        const skipLabel = "SKIP TUTORIAL";
+        const skipBaseSize = 9;
+        const skipBaselineY = panelY + panelH - 14;
+        const skipLeftX = panelX + 16;
+
+        // Hit rect uses the un-hovered size so the click target doesn't move.
+        const skipW = skipLabel.length * skipBaseSize + 4;
+        const skipH = skipBaseSize + 10;
+        const skipRectX = skipLeftX - 4;
+        const skipRectY = skipBaselineY - skipBaseSize - 4;
+
+        const mp = k.mousePos();
+        const hovered =
+            mp.x >= skipRectX && mp.x <= skipRectX + skipW &&
+            mp.y >= skipRectY && mp.y <= skipRectY + skipH;
+
+        const hoverPulse = 0.5 + 0.5 * Math.sin(t * 6);
+        const skipSize = hovered ? skipBaseSize + 1 : skipBaseSize;
+        const skipOpacity = hovered ? 0.85 + 0.15 * hoverPulse : 0.7;
+
+        k.drawText({
+            text: skipLabel,
+            pos: k.vec2(skipLeftX, skipBaselineY),
+            size: skipSize,
+            font: "PressStart2P",
+            color: colorOf(C.markerRed),
+            opacity: skipOpacity,
+            anchor: "botleft",
+        });
+        state._tutSkipRect = {
+            x: skipRectX, y: skipRectY,
+            w: skipW, h: skipH,
+        };
     }
 
     // ─── Pulsing glow around the members the AI just placed ─────────
@@ -5856,27 +6085,29 @@ export function gameScene(k, { levelIdx }) {
         const pulse = 0.5 + 0.5 * Math.sin(t * 5);
         const haloCol = colorOf("#ffd479");
         for (const m of state.aiHighlightMembers) {
-            if (!m || m.broken) continue;
+            // Skip members the player has since undone — keeping a halo on a
+            // removed member leaves a stale glow floating in space.
+            if (!m || m.broken || !state.members.includes(m)) continue;
             const p1 = toScreen(m.n1.x, m.n1.y);
             const p2 = toScreen(m.n2.x, m.n2.y);
             const mat = MATERIALS[m.type];
-            const baseW = (mat?.width || 6) * sc + 4;
-            // Three fattening lines for a soft glow
-            for (let g = 3; g >= 1; g--) {
+            const baseW = (mat?.width || 6) * sc + 3;
+            // Two fattening lines for a soft glow (thinner & dimmer than before)
+            for (let g = 2; g >= 1; g--) {
                 k.drawLine({
                     p1, p2,
-                    width: baseW + g * 4,
+                    width: baseW + g * 3,
                     color: haloCol,
-                    opacity: fade * (0.18 + 0.22 * pulse) / g,
+                    opacity: fade * (0.10 + 0.12 * pulse) / g,
                 });
             }
             // Endpoint accent dots
             for (const p of [p1, p2]) {
                 k.drawCircle({
-                    pos: p, radius: 7 + pulse * 1.5,
+                    pos: p, radius: 6 + pulse,
                     fill: false,
-                    outline: { width: 2, color: haloCol },
-                    opacity: fade * (0.45 + 0.35 * pulse),
+                    outline: { width: 1.5, color: haloCol },
+                    opacity: fade * (0.30 + 0.22 * pulse),
                 });
             }
         }
@@ -5894,6 +6125,8 @@ export function gameScene(k, { levelIdx }) {
     function drawAiPanel() {
         state.aiOptionRects = [];
         state.aiNextRect = null;
+        state.aiShowRect = null;
+        state.aiCoachRect = null;
         if (!state.aiPanelOpen) return;
 
         const W = k.width();
@@ -5920,8 +6153,12 @@ export function gameScene(k, { levelIdx }) {
 
         let panelH = 180;
         let titleH = 0, explH = 0;
+        const showPicker = state.aiMode == null && !hasSteps && !state.aiLoading
+            && !state.aiResult?.error && !state.aiResult?.explanation;
 
-        if (state.aiLoading) {
+        if (showPicker) {
+            panelH = 230;
+        } else if (state.aiLoading) {
             panelH = 130;
         } else if (hasSteps) {
             const step = lesson.steps[state.aiStepIdx];
@@ -5964,11 +6201,51 @@ export function gameScene(k, { levelIdx }) {
         k.drawText({ text: "AI HELPER", pos: k.vec2(px + padX + 50, py + padY), size: 11, font: "PressStart2P", color: colorOf(C.markerBlue) });
         if (hasSteps) {
             const totalSteps = lesson.steps.length;
+            const stepLbl = state.aiMode === "coach" ? "Tip" : "Step";
             k.drawText({
-                text: `Step ${Math.min(state.aiStepIdx + 1, totalSteps)} / ${totalSteps}`,
+                text: `${stepLbl} ${Math.min(state.aiStepIdx + 1, totalSteps)} / ${totalSteps}`,
                 pos: k.vec2(px + panelW - padX, py + padY),
                 size: 11, font: "PressStart2P", color: colorOf(C.pencil), opacity: 0.55, anchor: "topright",
             });
+        }
+
+        // Picker — two buttons, one per mode. Shown until the player chooses.
+        if (showPicker) {
+            const innerX = px + padX + 50;
+            const innerW = panelW - padX * 2 - 60;
+            // Subtitle / prompt
+            k.drawText({
+                text: "What can I help with?",
+                pos: k.vec2(innerX, py + padY + 28),
+                size: 20, font: "PatrickHand", color: colorOf(C.pencil),
+                width: innerW, lineSpacing: 4,
+            });
+
+            const btnW = innerW;
+            const btnH = 52;
+            const btnX = innerX;
+            const gap = 12;
+            const startY = py + padY + 64;
+
+            // Button 1 — Show me a bridge
+            const showY = startY;
+            state.aiShowRect = { x: btnX, y: showY, w: btnW, h: btnH };
+            k.drawRect({ pos: k.vec2(btnX + 1, showY + 2), width: btnW, height: btnH, color: colorOf("#000000"), opacity: 0.25, anchor: "topleft", radius: 4 });
+            k.drawRect({ pos: k.vec2(btnX, showY), width: btnW, height: btnH, color: colorOf(C.markerBlue), anchor: "topleft", radius: 4 });
+            k.drawText({ text: "SHOW ME A BRIDGE", pos: k.vec2(btnX + 14, showY + 12), size: 12, font: "PressStart2P", color: colorOf("#ffffff") });
+            k.drawText({ text: "Build an example bridge step by step", pos: k.vec2(btnX + 14, showY + 30), size: 14, font: "PatrickHand", color: colorOf("#fff5d0"), opacity: 0.85 });
+
+            // Button 2 — Coach my build
+            const coachY = showY + btnH + gap;
+            const canCoach = placedStructuralCount() >= 2;
+            state.aiCoachRect = canCoach ? { x: btnX, y: coachY, w: btnW, h: btnH } : null;
+            const coachBg = canCoach ? C.markerGreen : "#999999";
+            k.drawRect({ pos: k.vec2(btnX + 1, coachY + 2), width: btnW, height: btnH, color: colorOf("#000000"), opacity: 0.25, anchor: "topleft", radius: 4 });
+            k.drawRect({ pos: k.vec2(btnX, coachY), width: btnW, height: btnH, color: colorOf(coachBg), opacity: canCoach ? 1.0 : 0.6, anchor: "topleft", radius: 4 });
+            k.drawText({ text: "COACH MY BUILD", pos: k.vec2(btnX + 14, coachY + 12), size: 12, font: "PressStart2P", color: colorOf("#ffffff") });
+            const coachSub = canCoach ? "Tips on the bridge you've built so far" : "Place a few beams first, then come back";
+            k.drawText({ text: coachSub, pos: k.vec2(btnX + 14, coachY + 30), size: 14, font: "PatrickHand", color: colorOf("#fff5d0"), opacity: canCoach ? 0.85 : 0.7 });
+            return;
         }
 
         // Loading state — typing dots
@@ -5996,9 +6273,7 @@ export function gameScene(k, { levelIdx }) {
         }
 
         if (!hasSteps) {
-            const beaten = getCompleted().includes(levelIdx);
-            const tip = beaten ? "Click the AI button to start." : "Beat this level first to unlock the AI helper!";
-            k.drawText({ text: tip, pos: k.vec2(px + padX + 50, py + padY + 32), size: 18, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.6, width: panelW - padX * 2 - 50, lineSpacing: 4 });
+            k.drawText({ text: "Click the AI button to start.", pos: k.vec2(px + padX + 50, py + padY + 32), size: 18, font: "PatrickHand", color: colorOf(C.pencil), opacity: 0.6, width: panelW - padX * 2 - 50, lineSpacing: 4 });
             return;
         }
 
@@ -6036,6 +6311,7 @@ export function gameScene(k, { levelIdx }) {
             const btnY = py + panelH - btnH - padY;
             state.aiNextRect = { x: btnX, y: btnY, w: btnW, h: btnH };
             const isLast = state.aiStepIdx === lesson.steps.length - 1;
+            const isCoach = state.aiMode === "coach";
             const btnPulse = 0.5 + 0.5 * Math.sin(t * 4);
             k.drawRect({
                 pos: k.vec2(btnX - 4, btnY - 4),
@@ -6046,7 +6322,9 @@ export function gameScene(k, { levelIdx }) {
             });
             k.drawRect({ pos: k.vec2(btnX + 1, btnY + 2), width: btnW, height: btnH, color: colorOf("#000000"), opacity: 0.3, anchor: "topleft", radius: 4 });
             k.drawRect({ pos: k.vec2(btnX, btnY), width: btnW, height: btnH, color: colorOf(C.markerBlue), anchor: "topleft", radius: 4 });
-            const btnLabel = isLast ? "Build & Finish!" : "Build & Next";
+            const btnLabel = isCoach
+                ? (isLast ? "Got it!" : "Next Tip")
+                : (isLast ? "Build & Finish!" : "Build & Next");
             k.drawText({ text: btnLabel, pos: k.vec2(btnX + btnW / 2, btnY + btnH / 2 + 1), size: 12, font: "PressStart2P", color: colorOf("#ffffff"), anchor: "center" });
             return;
         }
@@ -6055,8 +6333,13 @@ export function gameScene(k, { levelIdx }) {
             const innerX = px + padX + 50;
             const innerW = panelW - padX * 2 - 60;
             const bannerY = py + padY + 28;
-            k.drawText({ text: "LESSON COMPLETE", pos: k.vec2(innerX, bannerY), size: 13, font: "PressStart2P", color: colorOf(C.markerGreen) });
-            k.drawText({ text: lesson.summary || "Great work — hit PLAY to see the bridge in action.", pos: k.vec2(innerX, bannerY + 32), size: 18, font: "PatrickHand", color: colorOf(C.pencil), width: innerW, lineSpacing: 5 });
+            const isCoachDone = state.aiMode === "coach";
+            const banner = isCoachDone ? "GOOD LUCK!" : "LESSON COMPLETE";
+            const fallback = isCoachDone
+                ? "That's everything — try those tips and run a sim."
+                : "Great work — hit PLAY to see the bridge in action.";
+            k.drawText({ text: banner, pos: k.vec2(innerX, bannerY), size: 13, font: "PressStart2P", color: colorOf(C.markerGreen) });
+            k.drawText({ text: lesson.summary || fallback, pos: k.vec2(innerX, bannerY + 32), size: 18, font: "PatrickHand", color: colorOf(C.pencil), width: innerW, lineSpacing: 5 });
 
             const btnW = 130, btnH = 34;
             const btnX = px + panelW - btnW - padX;
@@ -6126,8 +6409,7 @@ export function gameScene(k, { levelIdx }) {
         const rightColX = hasLeaderboard ? leftColX + leftColW + colGap : 0;
 
         // Icon-button row anchored to the BOTTOM of the left column.
-        const actions = ["menu", "replay"];
-        if (beaten) actions.push("ai");
+        const actions = ["menu", "replay", "ai"];
         if (isWin) actions.push("next");
         const rowW = actions.length * MODAL_BTN_SIZE + (actions.length - 1) * MODAL_BTN_GAP;
         // Center the icon row inside the left column (or modal if no leaderboard).

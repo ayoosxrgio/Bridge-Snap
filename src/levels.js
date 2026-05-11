@@ -22,7 +22,7 @@ export const LEVELS = [
         vType:    "car",
         gap:      360,
         hDiff:    0,
-        budget:   7000,
+        budget:   8000,
         terrain:  "canyon",
         extraAnchors: [],
         multiVehicle: null,

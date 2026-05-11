@@ -358,6 +358,26 @@ export function physicsTick(state) {
         const forceMag = Math.abs(m.lambda) / (SUB_DT * SUB_DT);
         const lambdaStress = forceMag / mat.breakForce;
 
+        // 3. Axial-tension fatigue for roads.
+        //
+        // Wood planks aren't designed to be load-bearing structural members —
+        // when a road is carrying significant axial force (i.e. it's being
+        // used as a structural chord rather than just a driving surface), it
+        // accumulates damage and eventually splits. This is the rule that
+        // punishes floating-apex designs where the beams above the deck
+        // translate as a unit and the road is left to take all the bending
+        // load. Threshold and rate are tuned so:
+        //   - well-designed bridges (real bottom chord, suspension with
+        //     anchored stiffening truss, etc.) keep road lambdaStress < 0.2
+        //     and never accumulate fatigue from this source
+        //   - floating-apex designs spike road lambdaStress past 0.4-0.6
+        //     while a vehicle is on the deck, fatiguing out in 1-2 seconds
+        if (mat.isRoad && lambdaStress > 0.22) {
+            const lengthScale = m.rest > 0 ? mat.maxLength / m.rest : 1;
+            const over = lambdaStress - 0.22;
+            m._fatigue = (m._fatigue || 0) + over * 0.11 * lengthScale;
+        }
+
         const rawStress = Math.max(m._fatigue || 0, lambdaStress);
 
         // Smooth display stress (for color visualization)

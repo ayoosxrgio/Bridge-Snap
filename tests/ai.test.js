@@ -1,251 +1,206 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { buildPrompt, solveBridge, setApiKey, getApiKey } from "../src/aiHelper.js";
+import { describe, it, expect } from "vitest";
+import { generateSkeleton, pickArchetype, validArchetypes, groupIntoSteps, buildPlayerDigest } from "../src/aiSkeleton.js";
 import { MATERIALS, GRID } from "../src/constants.js";
 
-const SAMPLE_LVL = {
+const FLAT_LVL = {
     lX: 180, lY: 396,
-    rX: 576, rY: 396,
-    midX: 378,
-    gap: 396, hDiff: 0,
-    budget: 10000,
-};
-const SAMPLE_LVL_DEF = {
-    name: "TEST LEVEL",
+    rX: 540, rY: 396,
+    midX: 360,
+    gap: 360, hDiff: 0,
+    budget: 7000,
+    terrain: "canyon",
     vType: "car",
-    concept: "TRIANGULATION",
+};
+const FLAT_DEF = {
+    name: "FLAT",
+    concept: "BASICS",
+    difficulty: 1,
+    materials: ["wood_road", "wood_beam"],
     extraAnchors: [],
 };
 
-// Helper: build a fake OpenAI chat-completions response
-function openaiResponse(text) {
-    return {
-        ok: true,
-        json: async () => ({ choices: [{ message: { content: text } }] }),
-    };
-}
+const PIER_LVL = {
+    lX: 180, lY: 396,
+    rX: 720, rY: 324,
+    midX: 450,
+    gap: 540, hDiff: -72,
+    budget: 13000,
+    terrain: "gorge",
+    vType: "jeep",
+};
+const PIER_DEF = {
+    name: "PIER",
+    concept: "PIERS",
+    difficulty: 2,
+    materials: ["wood_road", "wood_beam"],
+    extraAnchors: [{ side: "MID", dx: -72, dy: 36 }],
+};
 
-// Minimal valid lesson payload used by several tests
-function sampleLesson() {
-    return {
-        concept: "Triangulation",
-        steps: [
-            {
-                question: "What should we lay first?",
-                options: ["steel", "wood road", "rope"],
-                correct: 1,
-                explainCorrect: "Right — cars need a road surface.",
-                explainWrong: "Cables don't give the wheels anything to roll on.",
-                members: [
-                    { x1: 180, y1: 396, x2: 216, y2: 396, type: "wood_road" },
-                ],
-            },
-            {
-                question: "What shape prevents sagging?",
-                options: ["square", "triangle"],
-                correct: 1,
-                explainCorrect: "Triangles are naturally rigid.",
-                explainWrong: "Squares collapse into parallelograms.",
-                members: [
-                    { x1: 180, y1: 396, x2: 216, y2: 432, type: "wood_beam" },
-                ],
-            },
-        ],
-        summary: "You built a triangulated bridge!",
-    };
-}
+const SUSP_LVL = {
+    lX: 180, lY: 396,
+    rX: 648, rY: 396,
+    midX: 414,
+    gap: 468, hDiff: 0,
+    budget: 16000,
+    terrain: "canyon",
+    vType: "camper",
+};
+const SUSP_DEF = {
+    name: "SUSP",
+    concept: "TENSION",
+    difficulty: 3,
+    materials: ["wood_road", "wood_beam", "rope"],
+    extraAnchors: [
+        { side: "L", dx: -36, dy: -144 },
+        { side: "R", dx:  36, dy: -144 },
+    ],
+};
 
-describe("buildPrompt", () => {
-    it("includes the level name, gap, hDiff, and budget", () => {
-        const prompt = buildPrompt(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(prompt).toContain("TEST LEVEL");
-        expect(prompt).toContain("396");
-        expect(prompt).toContain("10000");
+describe("pickArchetype / validArchetypes", () => {
+    it("forces beam_pier when there's a mid-gap anchor", () => {
+        expect(validArchetypes(PIER_LVL, PIER_DEF)).toEqual(["beam_pier"]);
+        expect(pickArchetype(PIER_LVL, PIER_DEF)).toBe("beam_pier");
+    });
+    it("offers suspension-class variants when both cliffs have high anchors and tension is allowed", () => {
+        const opts = validArchetypes(SUSP_LVL, SUSP_DEF);
+        expect(opts).toContain("suspension");
+        expect(opts).toContain("cable_stayed");
+        expect(opts).toContain("tied_arch");
+        expect(opts).not.toContain("truss"); // basic trusses excluded on suspension levels
+    });
+    it("offers the truss + arch family on standard cliff-to-cliff levels", () => {
+        const opts = validArchetypes(FLAT_LVL, FLAT_DEF);
+        expect(opts).toContain("truss");
+        expect(opts).toContain("truss_above");
+        expect(opts).toContain("tied_arch");
+        expect(opts).toContain("arch_deck");
+    });
+    it("pickArchetype returns one of the valid options", () => {
+        const opts = validArchetypes(FLAT_LVL, FLAT_DEF);
+        for (let i = 0; i < 20; i++) {
+            expect(opts).toContain(pickArchetype(FLAT_LVL, FLAT_DEF));
+        }
+    });
+});
+
+describe("generateSkeleton", () => {
+    it("produces a road chain from left anchor to right anchor", () => {
+        const sk = generateSkeleton(FLAT_LVL, FLAT_DEF);
+        const roadKeys = new Set(FLAT_DEF.materials.filter(k => MATERIALS[k].isRoad));
+        const adj = new Map();
+        const key = (x, y) => `${x},${y}`;
+        for (const m of sk.members) {
+            if (!roadKeys.has(m.type)) continue;
+            const a = key(m.x1, m.y1), b = key(m.x2, m.y2);
+            if (!adj.has(a)) adj.set(a, new Set());
+            if (!adj.has(b)) adj.set(b, new Set());
+            adj.get(a).add(b);
+            adj.get(b).add(a);
+        }
+        const start = key(FLAT_LVL.lX, FLAT_LVL.lY);
+        const end   = key(FLAT_LVL.rX, FLAT_LVL.rY);
+        const visited = new Set([start]);
+        const queue = [start];
+        let connected = false;
+        while (queue.length) {
+            const cur = queue.shift();
+            if (cur === end) { connected = true; break; }
+            for (const nb of adj.get(cur) || []) if (!visited.has(nb)) { visited.add(nb); queue.push(nb); }
+        }
+        expect(connected).toBe(true);
     });
 
-    it("describes every material in the default catalog", () => {
-        const prompt = buildPrompt(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        for (const key of Object.keys(MATERIALS)) {
-            expect(prompt).toContain(`"${key}"`);
+    it("respects the level's allowed materials list", () => {
+        const sk = generateSkeleton(SUSP_LVL, SUSP_DEF);
+        const allowed = new Set(SUSP_DEF.materials);
+        for (const m of sk.members) {
+            expect(allowed.has(m.type)).toBe(true);
         }
     });
 
-    it("lists the primary anchors", () => {
-        const prompt = buildPrompt(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(prompt).toContain("LEFT ANCHOR (180, 396)");
-        expect(prompt).toContain("RIGHT ANCHOR (576, 396)");
+    it("snaps every coordinate to the grid", () => {
+        const sk = generateSkeleton(PIER_LVL, PIER_DEF);
+        for (const m of sk.members) {
+            expect(m.x1 % GRID).toBe(0);
+            expect(m.y1 % GRID).toBe(0);
+            expect(m.x2 % GRID).toBe(0);
+            expect(m.y2 % GRID).toBe(0);
+        }
     });
 
-    it("grid-snaps extraAnchors on side L", () => {
-        const def = { ...SAMPLE_LVL_DEF, extraAnchors: [{ side: "L", dx: 0, dy: -108 }] };
-        const prompt = buildPrompt(SAMPLE_LVL, def);
-        expect(prompt).toContain("EXTRA ANCHOR (180, 288)");
+    it("never exceeds the level budget for the chosen archetype", () => {
+        for (const [lvl, def] of [[FLAT_LVL, FLAT_DEF], [PIER_LVL, PIER_DEF], [SUSP_LVL, SUSP_DEF]]) {
+            const sk = generateSkeleton(lvl, def);
+            const cost = sk.members.reduce((sum, m) => {
+                const mat = MATERIALS[m.type];
+                const len = Math.hypot(m.x2 - m.x1, m.y2 - m.y1);
+                return sum + len * mat.price / 10;
+            }, 0);
+            expect(cost).toBeLessThanOrEqual(lvl.budget);
+        }
     });
 
-    it("grid-snaps extraAnchors on side R", () => {
-        const def = { ...SAMPLE_LVL_DEF, extraAnchors: [{ side: "R", dx: 0, dy: -GRID * 2 }] };
-        const prompt = buildPrompt(SAMPLE_LVL, def);
-        expect(prompt).toContain(`EXTRA ANCHOR (576, ${396 - GRID * 2})`);
+    it("uses the mid pier as a node on beam_pier levels", () => {
+        const sk = generateSkeleton(PIER_LVL, PIER_DEF);
+        const pierX = Math.round((PIER_LVL.midX + PIER_DEF.extraAnchors[0].dx) / GRID) * GRID;
+        const pierY = Math.round((PIER_LVL.lY + PIER_DEF.extraAnchors[0].dy) / GRID) * GRID;
+        const pierKey = `${pierX},${pierY}`;
+        const seen = sk.members.some(m =>
+            `${m.x1},${m.y1}` === pierKey || `${m.x2},${m.y2}` === pierKey
+        );
+        expect(seen).toBe(true);
     });
 
-    it("handles center (C) extraAnchors relative to midX", () => {
-        const def = { ...SAMPLE_LVL_DEF, extraAnchors: [{ side: "C", dx: 0, dy: 0 }] };
-        const prompt = buildPrompt(SAMPLE_LVL, def);
-        const snappedX = Math.round(SAMPLE_LVL.midX / GRID) * GRID;
-        expect(prompt).toContain(`EXTRA ANCHOR (${snappedX}, 396)`);
-    });
-
-    it("only lists materials unlocked for the current level", () => {
-        const def = { ...SAMPLE_LVL_DEF, materials: ["wood_road", "wood_beam"] };
-        const prompt = buildPrompt(SAMPLE_LVL, def);
-        expect(prompt).toContain(`"wood_road"`);
-        expect(prompt).toContain(`"wood_beam"`);
-        // Locked materials should NOT appear in the prompt's allowed-materials section
-        expect(prompt).not.toContain(`"steel"`);
-        expect(prompt).not.toContain(`"stone_road"`);
-        expect(prompt).not.toContain(`"cable"`);
-    });
-
-    it("incorporates level-specific context (hint + lesson + concept)", () => {
-        const def = {
-            ...SAMPLE_LVL_DEF,
-            concept: "SUSPENSION",
-            hint: "hang the road from cables above",
-            lesson: "cables pull the roadbed up from high anchors",
-        };
-        const prompt = buildPrompt(SAMPLE_LVL, def);
-        expect(prompt).toContain("SUSPENSION");
-        expect(prompt).toContain("hang the road from cables above");
-        expect(prompt).toContain("cables pull the roadbed up");
-    });
-
-    it("mentions the grid size", () => {
-        const prompt = buildPrompt(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(prompt).toContain(`multiples of ${GRID}`);
-    });
-
-    it("asks for a multi-step Socratic lesson in JSON", () => {
-        const prompt = buildPrompt(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(prompt).toMatch(/SOCRATIC/i);
-        expect(prompt).toMatch(/"steps"/);
-        expect(prompt).toMatch(/JSON/);
-    });
-
-    it("mentions the level's core concept so the lesson stays on-topic", () => {
-        const prompt = buildPrompt(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(prompt).toContain("TRIANGULATION");
+    it("groups members into deck → primary → connectors steps", () => {
+        const sk = generateSkeleton(SUSP_LVL, SUSP_DEF);
+        const steps = groupIntoSteps(sk);
+        expect(steps.length).toBeGreaterThanOrEqual(2);
+        expect(steps[0].slot).toBe("deck");
     });
 });
 
-describe("setApiKey / getApiKey", () => {
-    it("round-trips a key", () => {
-        setApiKey("test-key-123");
-        expect(getApiKey()).toBe("test-key-123");
-    });
-});
-
-describe("solveBridge", () => {
-    let originalFetch;
-
-    beforeEach(() => {
-        originalFetch = global.fetch;
+describe("buildPlayerDigest", () => {
+    it("reports an empty build", () => {
+        const d = buildPlayerDigest(FLAT_LVL, FLAT_DEF, { members: [], nodes: [] });
+        expect(d.memberCount).toBe(0);
+        expect(d.roadConnected).toBe(false);
+        expect(d.triangleCount).toBe(0);
     });
 
-    afterEach(() => {
-        global.fetch = originalFetch;
-        setApiKey(null);
+    it("reports cost & material counts for placed members", () => {
+        const n1 = { x: FLAT_LVL.lX, y: FLAT_LVL.lY };
+        const n2 = { x: FLAT_LVL.lX + 36, y: FLAT_LVL.lY };
+        const fakeMember = { n1, n2, type: "wood_road", builtin: false };
+        const d = buildPlayerDigest(FLAT_LVL, FLAT_DEF, { members: [fakeMember], nodes: [n1, n2] });
+        expect(d.memberCount).toBe(1);
+        expect(d.totalCost).toBeGreaterThan(0);
     });
 
-    it("returns an error when no API key is set", async () => {
-        setApiKey(null);
-        const result = await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(result.error).toMatch(/no api key/i);
+    it("detects a triangle formed by two beams + a road segment", () => {
+        // Three nodes forming a triangle: two deck nodes + one apex above.
+        const a = { x: FLAT_LVL.lX,        y: FLAT_LVL.lY };
+        const b = { x: FLAT_LVL.lX + 72,   y: FLAT_LVL.lY };
+        const c = { x: FLAT_LVL.lX + 36,   y: FLAT_LVL.lY - 36 };
+        const members = [
+            { n1: a, n2: b, type: "wood_road", builtin: false },
+            { n1: a, n2: c, type: "wood_beam", builtin: false },
+            { n1: b, n2: c, type: "wood_beam", builtin: false },
+        ];
+        const d = buildPlayerDigest(FLAT_LVL, FLAT_DEF, { members, nodes: [a, b, c] });
+        expect(d.triangleCount).toBe(1);
     });
 
-    it("parses a fenced JSON lesson", async () => {
-        setApiKey("k");
-        const lesson = sampleLesson();
-        global.fetch = vi.fn().mockResolvedValue(
-            openaiResponse("here you go:\n```json\n" + JSON.stringify(lesson) + "\n```")
-        );
-        const result = await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(result.concept).toBe("Triangulation");
-        expect(result.steps).toHaveLength(2);
-        expect(result.steps[0].options).toHaveLength(3);
-        expect(result.summary).toMatch(/triangulated/);
-    });
-
-    it("parses a raw (unfenced) JSON lesson", async () => {
-        setApiKey("k");
-        const lesson = sampleLesson();
-        global.fetch = vi.fn().mockResolvedValue(openaiResponse(JSON.stringify(lesson)));
-        const result = await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(result.steps).toHaveLength(2);
-    });
-
-    it("surfaces API errors from non-2xx responses", async () => {
-        setApiKey("k");
-        global.fetch = vi.fn().mockResolvedValue({
-            ok: false,
-            status: 401,
-            text: async () => "invalid key",
-        });
-        const result = await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(result.error).toMatch(/401/);
-        expect(result.error).toMatch(/invalid key/);
-    });
-
-    it("errors when response has no parseable JSON", async () => {
-        setApiKey("k");
-        global.fetch = vi.fn().mockResolvedValue(openaiResponse("I couldn't help with that."));
-        const result = await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(result.error).toMatch(/parse/i);
-    });
-
-    it("errors when response is missing the steps array", async () => {
-        setApiKey("k");
-        global.fetch = vi.fn().mockResolvedValue(
-            openaiResponse("```json\n" + JSON.stringify({ concept: "x" }) + "\n```")
-        );
-        const result = await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(result.error).toMatch(/steps/i);
-    });
-
-    it("errors when a step is missing required fields", async () => {
-        setApiKey("k");
-        const badLesson = {
-            concept: "x",
-            steps: [{ question: "hi", options: ["a"], members: [] }], // no `correct`
-        };
-        global.fetch = vi.fn().mockResolvedValue(
-            openaiResponse("```json\n" + JSON.stringify(badLesson) + "\n```")
-        );
-        const result = await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(result.error).toMatch(/malformed|step/i);
-    });
-
-    it("catches thrown network errors", async () => {
-        setApiKey("k");
-        global.fetch = vi.fn().mockRejectedValue(new Error("network down"));
-        const result = await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-        expect(result.error).toMatch(/network down/i);
-    });
-
-    it("sends the OpenAI endpoint, Bearer auth, and prompt body", async () => {
-        setApiKey("sk-proj-my-key");
-        const fetchMock = vi.fn().mockResolvedValue(
-            openaiResponse("```json\n" + JSON.stringify(sampleLesson()) + "\n```")
-        );
-        global.fetch = fetchMock;
-        await solveBridge(SAMPLE_LVL, SAMPLE_LVL_DEF);
-
-        expect(fetchMock).toHaveBeenCalledOnce();
-        const [url, opts] = fetchMock.mock.calls[0];
-        expect(url).toBe("https://api.openai.com/v1/chat/completions");
-        expect(opts.method).toBe("POST");
-        expect(opts.headers["Authorization"]).toBe("Bearer sk-proj-my-key");
-        const body = JSON.parse(opts.body);
-        expect(body.model).toMatch(/gpt/);
-        expect(body.messages[0].role).toBe("user");
-        expect(body.messages[0].content).toContain("TEST LEVEL");
+    it("flags floating structural members not connected to any anchor", () => {
+        // Two beams forming an isolated triangle far from any anchor.
+        const a = { x: FLAT_LVL.lX + 100,  y: FLAT_LVL.lY - 100 };
+        const b = { x: FLAT_LVL.lX + 150,  y: FLAT_LVL.lY - 100 };
+        const c = { x: FLAT_LVL.lX + 125,  y: FLAT_LVL.lY - 60 };
+        const members = [
+            { n1: a, n2: b, type: "wood_beam", builtin: false },
+            { n1: a, n2: c, type: "wood_beam", builtin: false },
+            { n1: b, n2: c, type: "wood_beam", builtin: false },
+        ];
+        const d = buildPlayerDigest(FLAT_LVL, FLAT_DEF, { members, nodes: [a, b, c] });
+        expect(d.floatingStructuralMembers).toBe(3);
     });
 });
